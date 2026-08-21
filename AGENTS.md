@@ -3,8 +3,13 @@
 ## 项目概览
 
 `viroflash` 是一个 Rust 2021 单 crate 命令行项目。它读取单端或双端
-FASTQ/FASTQ.gz，以及宿主、目标、诱饵和污染四类 FASTA，执行 k-mer 预筛、
-minimap2 竞争比对、候选聚合和统计判定，输出候选级 JSON 与 TSV。
+FASTQ/FASTQ.gz，配合可复用索引（宿主、目标、诱饵、污染参考 + k-mer Bloom +
+manifest），执行 k-mer 预筛、minimap2 竞争比对、候选聚合和统计判定，输出
+候选级 JSON 与 TSV。
+
+命令结构为两阶段：`viroflash index` 构建索引目录；`viroflash run` 用
+`--index` 复用，或直接给参考 FASTA 自动构建（两条路径共用同一构建入口，
+结果一致）。诱饵可显式提供（`--decoy-fa`），也可在索引构建阶段自动生成。
 
 主程序不调用外部 CLI；比对通过 `minimap2` Rust 绑定及其原生 FFI 完成。
 保持依赖少、流式输入、有界并发、确定性聚合和可审计的参数来源。
@@ -15,6 +20,8 @@ minimap2 竞争比对、候选聚合和统计判定，输出候选级 JSON 与 T
 Cargo.toml / Cargo.lock    包配置与锁定依赖
 src/main.rs                CLI 解析、命令分发和退出码
 src/lib.rs                 管线编排、证据聚合和候选决策
+src/index.rs               索引目录构建/加载、manifest、Bloom 序列化与校验
+src/hash.rs                BLAKE3 校验和（blake3 crate 薄封装）
 src/reference.rs           FASTA 解析、复合参考和 minimap2 索引
 src/fastq.rs               FASTQ/FASTQ.gz 解析与配对校验
 src/prescreen.rs           canonical k-mer Bloom 与 SDUST 门控
@@ -29,6 +36,19 @@ scripts/                   可移植的合成数据工具
 
 `Cargo.toml`、`Cargo.lock`、当前 `src/` 和测试是构建及运行行为的事实来源。
 阈值应由拥有该阶段的模块集中定义，不要散落在调用点。
+
+## 索引契约
+
+- 索引是目录：`ref.mmi` + `bloom.bin` + `manifest.json`（+ 自动诱饵产物）。
+- `manifest.json` 是角色→contig 元数据的唯一来源；加载路径不解析参考 FASTA。
+- 索引格式带版本号（`index::FORMAT_VERSION`），加载时校验：版本高于当前支持、
+  `--k` 与索引不一致、bloom 与 manifest 不一致都必须报错，不得静默错用。
+- `--index` 与 `--host-fa/--target-fa/--decoy-fa/--contam-fa` 互斥
+  （CLI 解析与 `run_pipeline` 双重校验）。
+- 「`--index` 加载」与「FASTA 自动构建」必须产出逐候选一致的结果
+  （smoke 的等价性测试守护）；manifest 中的 gc 用 f64 最短往返表示，
+  不得降精度导致分层边界翻转。
+- 构建用「临时目录 + 原子改名」，目标目录已存在时拒绝覆盖。
 
 ## 仓库边界
 
