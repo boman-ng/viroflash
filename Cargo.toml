@@ -1,0 +1,17 @@
+[package]
+name = "viroflash"
+version = "0.1.0"
+edition = "2021"
+description = "病毒候选检测命令行工具"
+publish = false
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+minimap2 = "0.1"
+memchr = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
