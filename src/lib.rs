@@ -5,6 +5,8 @@ pub mod align;
 pub mod cluster;
 pub mod decoy;
 pub mod fastq;
+pub mod hash;
+pub mod index;
 pub mod prescreen;
 pub mod reference;
 pub mod report;
@@ -20,10 +22,13 @@ pub struct Options {
     pub r1: PathBuf,
     /// None = 单端模式（454/单端测序），每 read 一个 fragment。
     pub r2: Option<PathBuf>,
-    pub host_fa: PathBuf,
-    pub target_fa: PathBuf,
-    pub decoy_fa: PathBuf,
-    pub contam_fa: PathBuf,
+    /// 已构建索引目录；与四类 FASTA 参数互斥（main.rs 解析与 run_pipeline 双重校验）。
+    /// None = 自动构建（索引产物落 `<out>.work/index/`）。
+    pub index: Option<PathBuf>,
+    pub host_fa: Option<PathBuf>,
+    pub target_fa: Option<PathBuf>,
+    pub decoy_fa: Option<PathBuf>,
+    pub contam_fa: Option<PathBuf>,
     pub threads: usize,
     pub out: PathBuf,
     pub k: usize,
@@ -34,10 +39,11 @@ impl Default for Options {
         Self {
             r1: PathBuf::new(),
             r2: None,
-            host_fa: PathBuf::new(),
-            target_fa: PathBuf::new(),
-            decoy_fa: PathBuf::new(),
-            contam_fa: PathBuf::new(),
+            index: None,
+            host_fa: None,
+            target_fa: None,
+            decoy_fa: None,
+            contam_fa: None,
             threads: 8,
             out: PathBuf::from("viroflash_out"),
             k: prescreen::DEFAULT_K,
@@ -75,73 +81,88 @@ pub fn run_pipeline(opt: &Options) -> Result<RunSummary, String> {
             opt.k
         ));
     }
-    for (label, p) in [
-        ("r1", &opt.r1),
-        ("host-fa", &opt.host_fa),
-        ("target-fa", &opt.target_fa),
-        ("decoy-fa", &opt.decoy_fa),
-        ("contam-fa", &opt.contam_fa),
-    ] {
-        if p.as_os_str().is_empty() {
-            return Err(format!("缺少 --{label}"));
-        }
+    if opt.r1.as_os_str().is_empty() {
+        return Err("缺少 --r1".into());
+    }
+    // --index 与四类 FASTA 互斥：加载路径的角色/参考信息全部来自 manifest，
+    // 同时给 FASTA 会造成两个矛盾的参考来源。
+    let fasta_args: Vec<&str> = [
+        ("--host-fa", &opt.host_fa),
+        ("--target-fa", &opt.target_fa),
+        ("--decoy-fa", &opt.decoy_fa),
+        ("--contam-fa", &opt.contam_fa),
+    ]
+    .into_iter()
+    .filter(|(_, p)| p.is_some())
+    .map(|(label, _)| label)
+    .collect();
+    if opt.index.is_some() && !fasta_args.is_empty() {
+        return Err(format!(
+            "--index 与 {} 不能同时使用（加载索引时参考信息取自 manifest）",
+            fasta_args.join("/")
+        ));
     }
 
     let work_dir = PathBuf::from(format!("{}.work", opt.out.display()));
-    let fastas = vec![
-        (Role::Host, opt.host_fa.clone()),
-        (Role::Target, opt.target_fa.clone()),
-        (Role::Decoy, opt.decoy_fa.clone()),
-        (Role::Contaminant, opt.contam_fa.clone()),
-    ];
     let mut t0 = std::time::Instant::now();
-    let (mmi_path, contigs) = reference::build_reference(&fastas, &work_dir, opt.threads)?;
-    eprintln!("[阶段] 参考构建+索引 {:.1}s", t0.elapsed().as_secs_f64());
-    let roles: HashMap<String, Role> = contigs.iter().map(|c| (c.name.clone(), c.role)).collect();
+    // 索引解析：--index 直接加载并校验；否则自动构建（诱饵未提供时按固定默认
+    // 参数自动生成），与 `viroflash index` 共用同一构建入口，两路径结果一致。
+    let (built, index_source) = match &opt.index {
+        Some(dir) => {
+            let loaded = index::load_index(dir, opt.k)?;
+            eprintln!("[阶段] 索引加载 {:.1}s", t0.elapsed().as_secs_f64());
+            (loaded, "loaded")
+        }
+        None => {
+            let host_fa = require_fa(opt.host_fa.as_deref(), "--host-fa")?;
+            let target_fa = require_fa(opt.target_fa.as_deref(), "--target-fa")?;
+            let spec = index::IndexOptions {
+                host_fa: host_fa.to_path_buf(),
+                target_fa: target_fa.to_path_buf(),
+                contam_fa: opt.contam_fa.clone(),
+                decoy_fa: opt.decoy_fa.clone(),
+                out_dir: work_dir.join("index"),
+                k: opt.k,
+                threads: opt.threads,
+                ..index::IndexOptions::default()
+            };
+            let built = index::build_index(&spec)?;
+            eprintln!("[阶段] 参考构建+索引 {:.1}s", t0.elapsed().as_secs_f64());
+            (built, "built")
+        }
+    };
 
     // 1. 预筛（宽松保留）
-    let target_refs: Vec<&reference::Contig> =
-        contigs.iter().filter(|c| c.role == Role::Target).collect();
-    if target_refs.is_empty() {
-        return Err("目标 FASTA 中没有序列".into());
+    if !built.contigs.iter().any(|c| c.role == Role::Target) {
+        return Err("目标参考中没有序列（索引未含目标或目标 FASTA 为空）".into());
     }
     // Bloom 覆盖目标与诱饵的 k-mer 并集，使 82–88% ANI 的诱饵 reads 能通过
     // 比例门进入竞争比对；否则诱饵层 reads 恒为 0，导致 λ̂=0、p=0。
-    let bloom_refs: Vec<&reference::Contig> = contigs
-        .iter()
-        .filter(|c| matches!(c.role, Role::Target | Role::Decoy))
-        .collect();
-    let bloom =
-        prescreen::KmerBloom::build(&bloom_refs, opt.k, prescreen::GATE_FPR).ok_or_else(|| {
-            format!(
-                "目标+诱饵 FASTA 中没有 ≥k={} 的有效 k-mer（全部序列过短或含非 ACGT 字符）",
-                opt.k
-            )
-        })?;
+    // Bloom 在索引构建阶段生成并持久化（bloom.bin），加载路径直接复用。
     // N 总线程 = 1 主 + D 解压 + W worker，D:W 约为 1:3。
     let (decomp_threads, workers) = thread_budget(opt.threads);
-    let aligner = align::CompetitiveAligner::open(&mmi_path, workers)?;
+    let aligner = align::CompetitiveAligner::open(&built.mmi_path, workers)?;
     t0 = std::time::Instant::now();
     let (input_pairs, prescreen_pairs, map_errors, evidences) = prescreen_and_align(
         &opt.r1,
         opt.r2.as_deref(),
         opt.k,
-        &bloom,
+        &built.bloom,
         &aligner,
-        &roles,
+        &built.roles,
         decomp_threads,
     )?;
     eprintln!("[阶段] 预筛+竞争比对 {:.1}s", t0.elapsed().as_secs_f64());
 
     // 3. 聚合 + 候选聚类
     t0 = std::time::Instant::now();
-    let aggs = aggregate_evidence(&contigs, &evidences, opt.threads)?;
+    let aggs = aggregate_evidence(&built.contigs, &evidences, opt.threads)?;
     eprintln!("[阶段] 证据聚合 {:.1}s", t0.elapsed().as_secs_f64());
 
     // 4. decoy 统计判定（N_total = 输入 read 边数：PE 每 pair 2 边，SE 每 read 1 边）
     t0 = std::time::Instant::now();
     let total_read_sides = input_pairs * if opt.r2.is_some() { 2 } else { 1 };
-    let candidates = decide_candidates(&contigs, &aggs, total_read_sides, input_pairs)?;
+    let candidates = decide_candidates(&built.contigs, &aggs, total_read_sides, input_pairs)?;
     eprintln!("[阶段] 统计判定 {:.1}s", t0.elapsed().as_secs_f64());
 
     // 5. 报告
@@ -155,6 +176,9 @@ pub fn run_pipeline(opt: &Options) -> Result<RunSummary, String> {
         input_pairs,
         prescreen_pairs,
         map_errors,
+        index_source,
+        index::FORMAT_VERSION,
+        &built.manifest_blake3,
         &candidates,
     )?;
     eprintln!("[阶段] 报告 {:.1}s", t0.elapsed().as_secs_f64());
@@ -167,6 +191,16 @@ pub fn run_pipeline(opt: &Options) -> Result<RunSummary, String> {
         result_json,
         result_tsv,
     })
+}
+
+/// run 未提供 --index 时自动构建索引所需的必填 FASTA 校验。
+fn require_fa<'a>(p: Option<&'a Path>, label: &str) -> Result<&'a Path, String> {
+    match p {
+        Some(path) if !path.as_os_str().is_empty() => Ok(path),
+        _ => Err(format!(
+            "缺少 {label}（未提供 --index 时自动构建索引需要它）"
+        )),
+    }
 }
 
 fn sample_name(r1: &Path) -> String {
@@ -357,7 +391,7 @@ fn aggregate_one(ev: &align::FragmentEvidence, aggs: &mut HashMap<String, Contig
 /// 每个 contig 的证据聚合：chunk 并行出局部聚合表，主线程有序合并。
 /// 合并只做区间拼接与计数相加（交换、可结合），与顺序无关，不影响确定性结果。
 fn aggregate_evidence(
-    contigs: &[reference::Contig],
+    contigs: &[reference::ContigMeta],
     evidences: &[align::FragmentEvidence],
     threads: usize,
 ) -> Result<HashMap<String, ContigAgg>, String> {
@@ -486,7 +520,7 @@ fn merged_interval_count(intervals: &[(i32, i32)]) -> usize {
 /// 当前 split 确认层使用 split_events>0；未计算 LLR_split，因为 μ_s⁺/μ_s⁻
 /// 的估计方式未定义。
 fn decide_candidates(
-    contigs: &[reference::Contig],
+    contigs: &[reference::ContigMeta],
     aggs: &HashMap<String, ContigAgg>,
     total_read_sides: u64,
     input_pairs: u64,
@@ -500,8 +534,8 @@ fn decide_candidates(
     let mut all_rates: Vec<f64> = Vec::new();
     for c in contigs.iter().filter(|c| c.role == Role::Decoy) {
         let agg = &aggs[&c.name];
-        let stratum = strata(c.len() as u64, c.gc_frac);
-        let rate = agg.reads as f64 / c.len() as f64 * depth_norm;
+        let stratum = strata(c.len, c.gc_frac);
+        let rate = agg.reads as f64 / c.len as f64 * depth_norm;
         decoy_strata.entry(stratum.clone()).or_default().push(rate);
         decoy_counts
             .entry(stratum)
@@ -540,7 +574,7 @@ fn decide_candidates(
         if !has_evidence {
             continue;
         }
-        let stratum = strata(c.len() as u64, c.gc_frac);
+        let stratum = strata(c.len, c.gc_frac);
         let layer = decoy_strata.get(&stratum);
         let lambda_layer = layer.and_then(|v| stats::trimmed_mean_20(v));
         // EB 收缩（κ=2）：层空 → 全局（退化）；层大 → 逼近层均值
@@ -548,7 +582,7 @@ fn decide_candidates(
             Some(l) => stats::eb_shrink_layer(l, layer.map_or(0, Vec::len), lambda_glob, 2.0),
             None => lambda_glob,
         };
-        let expected = lambda_star * stats::expected_hits(c.len() as u64, total_read_sides.max(1));
+        let expected = lambda_star * stats::expected_hits(c.len, total_read_sides.max(1));
         // n_plain：reads 扣唯一 split qname 数（避免 split read 双计）
         let mut split_qnames: HashSet<&str> = HashSet::new();
         for se in &agg.split_events {
@@ -559,10 +593,10 @@ fn decide_candidates(
         let rpm = agg.reads as f64 / input_pairs.max(1) as f64 * 1e6;
         raw.push(RawCandidate {
             contig: c.name.clone(),
-            len: c.len() as u64,
+            len: c.len,
             bases,
             windows: merged_interval_count(&agg.intervals) as u64,
-            frac: bases as f64 / c.len() as f64,
+            frac: bases as f64 / c.len as f64,
             reads: agg.reads,
             n_plain,
             split_events: agg.split_events.clone(),
@@ -705,28 +739,28 @@ mod tests {
         // target_1 仅 discordant=1 → n_plain=0；p=P(Pois(0)≥0)=1 → q=1 → NOT_SIGNIFICANT。
         // 池化 π0=1.0（已手算：CDH2018 各 τ 估计均被钳制到 1）。
         let contigs = vec![
-            reference::Contig {
+            reference::ContigMeta {
                 name: "target_0".into(),
                 role: Role::Target,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "target_1".into(),
                 role: Role::Target,
-                seq: vec![b'A'; 30000],
+                len: 30000,
                 gc_frac: 0.55,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "decoy_0".into(),
                 role: Role::Decoy,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "decoy_1".into(),
                 role: Role::Decoy,
-                seq: vec![b'A'; 30000],
+                len: 30000,
                 gc_frac: 0.55,
             },
         ];
@@ -771,16 +805,16 @@ mod tests {
     fn n_plain_dedups_split_qnames() {
         // reads=3、split qnames ["a","a","b"] → 唯一 2 → n_plain=1。
         let contigs = vec![
-            reference::Contig {
+            reference::ContigMeta {
                 name: "target_0".into(),
                 role: Role::Target,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "decoy_0".into(),
                 role: Role::Decoy,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
         ];
@@ -810,22 +844,22 @@ mod tests {
         // deep 目标：rpm=5 < 500（深度不过）；wide 目标：frac=0.02 < 0.10（覆盖不过）。
         // 两目标分层相同、诱饵零 reads → λ̂=0 → p=0 → q=0（无门槛时本应为 PASS/WEAK）。
         let contigs = vec![
-            reference::Contig {
+            reference::ContigMeta {
                 name: "deep".into(),
                 role: Role::Target,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "wide".into(),
                 role: Role::Target,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
-            reference::Contig {
+            reference::ContigMeta {
                 name: "decoy_0".into(),
                 role: Role::Decoy,
-                seq: vec![b'A'; 3000],
+                len: 3000,
                 gc_frac: 0.5,
             },
         ];

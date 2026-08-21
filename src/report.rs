@@ -20,7 +20,7 @@ pub fn confidence_for_q(q: f64) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub contig: String,
     pub contig_len: u64,
@@ -93,6 +93,9 @@ fn fmt_opt(v: Option<f64>) -> String {
 }
 
 /// 写 `{out}.json` 与 `{out}.tsv`，返回两个路径。
+/// `index_*`：本次运行所用索引的溯源摘要（source=loaded|built，manifest 的
+/// BLAKE3），写入 JSON 的顶层 `index` 块（对旧字段为纯增量，不改动既有 schema）；
+/// TSV 列契约不变。
 // 参数直接对应稳定的运行元数据与候选输出，聚合封装会增加无必要层级。
 #[allow(clippy::too_many_arguments)]
 pub fn write_report(
@@ -103,6 +106,9 @@ pub fn write_report(
     input_pairs: u64,
     prescreen_pairs: u64,
     map_errors: u64,
+    index_source: &str,
+    index_format_version: u32,
+    manifest_blake3: &str,
     candidates: &[Candidate],
 ) -> Result<(PathBuf, PathBuf), String> {
     // 前缀拼接（与 work_dir 的 `{out}.work` 约定一致；with_extension 会剥掉 .out 等后缀）
@@ -132,6 +138,12 @@ pub fn write_report(
             crate::cluster::MIN_SITE_SUPPORT,
             crate::DEPTH_RPM_MIN,
             crate::COVERAGE_MIN,
+        ));
+        // 索引溯源：本次运行所用索引的来源、格式版本与 manifest 校验和
+        //（可审计的参数来源约定；旧字段不受影响）。
+        body.push_str(&format!(
+            "  \"index\": {{\"source\": \"{}\", \"format_version\": {}, \"manifest_blake3\": \"{}\"}},\n",
+            index_source, index_format_version, manifest_blake3
         ));
         body.push_str("  \"candidates\": [\n");
         for (i, c) in candidates.iter().enumerate() {
