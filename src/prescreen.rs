@@ -81,6 +81,7 @@ pub(crate) fn splitmix64(mut x: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// 单列 Bloom：`words` 打包 m 位（m 为 2 的幂，`mask = m−1` 代替取模）。
+#[derive(Debug)]
 pub struct KmerBloom {
     words: Vec<u64>,
     mask: u64,
@@ -142,6 +143,21 @@ impl KmerBloom {
     pub fn fill_frac(&self) -> f64 {
         let set: u64 = self.words.iter().map(|w| u64::from(w.count_ones())).sum();
         set as f64 / (self.words.len() * 64) as f64
+    }
+
+    /// 序列化支持（index.rs 专用）：拆解内部字段。
+    pub(crate) fn to_raw(&self) -> (&[u64], u64) {
+        (&self.words, self.mask)
+    }
+
+    /// 反序列化支持（index.rs 专用）：按已验证字段重建。
+    pub(crate) fn from_raw(words: Vec<u64>, mask: u64, k: usize, n_inserted: u64) -> Self {
+        Self {
+            words,
+            mask,
+            k,
+            n_inserted,
+        }
     }
 }
 

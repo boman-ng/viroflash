@@ -130,7 +130,7 @@ fn write_fasta(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String>
 /// 生成诱饵面板。返回摘要（条数、GC 警告数、输出路径）。
 pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
     if opt.target_fa.as_os_str().is_empty() || opt.out.as_os_str().is_empty() {
-        return Err("decoy 子命令需要 --target-fa 与 --out".into());
+        return Err("诱饵生成需要 --target-fa 与 --out".into());
     }
     if opt.anis.is_empty() {
         return Err("--ani 至少一层".into());

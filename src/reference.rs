@@ -46,6 +46,27 @@ impl Contig {
     }
 }
 
+/// contig 元数据（索引 manifest 中持久化的最小信息）：下游聚合与统计判定
+/// 只依赖 name/role/len/gc，不依赖序列本身，加载索引时无需保留序列。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContigMeta {
+    pub name: String,
+    pub role: Role,
+    pub len: u64,
+    pub gc_frac: f64,
+}
+
+impl From<&Contig> for ContigMeta {
+    fn from(c: &Contig) -> Self {
+        Self {
+            name: c.name.clone(),
+            role: c.role,
+            len: c.len() as u64,
+            gc_frac: c.gc_frac,
+        }
+    }
+}
+
 /// 解析 FASTA（允许序列换行；仅保留 ACGTN，忽略其他字符）。
 pub fn parse_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let file = File::open(path).map_err(|e| format!("无法打开 {}: {e}", path.display()))?;
