@@ -1,6 +1,9 @@
-//! 合成数据端到端冒烟测试：随机宿主/目标/诱饵/污染参考 + 合成读对，
-//! 验证「目标候选被检出且 q 值显著」。
-//! 测试同时检查背景控制与输出文件生成。
+//! 合成数据端到端冒烟测试：随机宿主/目标/诱饵/污染参考 + 合成读对。
+//! 覆盖：
+//! - 「--index 加载」与「FASTA 自动构建」两条路径结果逐候选一致（等价性契约）；
+//! - 目标候选被检出且 q 值显著（背景控制、输出文件生成）；
+//! - 未提供 --decoy-fa 时自动生成诱饵并写入索引；
+//! - 索引 k 不一致、--index 与 FASTA 互斥的错误路径。
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -9,6 +12,7 @@ use std::path::PathBuf;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use viroflash::index::{self, IndexOptions};
 use viroflash::{run_pipeline, Options};
 
 /// xorshift64 确定性随机源。
@@ -86,8 +90,8 @@ fn write_fastq_gz(path: &std::path::Path, records: &[(&str, &[u8])]) {
     w.finish().unwrap();
 }
 
-fn synthetic_workspace() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("viroflash_smoke_{}", std::process::id()));
+fn synthetic_workspace(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("viroflash_smoke_{tag}_{}", std::process::id()));
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -95,9 +99,9 @@ fn synthetic_workspace() -> PathBuf {
     dir
 }
 
-#[test]
-fn e2e_detects_target_and_controls_background() {
-    let dir = synthetic_workspace();
+/// 写四类参考与合成读对，返回工作目录。
+fn setup_synthetic(tag: &str) -> PathBuf {
+    let dir = synthetic_workspace(tag);
     let mut rng = Rng(0x9e3779b97f4a7c15);
 
     let host = rng.seq(5000);
@@ -148,21 +152,11 @@ fn e2e_detects_target_and_controls_background() {
             .map(|(h, s)| (h.as_str(), s.as_slice()))
             .collect::<Vec<_>>(),
     );
+    dir
+}
 
-    let opt = Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        r2: Some(dir.join("reads_R2.fq.gz")),
-        host_fa: dir.join("host.fa"),
-        target_fa: dir.join("target.fa"),
-        decoy_fa: dir.join("decoy.fa"),
-        contam_fa: dir.join("contam.fa"),
-        threads: 4,
-        out: dir.join("out"),
-        k: 21,
-    };
-
-    let summary = run_pipeline(&opt).unwrap();
-
+/// 基础断言：目标候选被检出、背景受控、输出文件生成。
+fn assert_detected(summary: &viroflash::RunSummary) {
     assert_eq!(summary.input_pairs, 60);
     assert!(
         summary.prescreen_pairs >= 30,
@@ -185,13 +179,152 @@ fn e2e_detects_target_and_controls_background() {
         "q 值应显著（同层 decoy 无覆盖）: {:.4}",
         cand.q_value
     );
-    assert_eq!(cand.stratum_decoy_count, 20);
     // 合成读无嵌合，不应有 split/discordant 证据
     assert_eq!(cand.split_events, 0);
     assert_eq!(cand.discordant, 0);
 
     assert!(summary.result_json.exists());
     assert!(summary.result_tsv.exists());
+}
+
+#[test]
+fn e2e_index_and_autobuild_paths_agree() {
+    let dir = setup_synthetic("equiv");
+
+    // 路径 A：先构建索引目录，再 --index 加载运行。
+    let index_opts = IndexOptions {
+        host_fa: dir.join("host.fa"),
+        target_fa: dir.join("target.fa"),
+        contam_fa: Some(dir.join("contam.fa")),
+        decoy_fa: Some(dir.join("decoy.fa")),
+        out_dir: dir.join("idx"),
+        k: 21,
+        threads: 4,
+        ..IndexOptions::default()
+    };
+    let built = index::build_index(&index_opts).unwrap();
+    assert_eq!(
+        built
+            .contigs
+            .iter()
+            .filter(|c| c.role == viroflash::reference::Role::Decoy)
+            .count(),
+        20
+    );
+    let summary_loaded = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        r2: Some(dir.join("reads_R2.fq.gz")),
+        index: Some(dir.join("idx")),
+        threads: 4,
+        out: dir.join("out_idx"),
+        k: 21,
+        ..Options::default()
+    })
+    .unwrap();
+
+    // 路径 B：直接给 FASTA，自动构建（与 index 命令共用同一构建函数）。
+    let summary_built = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        r2: Some(dir.join("reads_R2.fq.gz")),
+        host_fa: Some(dir.join("host.fa")),
+        target_fa: Some(dir.join("target.fa")),
+        decoy_fa: Some(dir.join("decoy.fa")),
+        contam_fa: Some(dir.join("contam.fa")),
+        threads: 4,
+        out: dir.join("out_fa"),
+        k: 21,
+        ..Options::default()
+    })
+    .unwrap();
+
+    assert_detected(&summary_loaded);
+    assert_detected(&summary_built);
+    assert_eq!(summary_loaded.candidates, summary_built.candidates);
+    // 自动构建的索引落于 <out>.work/index/
+    assert!(dir
+        .join("out_fa.work")
+        .join("index")
+        .join("manifest.json")
+        .is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_auto_decoy_when_decoy_fa_absent() {
+    let dir = setup_synthetic("autodecoy");
+
+    // 未提供 --decoy-fa：索引构建阶段按默认 ANI/seed 从目标自动生成诱饵。
+    let summary = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        r2: Some(dir.join("reads_R2.fq.gz")),
+        host_fa: Some(dir.join("host.fa")),
+        target_fa: Some(dir.join("target.fa")),
+        threads: 4,
+        out: dir.join("out"),
+        k: 21,
+        ..Options::default()
+    })
+    .unwrap();
+    assert_detected(&summary);
+
+    // 自动诱饵产物与 manifest 的 generated 来源记录
+    let idx = dir.join("out.work").join("index");
+    assert!(idx.join("decoys.fa").is_file());
+    assert!(idx.join("decoys.tsv").is_file());
+    let manifest = std::fs::read_to_string(idx.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains("\"generated\""),
+        "manifest 应记录自动生成诱饵: {manifest}"
+    );
+    assert!(manifest.contains("\"anis\""), "manifest 应记录 ANI 层");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
+    let dir = setup_synthetic("errors");
+
+    let index_opts = IndexOptions {
+        host_fa: dir.join("host.fa"),
+        target_fa: dir.join("target.fa"),
+        decoy_fa: Some(dir.join("decoy.fa")),
+        out_dir: dir.join("idx"),
+        k: 21,
+        threads: 4,
+        ..IndexOptions::default()
+    };
+    index::build_index(&index_opts).unwrap();
+
+    // k 不一致：加载必须拒绝（Bloom 与索引均按 k 构建）。
+    let err = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        index: Some(dir.join("idx")),
+        k: 6,
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(err.contains("不一致"), "err={err}");
+
+    // --index 与 FASTA 互斥（库层防御，与 CLI 解析双重校验）。
+    let err = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        index: Some(dir.join("idx")),
+        host_fa: Some(dir.join("host.fa")),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(err.contains("不能同时使用"), "err={err}");
+
+    // 自动构建缺失必填参考。
+    let err = run_pipeline(&Options {
+        r1: dir.join("reads_R1.fq.gz"),
+        target_fa: Some(dir.join("target.fa")),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(err.contains("--host-fa"), "err={err}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
