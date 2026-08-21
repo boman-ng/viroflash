@@ -9,6 +9,7 @@ publish = false
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 minimap2 = "0.1"
 memchr = "2"
+blake3 = "1"
 
 [profile.release]
 opt-level = 3
