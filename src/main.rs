@@ -1,5 +1,5 @@
-//! 命令行入口：`viroflash index` / `viroflash run` / `viroflash version`。
-//! 手工解析参数；性能采样由库内 `sysinfo` 模块提供。
+//! Command-line entry point for `viroflash index`, `viroflash run`, and `viroflash version`.
+//! Arguments are parsed directly; the library's `sysinfo` module provides telemetry.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,7 +12,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("错误: {e}");
+            eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
             let built = index::build_index(&opt)?;
             let n = |r| built.contigs.iter().filter(|c| c.role == r).count();
             eprintln!(
-                "索引已构建: {}（contig: host={} target={} decoy={} contam={}；k={}）",
+                "Index built: {} (contigs: host={} target={} decoy={} contam={}; k={})",
                 opt.out_dir.display(),
                 n(Role::Host),
                 n(Role::Target),
@@ -49,43 +49,47 @@ fn run() -> Result<(), String> {
                 opt.k
             );
             eprintln!(
-                "  ref.mmi / bloom.bin / manifest.json / targets.fa（manifest_blake3={}）",
+                "  ref.mmi / bloom.bin / manifest.json / targets.fa (manifest_blake3={})",
                 built.manifest_blake3
             );
             let perf = viroflash::perf::report_paths(&opt.out_dir);
-            eprintln!("性能报告: {} / {}", perf.json.display(), perf.tsv.display());
+            eprintln!(
+                "Performance reports: {} / {}",
+                perf.json.display(),
+                perf.tsv.display()
+            );
             Ok(())
         }
         Command::Run(opt) => {
             let summary = run_pipeline(&opt)?;
-            eprintln!("输入 pairs: {}", summary.input_pairs);
+            eprintln!("Input pairs: {}", summary.input_pairs);
             eprintln!(
-                "抽样 pairs: {}（p={:.6}），抽样内预筛通过: {}",
+                "Sampled pairs: {} (p={:.6}); prescreened pairs in sample: {}",
                 summary.sampling.selected_pairs,
                 summary.sampling.inclusion_probability,
                 summary.prescreen_pairs
             );
             if summary.map_errors > 0 {
                 eprintln!(
-                    "警告: {} 个 fragment 比对失败（详见报告 run.map_errors）",
+                    "Warning: {} fragments failed alignment (see run.map_errors)",
                     summary.map_errors
                 );
             }
             if summary.sampling.audit_overflows > 0 {
                 eprintln!(
-                    "警告: {} 个 read-end 的全链命中超限，未当作空证据（详见报告 sampling.audit_overflows）",
+                    "Warning: {} read ends exceeded the whole-chain hit limit and were not treated as empty evidence (see sampling.audit_overflows)",
                     summary.sampling.audit_overflows
                 );
             }
             eprintln!(
-                "固定检验族: {}，报告候选: {}",
+                "Fixed testing family: {}; reported candidates: {}",
                 summary.test_family_size,
                 summary.candidates.len()
             );
-            eprintln!("解释范围: 候选级研究报告门，不计算样本级结论；QC=NOT_EVALUATED");
+            eprintln!("Interpretation scope: candidate-level research gate; no sample-level conclusion; QC=NOT_EVALUATED");
             for c in &summary.candidates {
                 eprintln!(
-                    "  hypothesis={} OR({})  代表={}  adjusted-p={}  状态={}  候选门={}  覆盖={:.2}  reads={}  integration={}  split={}  discordant={}",
+                    "  hypothesis={} OR({})  representative={}  adjusted-p={}  status={}  candidate_gate={}  breadth={:.2}  reads={}  integration={}  split={}  discordant={}",
                     c.contig,
                     c.hypothesis_members.len(),
                     c.representative,
@@ -108,12 +112,16 @@ fn run() -> Result<(), String> {
                 );
             }
             eprintln!(
-                "报告: {} / {}",
+                "Reports: {} / {}",
                 summary.result_json.display(),
                 summary.result_tsv.display()
             );
             let perf = viroflash::perf::report_paths(&opt.out);
-            eprintln!("性能报告: {} / {}", perf.json.display(), perf.tsv.display());
+            eprintln!(
+                "Performance reports: {} / {}",
+                perf.json.display(),
+                perf.tsv.display()
+            );
             Ok(())
         }
     }
@@ -132,14 +140,14 @@ fn parse_args_from(args: &[String]) -> Result<Command, String> {
         "version" | "--version" => Ok(Command::Version),
         "index" => parse_index(&args[1..]),
         "run" => parse_run(&args[1..]),
-        other => Err(format!("未知子命令: {other}")),
+        other => Err(format!("Unknown subcommand: {other}")),
     }
 }
 
 fn parse_num<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
     value
         .parse()
-        .map_err(|_| format!("{flag} 取值非法: {value}"))
+        .map_err(|_| format!("Invalid value for {flag}: {value}"))
 }
 
 fn parse_anis(value: &str) -> Result<Vec<u8>, String> {
@@ -148,12 +156,12 @@ fn parse_anis(value: &str) -> Result<Vec<u8>, String> {
         .map(|s| {
             s.trim()
                 .parse()
-                .map_err(|_| format!("--decoy-ani 取值非法: {s}"))
+                .map_err(|_| format!("Invalid value for --decoy-ani: {s}"))
         })
         .collect()
 }
 
-/// `viroflash index`：构建可复用索引目录；未提供 --decoy-fa 时自动生成诱饵。
+/// Build a reusable index; generate decoys when `--decoy-fa` is omitted.
 fn parse_index(args: &[String]) -> Result<Command, String> {
     let mut opt = IndexOptions::default();
     let mut decoy_tuning = false;
@@ -162,7 +170,7 @@ fn parse_index(args: &[String]) -> Result<Command, String> {
         let name = args[i].as_str();
         let value = args
             .get(i + 1)
-            .ok_or_else(|| format!("参数 {name} 缺少值"))?;
+            .ok_or_else(|| format!("Missing value for argument {name}"))?;
         match name {
             "--host-fa" => opt.host_fa = PathBuf::from(value),
             "--target-fa" => opt.target_fa = PathBuf::from(value),
@@ -183,26 +191,26 @@ fn parse_index(args: &[String]) -> Result<Command, String> {
             "--out" => opt.out_dir = PathBuf::from(value),
             "--k" => opt.k = parse_num("--k", value)?,
             "--threads" => opt.threads = parse_num("--threads", value)?,
-            other => return Err(format!("未知参数: {other}")),
+            other => return Err(format!("Unknown argument: {other}")),
         }
         i += 2;
     }
     if opt.decoy_fa.is_some() && decoy_tuning {
         return Err(
-            "--decoy-fa 与 --decoy-ani/--decoy-per-layer/--decoy-seed 不能同时使用（诱饵调参仅对自动生成有效）"
+            "--decoy-fa cannot be combined with --decoy-ani/--decoy-per-layer/--decoy-seed (generation options apply only to generated decoys)"
                 .into(),
         );
     }
     if opt.host_fa.as_os_str().is_empty() || opt.target_fa.as_os_str().is_empty() {
-        return Err("index 子命令缺少 --host-fa 或 --target-fa".into());
+        return Err("The index subcommand requires --host-fa and --target-fa".into());
     }
     if opt.out_dir.as_os_str().is_empty() {
-        return Err("index 子命令缺少 --out".into());
+        return Err("The index subcommand requires --out".into());
     }
     Ok(Command::Index(opt))
 }
 
-/// `viroflash run`：--index 复用索引，或直接给 FASTA 自动构建（互斥）。
+/// Run with a reusable `--index` or build one from FASTA inputs (mutually exclusive).
 fn parse_run(args: &[String]) -> Result<Command, String> {
     let mut opt = Options::default();
     let mut i = 0;
@@ -210,7 +218,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         let name = args[i].as_str();
         let value = args
             .get(i + 1)
-            .ok_or_else(|| format!("参数 {name} 缺少值"))?;
+            .ok_or_else(|| format!("Missing value for argument {name}"))?;
         match name {
             "--r1" => opt.r1 = PathBuf::from(value),
             "--r2" => opt.r2 = Some(PathBuf::from(value)),
@@ -222,12 +230,12 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
             "--threads" => opt.threads = parse_num("--threads", value)?,
             "--out" => opt.out = PathBuf::from(value),
             "--k" => opt.k = parse_num("--k", value)?,
-            other => return Err(format!("未知参数: {other}")),
+            other => return Err(format!("Unknown argument: {other}")),
         }
         i += 2;
     }
     if opt.r1.as_os_str().is_empty() {
-        return Err("run 子命令缺少 --r1".into());
+        return Err("The run subcommand requires --r1".into());
     }
     if opt.index.is_some() {
         for (label, p) in [
@@ -238,13 +246,13 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         ] {
             if p.is_some() {
                 return Err(format!(
-                    "--index 与 {label} 不能同时使用（加载索引时参考信息取自 manifest）"
+                    "--index cannot be combined with {label} (a loaded index obtains reference metadata from its manifest)"
                 ));
             }
         }
     } else if opt.host_fa.is_none() || opt.target_fa.is_none() {
         return Err(
-            "run 子命令缺少 --host-fa/--target-fa（未提供 --index 时自动构建索引需要它们）".into(),
+            "The run subcommand requires --host-fa and --target-fa when --index is omitted".into(),
         );
     }
     Ok(Command::Run(opt))
@@ -252,29 +260,29 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
 
 fn print_usage() {
     println!(
-        "viroflash {} — 病毒候选检测命令行工具\n\
+        "viroflash {} — viral candidate detection command-line tool\n\
 \n\
-用法:\n\
+Usage:\n\
   viroflash index \\\n\
-    --host-fa <宿主.fa> --target-fa <目标病毒.fa> \\\n\
-    [--contam-fa <污染.fa>] [--decoy-fa <诱饵.fa>] \\\n\
+    --host-fa <host.fa> --target-fa <target-virus.fa> \\\n\
+    [--contam-fa <contaminant.fa>] [--decoy-fa <decoy.fa>] \\\n\
     [--decoy-ani 85] [--decoy-per-layer 1] [--decoy-seed 0] \\\n\
-    --out <索引目录> [--k 21（1..=31）] [--threads 8]\n\
+    --out <index-directory> [--k 21 (1..=31)] [--threads 8]\n\
 \n\
   viroflash run \\\n\
     --r1 <reads_R1.fastq.gz> [--r2 <reads_R2.fastq.gz>] \\\n\
-    (--index <索引目录> | --host-fa <宿主.fa> --target-fa <目标病毒.fa> \\\n\
-      [--contam-fa <污染.fa>] [--decoy-fa <诱饵.fa>]) \\\n\
-    [--threads 8（数据管线计算线程预算）] [--out <输出前缀>] [--k 21（1..=31）]\n\
+    (--index <index-directory> | --host-fa <host.fa> --target-fa <target-virus.fa> \\\n\
+      [--contam-fa <contaminant.fa>] [--decoy-fa <decoy.fa>]) \\\n\
+    [--threads 8 (pipeline compute budget)] [--out <output-prefix>] [--k 21 (1..=31)]\n\
 \n\
   viroflash version\n\
 \n\
-index: 构建可复用索引目录（ref.mmi + bloom.bin + manifest.json + targets.fa）；未提供\n\
-  --decoy-fa 时按 --decoy-ani/--decoy-per-layer/--decoy-seed 从目标自动生成诱饵。\n\
-run: --index 复用索引（与 FASTA 参数互斥，--k 需与索引一致）；未提供 --index\n\
-  时自动构建（诱饵未提供时按默认参数自动生成）。\n\
-输入: 测序 fastq.gz（省略 --r2 即单端模式）；输出: <out>.json / <out>.tsv\n\
-性能: index 与 run 自动输出 <out>.perf.json / <out>.perf.tsv（当前进程与阶段汇总）",
+index: build a reusable index directory (ref.mmi + bloom.bin + manifest.json + targets.fa).\n\
+  Without --decoy-fa, generate decoys using --decoy-ani/--decoy-per-layer/--decoy-seed.\n\
+run: reuse --index (mutually exclusive with FASTA options; --k must match), or build one\n\
+  automatically when --index is omitted.\n\
+Input: sequencing fastq.gz; omit --r2 for single-end mode. Output: <out>.json / <out>.tsv\n\
+Performance: index and run emit <out>.perf.json / <out>.perf.tsv automatically.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -301,7 +309,7 @@ mod tests {
             "t.fa",
         ]))
         .unwrap_err();
-        assert!(err.contains("不能同时使用"), "err={err}");
+        assert!(err.contains("cannot be combined"), "err={err}");
     }
 
     #[test]
@@ -319,7 +327,7 @@ mod tests {
                 assert_eq!(opt.index, Some(PathBuf::from("idx")));
                 assert!(opt.host_fa.is_none());
             }
-            _ => panic!("应为 Run"),
+            _ => panic!("expected Run"),
         }
     }
 
@@ -355,7 +363,7 @@ mod tests {
             "82,88",
         ]))
         .unwrap_err();
-        assert!(err.contains("不能同时使用"), "err={err}");
+        assert!(err.contains("cannot be combined"), "err={err}");
     }
 
     #[test]
@@ -384,7 +392,7 @@ mod tests {
                 assert!(opt.decoy_fa.is_none());
                 assert_eq!(opt.contam_fa, None);
             }
-            _ => panic!("应为 Index"),
+            _ => panic!("expected Index"),
         }
     }
 
@@ -402,7 +410,7 @@ mod tests {
             "abc",
         ]))
         .unwrap_err();
-        assert!(err.contains("非法"), "err={err}");
+        assert!(err.contains("Invalid"), "err={err}");
         let err = parse_args_from(&args(&[
             "index",
             "--host-fa",
@@ -415,10 +423,10 @@ mod tests {
             "82x",
         ]))
         .unwrap_err();
-        assert!(err.contains("非法"), "err={err}");
+        assert!(err.contains("Invalid"), "err={err}");
         let err = parse_args_from(&args(&["frobnicate"])).unwrap_err();
-        assert!(err.contains("未知子命令"), "err={err}");
+        assert!(err.contains("Unknown subcommand"), "err={err}");
         let err = parse_args_from(&args(&["run", "--r1", "r", "--wat", "x"])).unwrap_err();
-        assert!(err.contains("未知参数"), "err={err}");
+        assert!(err.contains("Unknown argument"), "err={err}");
     }
 }

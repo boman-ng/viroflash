@@ -1,15 +1,14 @@
-//! `viroflash decoy`：依据目标基因组离线、确定性地生成分层诱饵。
+//! Offline deterministic generation of stratified decoys from target genomes.
 //!
-//! - RNG：splitmix64(master_seed ⊕ fnv64(target_name) ⊕ layer ⊕ idx) 派生 →
-//!   xorshift64* 采样流（Vigna 2016；同种子同输出、跨平台确定、零依赖）。
-//! - 突变模型：SNP-only；每诱饵按率 r = 1−ani 逐位 iid；替换采样 = 目标 GC
-//!   背景分布 + 抽中原碱基时同 GC 组交换（E[ΔGC]=0 精确、任意 gc）；**无 indel**
-//!   （层带方差最小、覆盖统计稳定）；**无 RC**；**无同源 run 硬限**（iid 突变下
-//!   150kb 最长同源 run 期望 ≈51/61/76bp 与真实近缘同分布，设上限反使诱饵偏离真实行为）。
-//! - 门禁：GC 偏差 ≤1% 生成时软检查（超限记录警告，不静默）；层内互斥与
-//!   ANI 精度可用 minimap2 验证（生成器不依赖比对）。
-//! - 默认运行层固定为 ANI 85（21-mer 理论共享率约 3.3%）且每代表一条；额外
-//!   ANI 层和重复仅由显式参数用于压力测试，避免默认索引按层数×重复数膨胀。
+//! - RNG: derive splitmix64(master_seed XOR fnv64(target_name) XOR layer XOR index), then use a
+//!   xorshift64* stream. Equal seeds produce cross-platform identical output without dependencies.
+//! - Mutation model: SNP-only IID substitutions at `r = 1 - ANI`, sampled from target GC background.
+//!   Selecting the original base swaps within its GC class, making expected GC drift exactly zero.
+//!   There are no indels, reverse complements, or artificial homologous-run caps.
+//! - Guard: GC deviation above 1% emits a warning. minimap2 may independently verify ANI and
+//!   within-layer exclusivity, but generation itself does not depend on alignment.
+//! - Default: one ANI-85 decoy per representative. Extra layers and replicas require explicit
+//!   stress-test options so default index size does not multiply unnecessarily.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -24,7 +23,7 @@ pub const DEFAULT_PER_LAYER: usize = 1;
 pub struct DecoyOptions {
     pub target_fa: PathBuf,
     pub out: PathBuf,
-    /// ANI 层（百分比整数，如 82/85/88）。
+    /// ANI layer as an integer percentage, such as 82, 85, or 88.
     pub anis: Vec<u8>,
     pub per_layer: usize,
     pub seed: u64,
@@ -44,7 +43,7 @@ impl Default for DecoyOptions {
     }
 }
 
-/// FNV-1a 64（目标名 → 种子分量；零依赖）。
+/// Dependency-free FNV-1a 64 mapping a target name to a seed component.
 fn fnv64(s: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in s {
@@ -54,7 +53,7 @@ fn fnv64(s: &[u8]) -> u64 {
     h
 }
 
-/// xorshift64* 采样流（Vigna 2016；splitmix64 种子派生见 prescreen::splitmix64）。
+/// xorshift64* sampling stream; see `prescreen::splitmix64` for seed derivation.
 struct Rng(u64);
 
 impl Rng {
@@ -66,16 +65,15 @@ impl Rng {
         self.0 = s;
         s.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    /// [0,1) 均匀。
+    /// Uniform value in [0, 1).
     fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / ((1u64 << 53) as f64)
     }
 }
 
-/// 替换采样：新碱基按目标 GC 含量的背景分布采样（A/T 各 (1−gc)/2，
-/// C/G 各 gc/2）；若抽中原碱基则改为同 GC 组另一碱基（A↔T、C↔G）。
-/// 该构造下 E[ΔGC]=0 **精确**（任意 gc，无系统性漂移），且每个突变事件
-/// 必改变碱基（实际突变率 = r，ANI 层位无偏）。
+/// Sample replacement bases from target GC background: A/T each `(1-gc)/2`, C/G each `gc/2`.
+/// If the original base is selected, swap within its GC class (A/T or C/G). This gives exactly zero
+/// expected GC drift for any GC fraction while ensuring every mutation changes the base.
 fn sample_replacement(rng: &mut Rng, cur: u8, gc: f64) -> u8 {
     let pa = (1.0 - gc) / 2.0;
     let pc = gc / 2.0;
@@ -100,7 +98,7 @@ fn sample_replacement(rng: &mut Rng, cur: u8, gc: f64) -> u8 {
     b
 }
 
-/// 单条诱饵：SNP-only iid 突变。N/非 ACGT 位保留不突变。
+/// Generate one decoy with IID SNP-only mutations; retain N and non-ACGT positions unchanged.
 fn decoy_seq(src: &[u8], r: f64, gc: f64, rng: &mut Rng) -> Vec<u8> {
     src.iter()
         .map(|&b| {
@@ -126,25 +124,27 @@ fn write_fasta_record<W: Write>(out: &mut W, name: &str, seq: &[u8]) -> std::io:
     Ok(())
 }
 
-/// 生成诱饵面板。返回摘要（条数、GC 警告数、输出路径）。
+/// Generate a decoy panel and return counts, GC warnings, and output paths.
 pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
     if opt.target_fa.as_os_str().is_empty() || opt.out.as_os_str().is_empty() {
-        return Err("诱饵生成需要 --target-fa 与 --out".into());
+        return Err("Decoy generation requires --target-fa and --out".into());
     }
     if opt.anis.is_empty() {
-        return Err("--ani 至少一层".into());
+        return Err("--ani requires at least one layer".into());
     }
     if opt.per_layer == 0 {
-        return Err("--per-layer 必须大于 0".into());
+        return Err("--per-layer must be greater than 0".into());
     }
     for &a in &opt.anis {
         if a == 0 || a >= 100 {
-            return Err(format!("--ani 层 {a} 非法（须在 1..99 之间）"));
+            return Err(format!(
+                "Invalid --ani layer {a} (must be between 1 and 99)"
+            ));
         }
     }
     let fasta = reference::parse_fasta(&opt.target_fa)?;
     if fasta.is_empty() {
-        return Err("目标 FASTA 中没有序列".into());
+        return Err("Target FASTA contains no sequences".into());
     }
 
     let report_path = opt.report.clone().unwrap_or_else(|| {
@@ -153,14 +153,14 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
         PathBuf::from(p)
     });
     let fasta_file =
-        File::create(&opt.out).map_err(|e| format!("无法创建 {}: {e}", opt.out.display()))?;
+        File::create(&opt.out).map_err(|e| format!("Cannot create {}: {e}", opt.out.display()))?;
     let report_file = File::create(&report_path)
-        .map_err(|e| format!("无法创建报告 {}: {e}", report_path.display()))?;
+        .map_err(|e| format!("Cannot create report {}: {e}", report_path.display()))?;
     let mut fasta_out = BufWriter::with_capacity(1 << 20, fasta_file);
     let mut report_out = BufWriter::with_capacity(1 << 20, report_file);
     report_out
         .write_all(b"name\tsource\tani\tr\tlen\tgc_src\tgc_decoy\tseed\n")
-        .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
+        .map_err(|e| format!("Failed to write report {}: {e}", report_path.display()))?;
 
     let mut entry_count = 0usize;
     let mut gc_warnings = 0usize;
@@ -182,13 +182,13 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
                 }
                 let decoy_name = format!("decoy:{name}:ani{ani}:i{idx}");
                 write_fasta_record(&mut fasta_out, &decoy_name, &decoy)
-                    .map_err(|e| format!("写 {} 失败: {e}", opt.out.display()))?;
+                    .map_err(|e| format!("Failed to write {}: {e}", opt.out.display()))?;
                 writeln!(
                     report_out,
                     "{decoy_name}\t{name}\t{ani}\t{r:.6}\t{}\t{gc:.6}\t{decoy_gc:.6}\t{seed}",
                     decoy.len()
                 )
-                .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
+                .map_err(|e| format!("Failed to write report {}: {e}", report_path.display()))?;
                 entry_count += 1;
             }
         }
@@ -196,13 +196,13 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
 
     fasta_out
         .flush()
-        .map_err(|e| format!("写 {} 失败: {e}", opt.out.display()))?;
+        .map_err(|e| format!("Failed to write {}: {e}", opt.out.display()))?;
     report_out
         .flush()
-        .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
+        .map_err(|e| format!("Failed to write report {}: {e}", report_path.display()))?;
 
     Ok(format!(
-        "诱饵 {} 条（目标 {} 条 × 层 {} × 每层 {}）→ {}；报告 {}；GC 偏差超 1% 警告 {} 条",
+        "Generated {} decoys ({} targets x {} layers x {} per layer) -> {}; report {}; {} warnings for GC deviation above 1%",
         entry_count,
         fasta.len(),
         opt.anis.len(),
@@ -217,7 +217,7 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// 确定性伪随机源序列（xorshift64* 派生）。
+    /// Deterministic pseudo-random source sequence derived from xorshift64*.
     fn pseudo_seq(len: usize, seed: u64) -> Vec<u8> {
         let mut rng = Rng(seed | 1);
         (0..len)
@@ -270,17 +270,20 @@ mod tests {
         }
         let a = std::fs::read(&out1).unwrap();
         let b = std::fs::read(&out2).unwrap();
-        assert_eq!(a, b, "同 seed 两次生成必须逐字节一致");
+        assert_eq!(
+            a, b,
+            "Repeated generation with the same seed must be byte-identical"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn mutation_rate_no_indel_always_differs() {
-        // 100kb 周期源（GC 精确 0.5），r=0.15：diff 率 ∈ 0.15±0.5%（σ≈0.11%）。
+        // A 100 kb periodic source with exact GC=0.5; r=0.15 should remain within 0.5%.
         let src: Vec<u8> = (0..100_000).map(|i| b"ACGT"[i % 4]).collect();
         let mut rng = Rng(crate::prescreen::splitmix64(999));
         let decoy = decoy_seq(&src, 0.15, 0.5, &mut rng);
-        assert_eq!(decoy.len(), src.len(), "无 indel：长度必须相等");
+        assert_eq!(decoy.len(), src.len(), "No indels: lengths must match");
         let mut diff = 0usize;
         for (a, b) in src.iter().zip(decoy.iter()) {
             if a != b {
@@ -289,30 +292,32 @@ mod tests {
             }
         }
         let rate = diff as f64 / src.len() as f64;
-        assert!((rate - 0.15).abs() < 0.005, "突变率偏离: {rate:.4}");
+        assert!(
+            (rate - 0.15).abs() < 0.005,
+            "Mutation rate deviation: {rate:.4}"
+        );
     }
 
     #[test]
     fn gc_preserved_within_tolerance() {
-        // gc=0.5 源替换无偏（E[ΔGC]=0），100kb 采样噪声 σ≈0.06% → 断言 ≤0.8%。
+        // GC=0.5 substitutions are unbiased; 100 kb sampling noise should stay below 0.8%.
         let src: Vec<u8> = (0..100_000).map(|i| b"ACGT"[i % 4]).collect();
         let mut rng = Rng(crate::prescreen::splitmix64(4242));
         let decoy = decoy_seq(&src, 0.18, 0.5, &mut rng);
         let d = (gc_fraction(&decoy) - 0.5).abs();
-        assert!(d <= 0.008, "GC 漂移超界: {d:.4}");
+        assert!(d <= 0.008, "GC drift exceeds limit: {d:.4}");
     }
 
     #[test]
     fn gc_unbiased_for_extreme_gc() {
-        // gc=0.3 的周期源（AAAAAAACCC × 10000）：E[ΔGC]=0 精确，
-        // 验证 GC 偏差不超过 1% 软检查线。
+        // A GC=0.3 periodic source has exactly zero expected drift; verify the 1% soft limit.
         let src: Vec<u8> = (0..100_000).map(|i| b"AAAAAAACCC"[i % 10]).collect();
         let gc0 = gc_fraction(&src);
         assert!((gc0 - 0.3).abs() < 1e-9);
         let mut rng = Rng(crate::prescreen::splitmix64(777));
         let decoy = decoy_seq(&src, 0.18, gc0, &mut rng);
         let d = (gc_fraction(&decoy) - gc0).abs();
-        assert!(d <= 0.008, "gc=0.3 漂移超界: {d:.4}");
+        assert!(d <= 0.008, "gc=0.3 drift exceeds limit: {d:.4}");
     }
 
     #[test]
@@ -334,8 +339,8 @@ mod tests {
         assert_eq!(entries.len(), 12);
         let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (n, _) in &entries {
-            assert!(n.starts_with("decoy:t:ani"), "命名约定: {n}");
-            assert!(names.insert(n), "名字重复: {n}");
+            assert!(n.starts_with("decoy:t:ani"), "Naming convention: {n}");
+            assert!(names.insert(n), "Duplicate name: {n}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

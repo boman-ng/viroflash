@@ -1,5 +1,9 @@
-//! 报告输出：候选级 JSON + TSV（手工序列化，避免引入 serde 依赖）。
-//! 输出保持候选级结论，不生成样本级结论。
+//! Candidate-scoped JSON/TSV reporting with a stable machine-readable contract.
+//!
+//! Reports distinguish model evidence, candidate gates, integration evidence, sampling metadata,
+//! index provenance, and unvalidated confidence semantics. Serialization is dependency-free and
+//! rejects non-finite values rather than emitting invalid JSON. Empty candidate output never invents
+//! a sample-level negative conclusion.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -7,12 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cluster::Site;
 
-/// 当前候选结果契约。v1 明确区分模型 adjusted-p、候选报告门和 integration 证据；
-/// 这些语义与旧 v0 不兼容，不能静默沿用同一版本号。
 pub const RESULT_SCHEMA: &str = "viroflash.result.v1";
 
-/// 兼容字段 `confidence` 的输出。当前 synthetic-decoy null 尚未独立校准，因此
-/// adjusted-p 不能转换成 HIGH/MEDIUM/LOW 置信度。
 pub fn confidence_for_q(q: f64) -> &'static str {
     if q < crate::MODEL_ADJUSTED_P_MAX {
         "UNVALIDATED"
@@ -24,70 +24,66 @@ pub fn confidence_for_q(q: f64) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub contig: String,
-    /// 检测组代表在用户 target FASTA 中的原始名称。
+
     pub representative: String,
-    /// 复合 OR 假设覆盖的原始 target 名称；不能据此归因到其中任一成员。
+
     pub hypothesis_members: Vec<String>,
-    /// discovery 证据的最小 hitting-set 解释，仅用于压缩展示。
+
     pub hypothesis_explanation: Vec<String>,
-    /// 构造该假设的 discovery read-end 数；不参与 validation 统计量。
+
     pub discovery_reads: u64,
     pub contig_len: u64,
-    /// discovery OR 假设包含的内部索引 target contig 数。
+
     pub index_member_count: usize,
-    /// target 直接 read 计数对应的内部索引参考总长度。
+
     pub target_exposure_bases: u64,
     pub covered_bases: u64,
     pub covered_frac: f64,
     pub reads: u64,
-    /// split 断点事件数（同一 read 双侧 softclip 可产生 2 条事件）。
+
     pub split_events: u64,
     pub discordant: u64,
     pub plus_strand: u64,
     pub minus_strand: u64,
     pub sites: Vec<Site>,
-    /// 精确条件 Poisson 率检验的普通 f64 p；若下溢为 0，`ln_p_value` 仍保留信息。
+
     pub p_value: f64,
-    /// 固定 discovery 检验族内的 BH adjusted-p；不是已验证的 classical-FDR q。
+
     pub q_value: f64,
     pub ln_p_value: f64,
     pub ln_q_value: f64,
     pub p_underflow: bool,
     pub q_underflow: bool,
-    /// 零 background read、一个 target read 时精确条件检验的 exposure 参考概率。
-    /// 字段名为 v0 兼容保留；它不是多 read 检验的数学硬地板。
+
     pub p_resolution_floor: f64,
-    /// 旧 plug-in Poisson 上尾，仅作诊断，不参与主 adjusted-p 或判定。
+
     pub poisson_p: Option<f64>,
-    /// v0 兼容字段；当前主路径不拟合未经验证的 NB dispersion。
+
     pub nb_p: Option<f64>,
     pub stratum: String,
     pub stratum_decoy_count: usize,
-    /// v0 兼容字段；现与 `reads` 相同，所有直接 validation read-end 只计一次。
-    /// split 是独立 integration evidence，不再从通用检测计数中扣除。
+
     pub n_plain: u64,
-    /// 同层诱饵直接 reads 按 target/background 参考长度比换算的 target 期望。
+
     pub expected_hits: f64,
-    /// 同层诱饵直接 reads 率，归一化为每 10M validation read-ends 的每碱基率；
-    /// 不含未经验证的 EB 收缩。
+
     pub lambda_bg_layer: f64,
-    /// n_plain / expected_hits；期望 = 0 时 None（TSV 输出 "-"）。
+
     pub depth_fold: Option<f64>,
-    /// validation read-ends / million selected validation read-ends；只作丰度描述，
-    /// 不作为未经校准的硬判定门槛。
+
     pub depth_rpm: f64,
-    /// p 是否不高于单 target event 的 exposure 参考概率；仅披露，不进 adjusted-p。
+
     pub p_floor_flag: bool,
-    /// v0 兼容字段；固定族 BH 使用 π0=1。
+
     pub pi0: f64,
-    /// 候选报告门：模型 adjusted-p、breadth 和分布窗口；不是样本级/临床结论。
+
     pub decision: &'static str,
     pub decision_reasons: Vec<&'static str>,
-    /// 与通用检测正交：NONE / UNCLUSTERED_SPLIT / SUPPORTED_SITE。
+
     pub integration_evidence: &'static str,
-    /// validation 对齐中点占据的代表序列固定位置分区数。
+
     pub distinct_windows: u64,
-    /// discovery 固定的 BH 检验族大小，包含 validation 为零的假设。
+
     pub test_family_size: usize,
     pub background_status: &'static str,
     pub background_scope: &'static str,
@@ -96,8 +92,6 @@ pub struct Candidate {
     pub background_cross_stratum_reads: u64,
 }
 
-/// 抽样、折分和歧义审计元数据。所有计数均为实际观测值；不把 Horvitz–Thompson
-/// 估计伪装成全量精确计数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SamplingReport {
     pub method: &'static str,
@@ -158,11 +152,6 @@ fn probability_status(underflow: bool) -> &'static str {
     }
 }
 
-/// 写 `{out}.json` 与 `{out}.tsv`，返回两个路径。
-/// `index_*`：本次运行所用索引的溯源摘要（source=loaded|built，manifest 的
-/// BLAKE3），写入 JSON 的顶层 `index` 块；
-/// TSV 列契约不变。
-// 参数直接对应稳定的运行元数据与候选输出，聚合封装会增加无必要层级。
 #[allow(clippy::too_many_arguments)]
 pub fn write_report(
     out_prefix: &Path,
@@ -184,7 +173,7 @@ pub fn write_report(
             .iter()
             .any(|candidate| candidate.test_family_size != test_family_size)
     {
-        return Err("报告候选与固定检验族大小不一致".to_string());
+        return Err("Reported candidates do not match the fixed testing-family size".to_string());
     }
     for candidate in candidates {
         let required = [
@@ -201,7 +190,10 @@ pub fn write_report(
         ];
         for (name, value) in required {
             if !value.is_finite() {
-                return Err(format!("候选 {} 的 {name} 非有限", candidate.contig));
+                return Err(format!(
+                    "Candidate {} has non-finite {name}",
+                    candidate.contig
+                ));
             }
         }
         for (name, value) in [
@@ -210,11 +202,14 @@ pub fn write_report(
             ("depth_fold", candidate.depth_fold),
         ] {
             if value.is_some_and(|value| !value.is_finite()) {
-                return Err(format!("候选 {} 的 {name} 非有限", candidate.contig));
+                return Err(format!(
+                    "Candidate {} has non-finite {name}",
+                    candidate.contig
+                ));
             }
         }
     }
-    // 前缀拼接（与 work_dir 的 `{out}.work` 约定一致；with_extension 会剥掉 .out 等后缀）
+
     let json_path = PathBuf::from(format!("{}.json", out_prefix.display()));
     let tsv_path = PathBuf::from(format!("{}.tsv", out_prefix.display()));
 
@@ -276,8 +271,7 @@ pub fn write_report(
             sampling.target_validation_unassigned,
             sampling.decoy_validation_unassigned,
         ));
-        // 阈值 source 分类：literature = 文献公式；community-convention = 社区惯例；
-        // literature-adapted = 文献原则的公开算法化实现；uncalibrated = 尚无正式校准依据。
+
         body.push_str(&format!(
             "  \"thresholds\": {{\n    \"k\": {{\"value\": {k}, \"source\": \"community-convention\"}},\n    \"min_mapq\": {{\"value\": {}, \"source\": \"uncalibrated\"}},\n    \"max_nm\": {{\"value\": {}, \"source\": \"uncalibrated\"}},\n    \"min_as_diff\": {{\"value\": {}, \"source\": \"uncalibrated\"}},\n    \"best_n\": {{\"value\": {}, \"source\": \"uncalibrated\", \"scope\": \"ordinary_mapper_only\"}},\n    \"ambiguity_audit\": {{\"mode\": \"all_chains\", \"max_hits_per_read\": {}}},\n    \"split_softclip\": {{\"value\": {}, \"source\": \"community-convention\", \"decision_role\": \"integration_evidence_only\"}},\n    \"split_mapq\": {{\"value\": {}, \"source\": \"community-convention\", \"decision_role\": \"integration_evidence_only\"}},\n    \"site_cluster_bp\": {{\"value\": {}, \"source\": \"community-convention\"}},\n    \"site_dedup_bp\": {{\"value\": {}, \"source\": \"community-convention\"}},\n    \"min_site_support\": {{\"value\": {}, \"source\": \"community-convention\", \"calibration_status\": \"unvalidated\"}},\n    \"synthetic_decoy_calibration\": {{\"source\": \"uncalibrated\", \"classical_fdr_guarantee\": false, \"role\": \"target_derived_null_stress_reference\"}},\n    \"model_p\": {{\"method\": \"exact_conditional_two_poisson_rates\", \"reference_id\": \"R_stats_poisson.test\", \"target_exposure\": \"sum_internal_index_contig_bases\", \"background_pool\": \"size_gc_for_single_index_member_global_for_composite\", \"null_calibration_status\": \"unvalidated_synthetic_decoy_exchangeability\"}},\n    \"multiple_testing\": {{\"method\": \"benjamini_hochberg\", \"family\": \"all_discovery_hypotheses_including_zero_validation_evidence\", \"classical_fdr_guarantee\": false}},\n    \"model_adjusted_p_max\": {{\"value\": {:.2}, \"source\": \"uncalibrated\", \"prespecified\": true}},\n    \"coverage_min\": {{\"value\": {:.2}, \"source\": \"literature-adapted\", \"reference_id\": \"doi:10.1128/jcm.00345-24\", \"applicability\": \"not_validated_for_all_viroflash_inputs\"}},\n    \"min_distributed_windows\": {{\"value\": {}, \"bins\": {}, \"source\": \"uncalibrated\", \"rationale\": \"operationalizes_distributed_nonoverlapping_evidence\"}},\n    \"confidence_bands\": {{\"status\": \"withdrawn_until_calibrated\"}}\n  }},\n",
             crate::align::MIN_MAPQ,
@@ -295,8 +289,7 @@ pub fn write_report(
             crate::MIN_DISTRIBUTED_WINDOWS,
             crate::DISTRIBUTED_WINDOW_BINS,
         ));
-        // 索引溯源：本次运行所用索引的来源、格式版本与 manifest 校验和
-        //（可审计的参数来源约定；旧字段不受影响）。
+
         body.push_str(&format!(
             "  \"index\": {{\"source\": \"{}\", \"format_version\": {}, \"manifest_blake3\": \"{}\"}},\n",
             index_source, index_format_version, manifest_blake3
@@ -429,25 +422,23 @@ pub fn write_report(
         body.push_str("  ]\n}\n");
 
         let file = File::create(&json_path)
-            .map_err(|e| format!("无法创建 {}: {e}", json_path.display()))?;
+            .map_err(|e| format!("Cannot create {}: {e}", json_path.display()))?;
         let mut w = BufWriter::new(file);
         w.write_all(body.as_bytes())
-            .map_err(|e| format!("写报告失败: {e}"))?;
-        w.flush().map_err(|e| format!("写报告失败: {e}"))?;
+            .map_err(|e| format!("Failed to write report: {e}"))?;
+        w.flush()
+            .map_err(|e| format!("Failed to write report: {e}"))?;
     }
 
     {
-        // TSV：固定 22 列的行级契约。
-        // adjusted-p<探索阈值的候选逐行明细；其余候选合并为审计汇总。空候选汇总
-        // 明确声明不等价于样本级 NOT_DETECTED。
-        let file =
-            File::create(&tsv_path).map_err(|e| format!("无法创建 {}: {e}", tsv_path.display()))?;
+        let file = File::create(&tsv_path)
+            .map_err(|e| format!("Cannot create {}: {e}", tsv_path.display()))?;
         let mut w = BufWriter::new(file);
         writeln!(
             w,
             "sample_id\tvirus_id\ttaxid\tresolution_level\treads_plain\tsplit_reads\tdiscordant_pairs\tdistinct_windows\taligned_bases\texpected_hits\tlambda_bg_layer\tdepth_fold\tp_value\tp_floor_flag\tpi0\tq_value\tdecision\tevidence_strength\tcoverage_breadth\tbccp\tdecaf_grade\tnotes"
         )
-        .map_err(|e| format!("写报告失败: {e}"))?;
+        .map_err(|e| format!("Failed to write report: {e}"))?;
         let fmt_depth = |v: Option<f64>| match v {
             Some(x) => fmt_sci(x),
             None => "-".to_string(),
@@ -512,10 +503,9 @@ pub fn write_report(
                 fmt_sci(c.covered_frac),
                 notes
             )
-            .map_err(|e| format!("写报告失败: {e}"))?;
+            .map_err(|e| format!("Failed to write report: {e}"))?;
         }
-        // 仅合并实际存在但 model adjusted-p 未过门的候选。真正空候选 TSV 只保留
-        // 表头，避免伪候选行被下游误解为样本级阴性结论。
+
         if !candidates.is_empty() && (significant.is_empty() || !merged.is_empty()) {
             let max_q = merged
                 .iter()
@@ -534,9 +524,10 @@ pub fn write_report(
                 merged.len(),
                 max_q_s,
             )
-            .map_err(|e| format!("写报告失败: {e}"))?;
+            .map_err(|e| format!("Failed to write report: {e}"))?;
         }
-        w.flush().map_err(|e| format!("写报告失败: {e}"))?;
+        w.flush()
+            .map_err(|e| format!("Failed to write report: {e}"))?;
     }
 
     Ok((json_path, tsv_path))
@@ -627,7 +618,10 @@ mod tests {
     fn escape_quotes_and_controls() {
         assert_eq!(json_escape("a\"b"), "a\\\"b");
         assert_eq!(json_escape("a\nb"), "a\\nb");
-        assert_eq!(json_escape("正常中文"), "正常中文");
+        assert_eq!(
+            json_escape("ordinary Unicode text"),
+            "ordinary Unicode text"
+        );
     }
 
     #[test]
@@ -675,7 +669,11 @@ mod tests {
         assert!(json.contains("\"test_family_size\": 2"));
         assert!(json.contains("\"unreported_zero_evidence_hypotheses\": 1"));
         for line in tsv.lines() {
-            assert_eq!(line.split('\t').count(), 22, "TSV 列数错误: {line}");
+            assert_eq!(
+                line.split('\t').count(),
+                22,
+                "Incorrect TSV column count: {line}"
+            );
         }
         assert!(tsv.contains("row_type=candidate;"));
         assert!(tsv.contains("result_schema=viroflash.result.v1"));
@@ -712,7 +710,11 @@ mod tests {
         assert!(json.contains("\"test_family_size\": 2"));
         assert!(json.contains("\"reported_candidates\": 0"));
         assert!(json.contains("\"unreported_zero_evidence_hypotheses\": 2"));
-        assert_eq!(tsv.lines().count(), 1, "空候选 TSV 只能包含表头");
+        assert_eq!(
+            tsv.lines().count(),
+            1,
+            "An empty-candidate TSV must contain only its header"
+        );
         assert!(!tsv.contains("candidate_summary"));
         let _ = std::fs::remove_file(json_path);
         let _ = std::fs::remove_file(tsv_path);

@@ -1,10 +1,10 @@
-//! fragment 的确定性 bottom-k 抽样与发现/验证折分。
+//! Deterministic bottom-k fragment sampling and discovery/validation fold assignment.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// 默认抽样容量。它限制任意输入规模下保留的序列内存与后续比对工作量；
-/// `N <= K` 时退化为全量处理，不是 panel 或阳性判定阈值。
+/// Default sample capacity, bounding retained sequence memory and downstream alignment work for any
+/// input size. `N <= K` processes all input and does not represent a panel or positivity threshold.
 pub const DEFAULT_SAMPLE_PAIRS: usize = 524_288;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +23,8 @@ pub struct SamplingResult {
     pub inclusion_probability: f64,
 }
 
-/// 同一 fragment 的两个 read-end 必须进入同一折，防止一端参与发现、另一端又
-/// 参与验证。ordinal 让重复 qname 的独立输入记录不会永久绑定在同一折。
+/// Both read ends from one fragment share a fold, preventing one end from discovering a hypothesis
+/// that the other validates. The ordinal keeps duplicate-qname records independently assignable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvidenceFold {
     Discovery,
@@ -34,7 +34,7 @@ pub enum EvidenceFold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct InclusionKey {
     digest: [u8; 32],
-    /// 仅在摘要相同（重复 ID 或哈希碰撞）时参与排序。
+    /// Ordering tie-breaker used only for equal digests from duplicate IDs or hash collisions.
     ordinal: u64,
 }
 
@@ -72,7 +72,7 @@ fn inclusion_key(r1_id: &[u8], ordinal: u64) -> InclusionKey {
     hasher.update(&ordinal.to_le_bytes());
     InclusionKey {
         digest: *hasher.finalize().as_bytes(),
-        // BLAKE3 碰撞时仍以稳定唯一序号给出全序。
+        // A stable unique ordinal provides a total order even after a BLAKE3 collision.
         ordinal,
     }
 }
@@ -98,10 +98,10 @@ pub struct PairReservoir {
 }
 
 impl PairReservoir {
-    /// 创建固定容量的 bottom-k reservoir。
+    /// Create a fixed-capacity bottom-k reservoir.
     pub fn new(capacity: usize) -> Result<Self, String> {
         if capacity == 0 {
-            return Err("sampling capacity 必须大于 0".to_string());
+            return Err("sampling capacity must be greater than 0".to_string());
         }
         Ok(Self {
             capacity,
@@ -110,11 +110,11 @@ impl PairReservoir {
         })
     }
 
-    /// 观察一个已完成配对校验的 PE fragment。
+    /// Observe one paired-end fragment after pair validation.
     ///
-    /// `ordinal` 必须是 fragment 在原始输入中的稳定唯一序号。抽样层不承担
-    /// k-mer 门控：先完成 bottom-k，再只门控最终 K 项，避免对全部输入随机访问
-    /// 大 Bloom。R1 ID 与 ordinal 共同进入域分离 BLAKE3，重复 ID 仍独立抽样。
+    /// `ordinal` is the fragment's stable unique input position. Sampling precedes k-mer gating so
+    /// only the final K items probe the large Bloom filter. Domain-separated BLAKE3 incorporates
+    /// both R1 ID and ordinal, keeping duplicate IDs independently sampled.
     pub fn observe(
         &mut self,
         ordinal: u64,
@@ -123,11 +123,11 @@ impl PairReservoir {
         r2_seq: &[u8],
     ) -> Result<(), String> {
         let qname = std::str::from_utf8(r1_id)
-            .map_err(|error| format!("R1 fragment ID 不是有效 UTF-8: {error}"))?;
+            .map_err(|error| format!("R1 fragment ID is not valid UTF-8: {error}"))?;
         let next_seen = self
             .seen_pairs
             .checked_add(1)
-            .ok_or_else(|| "fragment 计数溢出".to_string())?;
+            .ok_or_else(|| "fragment count overflow".to_string())?;
         let key = inclusion_key(r1_id, ordinal);
         let enters_sample = self.selected.len() < self.capacity
             || self
@@ -153,7 +153,7 @@ impl PairReservoir {
         Ok(())
     }
 
-    /// 完成抽样；入选 pair 按原始 ordinal 升序返回。
+    /// Finish sampling and return selected pairs in ascending original-ordinal order.
     pub fn finish(self) -> SamplingResult {
         let selected_pairs = self.selected.len() as u64;
         let mut pairs: Vec<OwnedPair> = self
@@ -255,11 +255,11 @@ mod tests {
     }
 
     fn observe_all(records: &[Input], capacity: usize) -> SamplingResult {
-        let mut reservoir = PairReservoir::new(capacity).expect("有效容量");
+        let mut reservoir = PairReservoir::new(capacity).expect("valid capacity");
         for record in records {
             reservoir
                 .observe(record.ordinal, record.id, record.r1_seq, record.r2_seq)
-                .expect("有效 fragment");
+                .expect("valid fragment");
         }
         reservoir.finish()
     }
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_is_rejected() {
-        let error = PairReservoir::new(0).expect_err("零容量必须报错");
+        let error = PairReservoir::new(0).expect_err("zero capacity must return an error");
         assert!(error.contains("capacity"));
     }
 
@@ -297,7 +297,7 @@ mod tests {
         let mut reservoir = PairReservoir::new(2).unwrap();
         let error = reservoir
             .observe(0, &[0xff], b"AC", b"GT")
-            .expect_err("非 UTF-8 ID 必须报错");
+            .expect_err("non-UTF-8 ID must return an error");
         assert!(error.contains("UTF-8"));
 
         let result = reservoir.finish();
@@ -428,7 +428,7 @@ mod tests {
     fn fold_is_deterministic_and_shared_by_both_read_ends() {
         let first = evidence_fold("fragment/1", 42);
         assert_eq!(first, evidence_fold("fragment/1", 42));
-        // 调用方只按 fragment 调一次，因此两个 read-end 共享这一结果。
+        // The caller invokes this once per fragment, so both read ends share the result.
         assert!(matches!(
             first,
             EvidenceFold::Discovery | EvidenceFold::Validation

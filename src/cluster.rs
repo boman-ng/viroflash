@@ -1,13 +1,13 @@
-//! 候选聚类：位点 2bp 锚点聚类（唯一 qname 支持度 ≥2）→ 断裂点 5bp 锚点去重（均值合并）。
-//! 聚类、去重和最小支持度阈值集中定义在本模块。
+//! Candidate clustering: 2 bp anchored site clusters with at least two unique qnames, followed by
+//! 5 bp anchored breakpoint deduplication using mean positions. This module owns all thresholds.
 
 use std::collections::HashSet;
 
-/// 位点聚类容差（bp）。
+/// Site-clustering tolerance in base pairs.
 pub const CLUSTER_TOLERANCE: i64 = 2;
-/// 断裂点去重容差（bp）。
+/// Breakpoint-deduplication tolerance in base pairs.
 pub const DEDUP_TOLERANCE: i64 = 5;
-/// 出位点的最小支持 read（唯一 qname）数。
+/// Minimum unique-qname read support required to emit a site.
 pub const MIN_SITE_SUPPORT: usize = 2;
 
 fn mean_round(values: &[i64]) -> i64 {
@@ -16,7 +16,7 @@ fn mean_round(values: &[i64]) -> i64 {
     (sum as f64 / n as f64).round() as i64
 }
 
-/// 断裂点事件：目标 contig 上的一个 split-read 断点。
+/// One split-read breakpoint event on a target contig.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteEvent {
     pub contig: String,
@@ -24,24 +24,24 @@ pub struct SiteEvent {
     pub host_contig: String,
     pub host_pos: i64,
     pub direction: String,
-    /// 来源 read ID：支持度按唯一 qname 计数。
+    /// Source read ID; support counts unique qnames.
     pub qname: String,
 }
 
-/// 聚类后的整合位点。
+/// Clustered integration site.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Site {
     pub contig: String,
     pub pos: i64,
-    /// 唯一 qname 支持数（5bp 去重合并时相加）。
+    /// Unique-qname support, summed during 5 bp deduplication.
     pub support: usize,
     pub host_contig: String,
     pub host_pos: i64,
     pub direction: String,
 }
 
-/// 位点聚类：同 (target contig, host contig) 内按 2bp 锚点聚类（支持度 = 唯一 qname
-/// ≥ min_support），再对出站位点做 5bp 锚点去重（位置均值合并，支持度相加）。
+/// Cluster within each target/host contig pair using 2 bp anchors and unique-qname support, then
+/// deduplicate emitted sites within 5 bp by averaging positions and summing support.
 pub fn cluster_sites(events: &[SiteEvent], min_support: usize) -> Vec<Site> {
     let mut sorted: Vec<&SiteEvent> = events.iter().collect();
     sorted.sort_by(|a, b| {
@@ -63,8 +63,8 @@ pub fn cluster_sites(events: &[SiteEvent], min_support: usize) -> Vec<Site> {
     sites
 }
 
-/// 2bp 锚点聚类（viroflash SummarizeIntegrationSite:1111）：同 (contig × host) 组内
-/// 窗口起点锚定，positions[j] − positions[i] ≤ 2 归入同簇；支持度 = 簇内唯一 qname 数。
+/// Anchor a 2 bp window at its first position within each contig/host group. Positions at most
+/// 2 bp from that anchor share a cluster; support is the number of unique qnames.
 fn push_clustered(sites: &mut Vec<Site>, group: &[&SiteEvent], min_support: usize) {
     let mut i = 0;
     while i < group.len() {
@@ -93,8 +93,7 @@ fn push_clustered(sites: &mut Vec<Site>, group: &[&SiteEvent], min_support: usiz
     }
 }
 
-/// 5bp 锚点去重（viroflash DeduplicateBreakpointPositions:1314）：位点位置差 ≤5 合并为
-/// 均值；合并组的支持度相加（各 2bp 簇的 qname 已去重且位置不重叠）。
+/// Deduplicate 2 bp clusters within a 5 bp anchor window, averaging positions and summing support.
 fn dedup_sites(sites: &mut Vec<Site>) {
     sites.sort_by(|a, b| {
         (&a.contig, &a.host_contig, a.pos).cmp(&(&b.contig, &b.host_contig, b.pos))
@@ -151,7 +150,7 @@ mod tests {
 
     #[test]
     fn cluster_sites_clusters_2bp_and_counts_qnames() {
-        // 100/101 同 2bp 簇 → 位点 (100+101)/2 → 101；105 单独成簇支持 1 被丢弃
+        // 100/101 share a cluster centered at 101; singleton 105 lacks support and is discarded.
         let events = vec![
             ev("target_0", 100, 1000, "r1"),
             ev("target_0", 101, 1001, "r2"),
@@ -167,7 +166,7 @@ mod tests {
 
     #[test]
     fn cluster_sites_dedups_nearby_sites_by_5bp() {
-        // 两个 2bp 簇（101 与 106），5bp 去重合并为 (101+106)/2 → 104，支持度相加
+        // Clusters at 101 and 106 merge within 5 bp to position 104 and combine support.
         let events = vec![
             ev("target_0", 100, 1000, "r1"),
             ev("target_0", 101, 1001, "r2"),
@@ -198,7 +197,7 @@ mod tests {
 
     #[test]
     fn cluster_sites_dedups_qnames_for_support() {
-        // 同一 fragment（r1/r2 各一条事件，同 qname）只计 1 个支持
+        // R1 and R2 events from one fragment share a qname and contribute one support count.
         let events = vec![
             ev("target_0", 100, 1000, "same_read"),
             ev("target_0", 100, 1000, "same_read"),

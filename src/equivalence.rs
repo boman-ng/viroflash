@@ -1,28 +1,28 @@
-//! 直接证据等价类的复合假设。
+//! Compound hypotheses derived from direct evidence equivalence classes.
 //!
-//! discovery 证据单元的目标成员集合是超边：共享任一成员的超边属于同一连通块。
-//! 每个块的 `members` 是直接出现成员的并集，语义为 OR hypothesis，不把证据归因
-//! 到任一单独成员；`explanation` 只是该块的简约解释，不改变假设边界。
+//! Each discovery evidence unit contributes a target-member hyperedge. Hyperedges sharing any
+//! member belong to one connected component. A component's `members` union forms an OR hypothesis;
+//! `explanation` is only a compact description and does not narrow attribution.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// 由 discovery 直接证据构成的复合假设。
+/// Compound hypothesis built from direct discovery evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositeHypothesis {
-    /// 连通块内直接出现的全部成员，按 ID 升序排列；整体表示 OR hypothesis。
+    /// All directly observed component members, sorted by ID; collectively an OR hypothesis.
     pub members: Vec<usize>,
-    /// weighted greedy hitting-set 近似得到的简约解释，按 ID 升序排列。
+    /// Compact weighted-greedy hitting-set approximation, sorted by ID.
     pub explanation: Vec<usize>,
-    /// 归入该连通块的非空 discovery 证据单元数。调用方当前以 read-end 为
-    /// 单元；每个输入单元恰好计一次，与命中成员数无关。
+    /// Number of non-empty discovery evidence units in the component. Callers currently use one
+    /// read end per unit; every input unit counts once regardless of member count.
     pub discovery_observations: u64,
 }
 
-/// 从 discovery 证据单元的目标成员集合构造互不重叠的复合假设。
+/// Build disjoint compound hypotheses from discovery target-member sets.
 ///
-/// 每个观测会先在函数内按成员 ID 排序、去重；空集合被忽略。不同观测即使
-/// 规范化后集合相同，仍各占一票。返回结果按 `members` 字典序稳定排列，因此
-/// 不依赖观测顺序或观测内成员顺序。
+/// Members are sorted and deduplicated per observation; empty sets are ignored. Distinct
+/// observations retain separate votes even when their normalized sets match. Results are sorted
+/// lexicographically by `members`, independent of observation and member order.
 pub fn build_composite_hypotheses(
     discovery_fragment_members: &[Vec<usize>],
 ) -> Vec<CompositeHypothesis> {
@@ -31,8 +31,8 @@ pub fn build_composite_hypotheses(
         return Vec::new();
     }
 
-    // 倒排表直接表达超图关联。遍历某个成员时展开包含它的 fragment，再从该
-    // fragment 展开其余成员；无需把一条大超边物化为全部成员对。
+    // The inverted index encodes hypergraph adjacency directly. Expand member postings and then
+    // their remaining members without materializing every pair in a large hyperedge.
     let mut member_fragments = BTreeMap::<usize, Vec<usize>>::new();
     for (fragment_index, members) in fragments.iter().enumerate() {
         for &member in members {
@@ -64,7 +64,7 @@ pub fn build_composite_hypotheses(
 
             if let Some(fragment_indices) = member_fragments.get(&member) {
                 for &fragment_index in fragment_indices {
-                    // 同一超边会出现在多个成员的 posting 中，但只能归属、计数一次。
+                    // One hyperedge occurs in multiple postings but belongs to and counts once.
                     if visited_fragments[fragment_index] {
                         continue;
                     }
@@ -96,10 +96,11 @@ pub fn build_composite_hypotheses(
     hypotheses
 }
 
-/// 返回 validation 证据单元所属的已发现假设下标。
+/// Return the discovered hypothesis index containing a validation evidence unit.
 ///
-/// validation 集合在函数内排序、去重。集合必须非空，且每个成员都已由 discovery
-/// 发现并属于同一个假设；未知成员或跨假设集合返回 `None`，不会扩张已有假设。
+/// The validation set is sorted and deduplicated. It must be non-empty and every member must have
+/// been discovered in one hypothesis. Unknown or cross-hypothesis sets return `None` and never
+/// expand an existing hypothesis.
 pub fn validation_hypothesis_index(
     hypotheses: &[CompositeHypothesis],
     validation_members: &[usize],
@@ -133,15 +134,15 @@ fn canonical_fragments(discovery_fragment_members: &[Vec<usize>]) -> Vec<Vec<usi
             fragments.push(members);
         }
     }
-    // 不对相同集合做跨 fragment 去重：每个输入 fragment 都保留一票。
+    // Do not deduplicate equal sets across fragments; every input fragment retains one vote.
     fragments.sort_unstable();
     fragments
 }
 
-/// 等权 fragment 的 deterministic weighted greedy minimum-hitting-set 近似。
+/// Deterministic weighted-greedy minimum-hitting-set approximation for equal-weight fragments.
 ///
-/// 每轮选择覆盖最多未覆盖集合的成员；票数相同时选择较小 ID。返回值最终按 ID
-/// 排序，因为它是解释集合而不是成员排名。
+/// Each round chooses the member covering the most uncovered sets and breaks ties by lower ID.
+/// The final values are ID-sorted because they form an explanation set, not a ranking.
 fn greedy_explanation(fragment_sets: &[&[usize]]) -> Vec<usize> {
     let mut uncovered = vec![true; fragment_sets.len()];
     let mut remaining = fragment_sets.len();
@@ -153,8 +154,7 @@ fn greedy_explanation(fragment_sets: &[&[usize]]) -> Vec<usize> {
             if !is_uncovered {
                 continue;
             }
-            // members 已在 canonical_fragments 中去重，所以一个 fragment 对同一
-            // member 至多投一票。
+            // canonical_fragments already deduplicates members, so a fragment votes once per member.
             for &member in *members {
                 *votes.entry(member).or_default() += 1;
             }
@@ -168,7 +168,7 @@ fn greedy_explanation(fragment_sets: &[&[usize]]) -> Vec<usize> {
                 best_votes = member_votes;
             }
         }
-        // 所有传入集合都非空；该分支只保护私有函数未来改动时不产生死循环。
+        // Inputs are non-empty; this guard prevents future private changes from looping forever.
         if best_votes == 0 {
             break;
         }
@@ -268,8 +268,8 @@ mod tests {
     fn one_observation_is_counted_and_weighted_once() {
         let hypotheses = build_composite_hypotheses(&[vec![4, 1, 4, 2, 3, 1]]);
 
-        // 单条超边虽可从四个 posting 到达，证据单元数仍为 1；规范化后四个成员
-        // 各得一票，tie 选择最小 ID 1。
+        // One hyperedge is reachable through four postings but remains one evidence unit. Each
+        // normalized member gets one vote and the tie resolves to the lowest ID, 1.
         assert_eq!(hypotheses, vec![hypothesis(&[1, 2, 3, 4], &[1], 1)]);
     }
 

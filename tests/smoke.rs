@@ -1,9 +1,6 @@
-//! 合成数据端到端冒烟测试：随机宿主/目标/诱饵/污染参考 + 合成读对。
-//! 覆盖：
-//! - 「--index 加载」与「FASTA 自动构建」两条路径结果逐候选一致（等价性契约）；
-//! - 目标候选通过精确率检验 adjusted-p 与分布门（输出文件生成）；
-//! - 未提供 --decoy-fa 时自动生成诱饵并写入索引；
-//! - 索引 k 不一致、--index 与 FASTA 互斥的错误路径。
+//! End-to-end smoke tests using random host, target, decoy, and contaminant references plus
+//! synthetic read pairs. Covers reusable-index/autobuild equivalence, target reporting through the
+//! exact-rate and distribution gates, automatic decoys, k mismatch, and conflicting input modes.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -15,7 +12,7 @@ use flate2::Compression;
 use viroflash::index::{self, IndexOptions};
 use viroflash::{run_pipeline, Options};
 
-/// xorshift64 确定性随机源。
+/// Deterministic xorshift64 random source.
 struct Rng(u64);
 
 impl Rng {
@@ -34,8 +31,8 @@ impl Rng {
             .collect()
     }
 
-    /// 精确 50% GC 的随机序列：一半 AT、一半 CG 后洗牌，
-    /// 保证目标与全部诱饵落入同一 gc 分层（gc:0.50-0.60）。
+    /// Random sequence with exactly 50% GC, shuffled after generating equal AT and CG halves.
+    /// This keeps the target and every decoy in the same GC stratum.
     fn half_gc_seq(&mut self, n: usize) -> Vec<u8> {
         let mut half: Vec<u8> = (0..n)
             .map(|i| {
@@ -46,7 +43,7 @@ impl Rng {
                 }
             })
             .collect();
-        // Fisher-Yates 洗牌（用同一 rng）
+        // Fisher-Yates shuffle using the same RNG.
         for i in (1..half.len()).rev() {
             let j = (self.next() % (i as u64 + 1)) as usize;
             half.swap(i, j);
@@ -99,7 +96,7 @@ fn synthetic_workspace(tag: &str) -> PathBuf {
     dir
 }
 
-/// 写四类参考与合成读对，返回工作目录。
+/// Write all four reference roles and synthetic read pairs, returning the work directory.
 fn setup_synthetic(tag: &str) -> PathBuf {
     let dir = synthetic_workspace(tag);
     let mut rng = Rng(0x9e3779b97f4a7c15);
@@ -125,8 +122,8 @@ fn setup_synthetic(tag: &str) -> PathBuf {
     );
     write_fasta(&dir.join("contam.fa"), &[("mycoplasma", &contam)]);
 
-    // 30 个目标对（来自 target 三段分布区域）+ 30 个宿主对。三段使该夹具明确
-    // 覆盖通用检测的 distributed-windows PASS 路径，而不依赖 split 证据。
+    // Thirty target pairs across three distributed regions plus thirty host pairs exercise the
+    // distributed-window PASS path without relying on split evidence.
     let mut r1: Vec<(String, Vec<u8>)> = Vec::new();
     let mut r2: Vec<(String, Vec<u8>)> = Vec::new();
     for i in 0..30 {
@@ -160,12 +157,12 @@ fn setup_synthetic(tag: &str) -> PathBuf {
     dir
 }
 
-/// 基础断言：目标候选被检出、背景受控、输出文件生成。
+/// Assert target reporting, controlled background, and generated output files.
 fn assert_detected(summary: &viroflash::RunSummary) {
     assert_eq!(summary.input_pairs, 60);
     assert!(
         summary.prescreen_pairs >= 30,
-        "预筛至少保留全部目标对: {}",
+        "prescreen must retain at least all target pairs: {}",
         summary.prescreen_pairs
     );
 
@@ -173,27 +170,30 @@ fn assert_detected(summary: &viroflash::RunSummary) {
         .candidates
         .iter()
         .find(|c| c.contig == "target_0")
-        .expect("应检出 target_0 候选");
+        .expect("target_0 candidate should be reported");
     assert_eq!(summary.test_family_size, 1);
     assert!(
         cand.covered_frac >= 0.2,
-        "覆盖比例过低: {:.3}",
+        "breadth is too low: {:.3}",
         cand.covered_frac
     );
     assert!(
         cand.q_value <= 0.2,
-        "模型 adjusted-p 应通过探索阈值（同层 decoy 无覆盖）: {:.4}",
+        "model adjusted p-value should pass the exploratory threshold with no same-stratum decoy coverage: {:.4}",
         cand.q_value
     );
     assert_eq!(cand.decision, "PASS");
     assert!(cand.distinct_windows >= 3);
     assert_eq!(cand.confidence(), "UNVALIDATED");
-    assert_eq!(cand.n_plain, cand.reads, "split 不得改变通用检测计数");
+    assert_eq!(
+        cand.n_plain, cand.reads,
+        "split evidence must not change general detection counts"
+    );
     assert_eq!(
         cand.background_status, "SYNTHETIC_DECOY_UNVALIDATED",
-        "报告必须披露 synthetic-decoy null 未校准"
+        "the report must disclose that the synthetic-decoy null is uncalibrated"
     );
-    // 合成读无嵌合，不应有 split/discordant 证据
+    // Synthetic reads are not chimeric and should have no split or discordant evidence.
     assert_eq!(cand.split_events, 0);
     assert_eq!(cand.discordant, 0);
     assert_eq!(cand.integration_evidence, "NONE");
@@ -212,7 +212,11 @@ fn assert_detected(summary: &viroflash::RunSummary) {
     assert!(result_tsv.contains("qc_status=NOT_EVALUATED"));
     assert!(result_tsv.contains("member_attribution=not_resolved"));
     for line in result_tsv.lines() {
-        assert_eq!(line.split('\t').count(), 22, "TSV 固定列契约: {line}");
+        assert_eq!(
+            line.split('\t').count(),
+            22,
+            "fixed 22-column TSV contract: {line}"
+        );
     }
     let perf_json = summary.result_json.with_extension("perf.json");
     let perf_tsv = summary.result_tsv.with_extension("perf.tsv");
@@ -221,14 +225,17 @@ fn assert_detected(summary: &viroflash::RunSummary) {
     let perf = std::fs::read_to_string(perf_json).unwrap();
     assert!(perf.contains("\"schema\": \"viroflash.perf.v1\""));
     assert!(perf.contains("\"status\": \"success\""));
-    assert!(!perf.contains("reads_R1.fq.gz"), "性能报告不得泄露输入路径");
+    assert!(
+        !perf.contains("reads_R1.fq.gz"),
+        "performance reports must not expose input paths"
+    );
 }
 
 #[test]
 fn e2e_index_and_autobuild_paths_agree() {
     let dir = setup_synthetic("equiv");
 
-    // 路径 A：先构建索引目录，再 --index 加载运行。
+    // Path A: build an index directory, then load it with --index.
     let index_opts = IndexOptions {
         host_fa: dir.join("host.fa"),
         target_fa: dir.join("target.fa"),
@@ -261,7 +268,7 @@ fn e2e_index_and_autobuild_paths_agree() {
     })
     .unwrap();
 
-    // 路径 B：直接给 FASTA，自动构建（与 index 命令共用同一构建函数）。
+    // Path B: pass FASTA files directly for automatic construction through the shared builder.
     let summary_built = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         r2: Some(dir.join("reads_R2.fq.gz")),
@@ -279,7 +286,7 @@ fn e2e_index_and_autobuild_paths_agree() {
     assert_detected(&summary_loaded);
     assert_detected(&summary_built);
     assert_eq!(summary_loaded.candidates, summary_built.candidates);
-    // 自动构建的索引落于 <out>.work/index/
+    // Automatic construction writes the index under <out>.work/index/.
     assert!(dir
         .join("out_fa.work")
         .join("index")
@@ -293,7 +300,7 @@ fn e2e_index_and_autobuild_paths_agree() {
 fn e2e_auto_decoy_when_decoy_fa_absent() {
     let dir = setup_synthetic("autodecoy");
 
-    // 未提供 --decoy-fa：索引构建阶段按默认 ANI/seed 从目标自动生成诱饵。
+    // Without --decoy-fa, index construction generates decoys with default ANI and seed.
     let summary = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         r2: Some(dir.join("reads_R2.fq.gz")),
@@ -307,16 +314,19 @@ fn e2e_auto_decoy_when_decoy_fa_absent() {
     .unwrap();
     assert_detected(&summary);
 
-    // 自动诱饵产物与 manifest 的 generated 来源记录
+    // Generated decoy artifacts and their manifest provenance.
     let idx = dir.join("out.work").join("index");
     assert!(idx.join("decoys.fa").is_file());
     assert!(idx.join("decoys.tsv").is_file());
     let manifest = std::fs::read_to_string(idx.join("manifest.json")).unwrap();
     assert!(
         manifest.contains("\"generated\""),
-        "manifest 应记录自动生成诱饵: {manifest}"
+        "manifest should record generated decoys: {manifest}"
     );
-    assert!(manifest.contains("\"anis\""), "manifest 应记录 ANI 层");
+    assert!(
+        manifest.contains("\"anis\""),
+        "manifest should record ANI layers"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -336,7 +346,7 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
     };
     index::build_index(&index_opts).unwrap();
 
-    // k 不一致：加载必须拒绝（Bloom 与索引均按 k 构建）。
+    // Loading must reject a k mismatch because both Bloom and MMI are built for one k.
     let err = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         index: Some(dir.join("idx")),
@@ -345,9 +355,9 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
         ..Options::default()
     })
     .unwrap_err();
-    assert!(err.contains("不一致"), "err={err}");
+    assert!(err.contains("does not match"), "err={err}");
 
-    // --index 与 FASTA 互斥（库层防御，与 CLI 解析双重校验）。
+    // --index and FASTA inputs are mutually exclusive at both library and CLI boundaries.
     let err = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         index: Some(dir.join("idx")),
@@ -356,9 +366,9 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
         ..Options::default()
     })
     .unwrap_err();
-    assert!(err.contains("不能同时使用"), "err={err}");
+    assert!(err.contains("cannot be combined"), "err={err}");
 
-    // 自动构建缺失必填参考。
+    // Automatic construction rejects missing required references.
     let err = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         target_fa: Some(dir.join("target.fa")),

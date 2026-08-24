@@ -1,6 +1,9 @@
-//! 病毒候选检测管线编排：
-//! 索引加载/构建 → 确定性 bottom-k 采样 → Bloom 门控与 ALL_CHAINS 竞争审计 →
-//! discovery 兼容集构造 → validation 独立计数与 decoy 统计判定 → 报告。
+//! End-to-end viroflash pipeline orchestration.
+//!
+//! `run_pipeline` validates inputs, loads or builds one index, performs deterministic bottom-k
+//! sampling, Bloom prescreening, whole-chain competitive alignment, discovery/validation hypothesis
+//! construction, exact statistical testing, and candidate reporting. Thread budgets, ordering,
+//! fold assignment, evidence counting, and report schemas remain deterministic and auditable.
 
 pub mod align;
 pub mod cluster;
@@ -25,10 +28,9 @@ use reference::Role;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub r1: PathBuf,
-    /// None = 单端模式（454/单端测序），每 read 一个 fragment。
+
     pub r2: Option<PathBuf>,
-    /// 已构建索引目录；与四类 FASTA 参数互斥（main.rs 解析与 run_pipeline 双重校验）。
-    /// None = 自动构建（索引产物落 `<out>.work/index/`）。
+
     pub index: Option<PathBuf>,
     pub host_fa: Option<PathBuf>,
     pub target_fa: Option<PathBuf>,
@@ -56,27 +58,21 @@ impl Default for Options {
     }
 }
 
-/// 证据层 corroboration：Mourik 2024 在特定 pan-viral capture 流程中评估了
-/// 10% genome breadth；Miller 2019 在 CSF mNGS 中采用至少 3 个非重叠区域。
-/// 两者都没有验证本项目的跨样本通用阈值。本实现公开采用代表序列 10 等分，以每条
-/// validation read 对齐中点占据的不同分区数衡量；它们是待外部验证的报告门，
-/// 不乘入模型 p/adjusted-p。
 pub const COVERAGE_MIN: f64 = 0.10;
 pub const MIN_DISTRIBUTED_WINDOWS: u64 = 3;
 pub const DISTRIBUTED_WINDOW_BINS: u64 = 10;
-/// 模型 adjusted-p 的探索性候选报告阈值；尚未由独立验证集校准。
+
 pub const MODEL_ADJUSTED_P_MAX: f64 = 0.20;
 
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub input_pairs: u64,
-    /// 在 bottom-k 入选样本中通过 k-mer 门的 pair 数；`input_pairs <= K` 时即全量
-    /// 精确值，否则作用域由 `sampling` 显式披露为 selected sample。
+
     pub prescreen_pairs: u64,
-    /// 比对失败的 fragment 数（minimap2 返回错误；不中止运行但显式披露）。
+
     pub map_errors: u64,
     pub sampling: report::SamplingReport,
-    /// discovery 固定的统计检验族大小，包含 validation 零证据假设。
+
     pub test_family_size: usize,
     pub candidates: Vec<report::Candidate>,
     pub result_json: PathBuf,
@@ -93,20 +89,19 @@ pub fn run_pipeline(opt: &Options) -> Result<RunSummary, String> {
 
 fn validate_run_options(opt: &Options) -> Result<(), String> {
     if opt.threads == 0 {
-        return Err("--threads 必须大于 0".into());
+        return Err("--threads must be greater than 0".into());
     }
     if !(1..=prescreen::K_MAX).contains(&opt.k) {
         return Err(format!(
-            "--k 必须在 1..={} 之间（2-bit 编码上限），得到 {}",
+            "--k must be between 1 and {} (the 2-bit encoding limit); got {}",
             prescreen::K_MAX,
             opt.k
         ));
     }
     if opt.r1.as_os_str().is_empty() {
-        return Err("缺少 --r1".into());
+        return Err("Missing --r1".into());
     }
-    // --index 与四类 FASTA 互斥：加载路径的角色/参考信息全部来自 manifest，
-    // 同时给 FASTA 会造成两个矛盾的参考来源。
+
     let fasta_args: Vec<&str> = [
         ("--host-fa", &opt.host_fa),
         ("--target-fa", &opt.target_fa),
@@ -119,7 +114,7 @@ fn validate_run_options(opt: &Options) -> Result<(), String> {
     .collect();
     if opt.index.is_some() && !fasta_args.is_empty() {
         return Err(format!(
-            "--index 与 {} 不能同时使用（加载索引时参考信息取自 manifest）",
+            "--index cannot be combined with {} (a loaded index obtains reference metadata from its manifest)",
             fasta_args.join("/")
         ));
     }
@@ -133,13 +128,12 @@ fn run_pipeline_inner(
 ) -> Result<RunSummary, String> {
     let work_dir = PathBuf::from(format!("{}.work", opt.out.display()));
     let mut t0 = std::time::Instant::now();
-    // 索引解析：--index 直接加载并校验；否则自动构建（诱饵未提供时按固定默认
-    // 参数自动生成），与 `viroflash index` 共用同一构建入口，两路径结果一致。
+
     let (built, index_source) = match &opt.index {
         Some(dir) => {
             monitor.stage("index_load");
             let loaded = index::load_index(dir, opt.k)?;
-            eprintln!("[阶段] 索引加载 {:.1}s", t0.elapsed().as_secs_f64());
+            eprintln!("[stage] index load {:.1}s", t0.elapsed().as_secs_f64());
             (loaded, "loaded")
         }
         None => {
@@ -156,18 +150,18 @@ fn run_pipeline_inner(
                 ..index::IndexOptions::default()
             };
             let built = index::build_index_with_monitor(&spec, monitor)?;
-            eprintln!("[阶段] 参考构建+索引 {:.1}s", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "[stage] reference and index build {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
             (built, "built")
         }
     };
 
-    // 1. 抽样 + 宽松预筛 + 全链直接证据审计。
     if !built.contigs.iter().any(|c| c.role == Role::Target) {
-        return Err("目标参考中没有序列（索引未含目标或目标 FASTA 为空）".into());
+        return Err("The target reference contains no sequences (the index has no targets or the target FASTA is empty)".into());
     }
-    // Bloom 覆盖全部原始目标与进入索引的诱饵 k-mer 并集。
-    // Bloom 在索引构建阶段生成并持久化（bloom.bin），加载路径直接复用。
-    // --threads 保持为数据管线预算；低频 telemetry sampler 不占 mapper/decompressor。
+
     monitor.stage("index_open_mmi");
     let runtime_threads = monitor.work_thread_budget();
     let (decomp_threads, workers) = thread_budget(runtime_threads);
@@ -186,11 +180,10 @@ fn run_pipeline_inner(
         decomp_threads,
     )?;
     eprintln!(
-        "[阶段] 抽样+预筛+全链审计 {:.1}s",
+        "[stage] sampling, prescreening, and whole-chain audit {:.1}s",
         t0.elapsed().as_secs_f64()
     );
 
-    // 2. discovery 直接集合构造 OR 假设；validation 只验证既有假设。
     monitor.stage("equivalence_aggregate");
     t0 = std::time::Instant::now();
     let composite = build_composite_evidence(
@@ -199,17 +192,18 @@ fn run_pipeline_inner(
         &role_members,
         &audited.evidence,
     )?;
-    eprintln!("[阶段] 等价类聚合 {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[stage] hypothesis aggregation {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
-    // 3. synthetic-decoy 统计判定。暴露量只取独立 validation 折的实际 read-end；
-    // discovery 只定义假设，不能再进入检验统计量。
     monitor.stage("statistics");
     t0 = std::time::Instant::now();
     let sides_per_pair = if opt.r2.is_some() { 2 } else { 1 };
     let validation_read_sides = audited
         .validation_pairs
         .checked_mul(sides_per_pair)
-        .ok_or_else(|| "validation read-end 计数溢出".to_string())?;
+        .ok_or_else(|| "validation read-end count overflow".to_string())?;
     let decision = decide_candidates(
         &built.contigs,
         &composite.aggs,
@@ -219,7 +213,10 @@ fn run_pipeline_inner(
     )?;
     let candidates = decision.candidates;
     let test_family_size = decision.test_family_size;
-    eprintln!("[阶段] 统计判定 {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[stage] statistical decision {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let input_pairs = audited.input_pairs;
     let prescreen_pairs = audited.selected_passed_pairs;
@@ -242,7 +239,6 @@ fn run_pipeline_inner(
         decoy_validation_unassigned: composite.decoy_validation_unassigned,
     };
 
-    // 4. 报告
     monitor.stage("report");
     t0 = std::time::Instant::now();
     let (result_json, result_tsv) = report::write_report(
@@ -260,15 +256,16 @@ fn run_pipeline_inner(
         test_family_size,
         &candidates,
     )?;
-    eprintln!("[阶段] 报告 {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!("[stage] reporting {:.1}s", t0.elapsed().as_secs_f64());
 
-    // minimap2 索引与 Bloom 占据绝大多数常驻内存；显式释放并单独计时，避免进程
-    // 退出前的大对象回收被误记为报告阶段。
     monitor.stage("cleanup");
     t0 = std::time::Instant::now();
     drop(aligner);
     drop(built);
-    eprintln!("[阶段] 资源释放 {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[stage] resource cleanup {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     Ok(RunSummary {
         input_pairs,
@@ -282,12 +279,11 @@ fn run_pipeline_inner(
     })
 }
 
-/// run 未提供 --index 时自动构建索引所需的必填 FASTA 校验。
 fn require_fa<'a>(p: Option<&'a Path>, label: &str) -> Result<&'a Path, String> {
     match p {
         Some(path) if !path.as_os_str().is_empty() => Ok(path),
         _ => Err(format!(
-            "缺少 {label}（未提供 --index 时自动构建索引需要它）"
+            "Missing {label}; automatic index construction requires it when --index is omitted"
         )),
     }
 }
@@ -305,12 +301,6 @@ fn sample_name(r1: &Path) -> String {
     stem
 }
 
-/// N 个管线计算线程 → (D 辅助解压线程, W worker 线程)。真实 IG 采样显示
-/// DEFLATE helper 各只消耗约 5% CPU，不应从持续满载的计算预算中一比一扣除；
-/// W=N−1，使 main caller-runs + workers 最多占满 N 个核。D 沿用既有约 1:3
-/// 配比，但只有输入带 IG 成员索引时才实际创建；普通 gzip 自动回退且不创建。
-/// CLI `--threads 8` → main 1 + worker 7，必要时另有 2 个有界低占用 helper；
-/// telemetry sampler 也是额外的低频休眠线程。`--threads 1` → 全内联。
 fn thread_budget(total: usize) -> (usize, usize) {
     let workers = total.saturating_sub(1);
     let auxiliary_decompressors = workers.div_ceil(4);
@@ -325,7 +315,6 @@ struct DirectPlacement {
     strand: char,
 }
 
-/// 单个 read-end 的直接最高分兼容集合。成员数不改变该观测的一票权重。
 #[derive(Debug, Clone)]
 struct DirectObservation {
     members: Vec<usize>,
@@ -439,7 +428,7 @@ fn audit_read(
             };
         }
     };
-    // 在物化 Hit 前检查 mapper 返回量，避免超限 read 先克隆数千个结构再丢弃。
+
     if mappings.len() > align::MAX_AUDIT_HITS {
         output.audit_overflows += 1;
         return MappedRead::default();
@@ -478,7 +467,6 @@ fn audit_read(
             None
         }
         align::AuditDecision::Overflow { .. } => {
-            // 上面的 mapping 数门已先拦截；保留该分支使接口未来调整仍显式计数。
             output.audit_overflows += 1;
             None
         }
@@ -515,8 +503,6 @@ fn store_direct(
     }
 }
 
-/// 全输入先做确定性 bottom-k，再只对最终样本访问 Bloom 和 ALL_CHAINS mapper。
-/// 发现/验证按 fragment 折分，两端始终同折；直接兼容集合按 read-end 各计一票。
 #[allow(clippy::too_many_arguments)]
 fn sample_and_audit(
     r1: &Path,
@@ -543,7 +529,7 @@ fn sample_and_audit(
         reservoir.observe(ordinal, pair.r1.id(), pair.r1.seq(), pair.r2.seq())?;
         ordinal = ordinal
             .checked_add(1)
-            .ok_or_else(|| "fragment 序号溢出".to_string())?;
+            .ok_or_else(|| "fragment ordinal overflow".to_string())?;
     }
     let sampled = reservoir.finish();
     let mut seen_qnames = HashSet::with_capacity(sampled.pairs.len());
@@ -631,21 +617,17 @@ fn sample_and_audit(
     })
 }
 
-/// 每个内部代表 contig 的 validation 证据聚合。
 #[derive(Default)]
 struct ContigAgg {
-    /// 覆盖区间（半开 [start, end)）。
     intervals: Vec<(i32, i32)>,
     split_events: Vec<cluster::SiteEvent>,
     discordant: u64,
-    /// 直接兼容 read-end 数；每个观测无论兼容成员多少只计一次。
+
     reads: u64,
     plus: u64,
     minus: u64,
 }
 
-/// 固定 decoy 参考集在 validation 折中的直接证据。与 discovery 是否观察到该
-/// decoy 无关，避免把“未被 discovery 选中”误当成 validation 的结构性零计数。
 #[derive(Debug, Clone, Copy, Default)]
 struct DecoyLayerBackground {
     reads: u64,
@@ -657,8 +639,7 @@ struct DecoyLayerBackground {
 struct DecoyBackground {
     layers: HashMap<String, DecoyLayerBackground>,
     global: DecoyLayerBackground,
-    /// 一个 read-end 的直接最高分兼容 decoy 跨越多个 size/GC 层；该 read 在每个
-    /// 兼容层中至多计一次，使对应目标检验保持保守而不在单层重复计票。
+
     cross_stratum_reads: u64,
 }
 
@@ -668,10 +649,9 @@ struct CompositeDetails {
     members: Vec<String>,
     explanation: Vec<String>,
     discovery_reads: u64,
-    /// discovery OR 假设实际包含的内部索引 target contig 数；与展开后的原始
-    /// accession 数不同。
+
     index_member_count: usize,
-    /// 上述内部索引 contig 的长度总和，是聚合 target read 计数对应的 exposure。
+
     target_exposure_bases: u64,
 }
 
@@ -718,15 +698,17 @@ fn aggregate_role_hypotheses(
                     .cmp(&support[index].get(right).copied().unwrap_or(0))
                     .then_with(|| right.cmp(left))
             })
-            .ok_or_else(|| "复合假设没有成员".to_string())?;
+            .ok_or_else(|| "Compound hypothesis has no members".to_string())?;
         let representative_name = names
             .get(representative)
-            .ok_or_else(|| format!("{role:?} 代表成员下标越界: {representative}"))?
+            .ok_or_else(|| {
+                format!("{role:?} representative member index out of bounds: {representative}")
+            })?
             .clone();
         for &member in &hypothesis.members {
-            let slot = member_to_representative
-                .get_mut(member)
-                .ok_or_else(|| format!("{role:?} 假设成员下标越界: {member}"))?;
+            let slot = member_to_representative.get_mut(member).ok_or_else(|| {
+                format!("{role:?} hypothesis member index out of bounds: {member}")
+            })?;
             *slot = Some(representative_name.clone());
         }
         resolved.push(ResolvedHypothesis {
@@ -750,10 +732,10 @@ fn aggregate_role_hypotheses(
         let resolved_hypothesis = &resolved[hypothesis_index];
         let representative_name = names
             .get(resolved_hypothesis.representative)
-            .ok_or_else(|| "validation 代表成员下标越界".to_string())?;
+            .ok_or_else(|| "validation representative member index out of bounds".to_string())?;
         let agg = aggs
             .get_mut(representative_name)
-            .ok_or_else(|| format!("未知代表 contig: {representative_name}"))?;
+            .ok_or_else(|| format!("Unknown representative contig: {representative_name}"))?;
         agg.reads += 1;
         if let Some(placement) = observation
             .placements
@@ -797,27 +779,27 @@ fn build_decoy_background(
     for name in role_members.names(Role::Decoy) {
         let contig = metadata
             .get(name.as_str())
-            .ok_or_else(|| format!("decoy 成员缺少 metadata: {name}"))?;
+            .ok_or_else(|| format!("Missing metadata for decoy member: {name}"))?;
         let stratum = strata(contig.len, contig.gc_frac);
         let layer = background.layers.entry(stratum.clone()).or_default();
         layer.reference_bases = layer
             .reference_bases
             .checked_add(contig.len)
-            .ok_or_else(|| format!("decoy 层 {stratum} reference bases 溢出"))?;
+            .ok_or_else(|| format!("decoy stratum {stratum} reference-bases overflow"))?;
         layer.contigs = layer
             .contigs
             .checked_add(1)
-            .ok_or_else(|| format!("decoy 层 {stratum} contig 数溢出"))?;
+            .ok_or_else(|| format!("decoy stratum {stratum} contig-count overflow"))?;
         background.global.reference_bases = background
             .global
             .reference_bases
             .checked_add(contig.len)
-            .ok_or_else(|| "全局 decoy reference bases 溢出".to_string())?;
+            .ok_or_else(|| "global decoy reference-bases overflow".to_string())?;
         background.global.contigs = background
             .global
             .contigs
             .checked_add(1)
-            .ok_or_else(|| "全局 decoy contig 数溢出".to_string())?;
+            .ok_or_else(|| "global decoy contig-count overflow".to_string())?;
         member_strata.push(stratum);
     }
 
@@ -826,7 +808,7 @@ fn build_decoy_background(
         for &member in &observation.members {
             let stratum = member_strata
                 .get(member)
-                .ok_or_else(|| format!("decoy validation 成员下标越界: {member}"))?;
+                .ok_or_else(|| format!("decoy validation member index out of bounds: {member}"))?;
             observed_strata.insert(stratum.as_str());
         }
         if observed_strata.len() > 1 {
@@ -839,7 +821,7 @@ fn build_decoy_background(
             background
                 .layers
                 .get_mut(stratum)
-                .ok_or_else(|| format!("decoy validation 指向未知层: {stratum}"))?
+                .ok_or_else(|| format!("decoy validation references unknown stratum: {stratum}"))?
                 .reads += 1;
         }
     }
@@ -872,7 +854,6 @@ fn build_composite_evidence(
         &mut aggs,
     )?;
 
-    // split/discordant 只使用 validation 折，并归入包含其直接 target 成员的 OR 假设。
     for fragment in &audit.validation_fragments {
         for event in &fragment.split_events {
             let Some(&(Role::Target, member)) = role_members.lookup.get(&event.target_contig)
@@ -887,7 +868,7 @@ fn build_composite_evidence(
                 continue;
             };
             aggs.get_mut(representative)
-                .ok_or_else(|| format!("未知 split 代表 contig: {representative}"))?
+                .ok_or_else(|| format!("Unknown split representative contig: {representative}"))?
                 .split_events
                 .push(cluster::SiteEvent {
                     contig: representative.clone(),
@@ -908,7 +889,9 @@ fn build_composite_evidence(
                 .and_then(|value| value.as_ref())
             {
                 aggs.get_mut(representative)
-                    .ok_or_else(|| format!("未知 discordant 代表 contig: {representative}"))?
+                    .ok_or_else(|| {
+                        format!("Unknown discordant representative contig: {representative}")
+                    })?
                     .discordant += 1;
             }
         }
@@ -927,25 +910,27 @@ fn build_composite_evidence(
     for resolved in target.hypotheses {
         let representative_contig = target_names
             .get(resolved.representative)
-            .ok_or_else(|| "target 代表成员下标越界".to_string())?;
+            .ok_or_else(|| "target representative member index out of bounds".to_string())?;
         let representative_group = groups
             .get(representative_contig.as_str())
-            .ok_or_else(|| format!("target_groups 缺少 {representative_contig}"))?;
+            .ok_or_else(|| format!("target_groups is missing {representative_contig}"))?;
         let mut original_members = BTreeSet::new();
         let mut target_exposure_bases = 0u64;
         for &member in &resolved.hypothesis.members {
             let contig = target_names
                 .get(member)
-                .ok_or_else(|| format!("target 假设成员下标越界: {member}"))?;
-            let contig_meta = metadata
-                .get(contig.as_str())
-                .ok_or_else(|| format!("target 假设成员缺少 metadata: {contig}"))?;
+                .ok_or_else(|| format!("target hypothesis member index out of bounds: {member}"))?;
+            let contig_meta = metadata.get(contig.as_str()).ok_or_else(|| {
+                format!("Missing metadata for target hypothesis member: {contig}")
+            })?;
             target_exposure_bases = target_exposure_bases
                 .checked_add(contig_meta.len)
-                .ok_or_else(|| format!("target 假设 {representative_contig} exposure 溢出"))?;
+                .ok_or_else(|| {
+                    format!("target hypothesis {representative_contig} exposure overflow")
+                })?;
             let group = groups
                 .get(contig.as_str())
-                .ok_or_else(|| format!("target_groups 缺少 {contig}"))?;
+                .ok_or_else(|| format!("target_groups is missing {contig}"))?;
             original_members.extend(group.members.iter().cloned());
         }
         let explanation = resolved
@@ -955,11 +940,11 @@ fn build_composite_evidence(
             .map(|&member| {
                 let contig = target_names
                     .get(member)
-                    .ok_or_else(|| format!("target explanation 下标越界: {member}"))?;
+                    .ok_or_else(|| format!("target explanation index out of bounds: {member}"))?;
                 groups
                     .get(contig.as_str())
                     .map(|group| group.representative.clone())
-                    .ok_or_else(|| format!("target_groups 缺少 {contig}"))
+                    .ok_or_else(|| format!("target_groups is missing {contig}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         details.insert(
@@ -984,7 +969,6 @@ fn build_composite_evidence(
     })
 }
 
-/// (size_bin, gc_bin) 分层键；边界由本模块集中定义。
 fn size_bin(len: u64) -> &'static str {
     if len < 1_000 {
         "<1kb"
@@ -1013,7 +997,6 @@ fn strata(len: u64, gc: f64) -> String {
     format!("sz:{},gc:{}", size_bin(len), gc_bin(gc))
 }
 
-/// 区间合并后覆盖碱基数；仅当 start < current_end 时合并。
 fn merged_covered_bases(intervals: &[(i32, i32)]) -> u64 {
     let mut sorted = intervals.to_vec();
     sorted.sort_unstable();
@@ -1033,8 +1016,6 @@ fn merged_covered_bases(intervals: &[(i32, i32)]) -> u64 {
     bases
 }
 
-/// 代表序列按固定数量等分；每条直接 validation read 只按对齐中点占据一个位置
-/// 分区。这样一条长 read 不能伪造三个区域，连续高覆盖也不会被合并成“一个窗口”。
 fn distributed_window_count(intervals: &[(i32, i32)], contig_len: u64) -> u64 {
     if contig_len == 0 {
         return 0;
@@ -1060,18 +1041,7 @@ struct CandidateDecision {
     test_family_size: usize,
 }
 
-/// discovery 固定检验族 + validation 精确两 Poisson 率检验 + BH adjusted-p +
-/// coverage/distribution 报告门。
-///
-/// target 计数的 exposure 是 discovery OR 假设内全部内部索引 contig 的长度总和。
-/// 单内部成员假设与同 size/GC 层的固定 synthetic-decoy 比较；多内部成员假设使用
-/// 全局固定 decoy，双方 read-end 均只计一次、reference bases 均各计一次。精确
-/// 条件检验在背景观测为 0 时仍保留有限样本不确定性。全部 discovery 假设（包括
-/// validation 为 0）进入 BH，避免用 validation 再筛检验族。synthetic decoy
-/// 可交换性尚未独立验证，因而 adjusted-p 是研究性模型证据，不宣称经典 FDR 控制。
-///
-/// 通用病毒检出不再依赖宿主-病毒 split；split/site 作为独立 integration evidence
-/// 报告。`PASS` 仅表示候选通过当前探索性模型与分布门，不是样本级或临床结论。
+/// Apply statistical and distribution gates to aggregated candidate evidence.
 fn decide_candidates(
     contigs: &[reference::ContigMeta],
     aggs: &HashMap<String, ContigAgg>,
@@ -1109,7 +1079,6 @@ fn decide_candidates(
 
     let mut raw = Vec::new();
     for contig in contigs.iter().filter(|contig| contig.role == Role::Target) {
-        // 生产路径只检验 discovery 定义的假设；测试传 None 时保留显式传入目标族。
         if composite_details.is_some_and(|details| !details.contains_key(&contig.name)) {
             continue;
         }
@@ -1122,7 +1091,10 @@ fn decide_candidates(
             .map(|details| details.target_exposure_bases)
             .unwrap_or(contig.len);
         if index_member_count == 0 || target_exposure_bases == 0 {
-            return Err(format!("target 假设 {} exposure 为空", contig.name));
+            return Err(format!(
+                "target hypothesis {} has empty exposure",
+                contig.name
+            ));
         }
         let bases = merged_covered_bases(&agg.intervals);
         let has_evidence =
@@ -1209,7 +1181,6 @@ fn decide_candidates(
         });
     }
 
-    // validation 计数为 0 的 discovery 假设也以 p=1 进入固定检验族。
     let ln_p_values = raw
         .iter()
         .map(|candidate| candidate.p.ln_probability)
@@ -1349,7 +1320,7 @@ mod tests {
     fn merge_intervals_counts_union_length() {
         assert_eq!(merged_covered_bases(&[(0, 100), (50, 150)]), 150);
         assert_eq!(merged_covered_bases(&[(0, 100), (200, 250)]), 150);
-        assert_eq!(merged_covered_bases(&[(100, 50)]), 0); // 非法区间防御
+        assert_eq!(merged_covered_bases(&[(100, 50)]), 0);
         assert_eq!(merged_covered_bases(&[]), 0);
     }
 
@@ -1377,8 +1348,7 @@ mod tests {
             },
         ];
         let members = RoleMembers::from_contigs(&contigs);
-        // 一个直接 validation read 同时兼容两个跨层 decoy；全局只计一票，每个
-        // 相关层各计一票作为该层目标检验的保守背景。
+
         let observations = vec![DirectObservation {
             members: vec![0, 1],
             placements: Vec::new(),
@@ -1480,12 +1450,6 @@ mod tests {
 
     #[test]
     fn decide_chain_uses_exact_rate_test_and_fixed_family_bh() {
-        // 2 目标各占一层、各 1 条零计数诱饵：
-        // target_0 reads=10、target/decoy exposure 相等 → exact p=(1/2)^10；
-        // 两个 discovery 假设都进入 BH，adjusted-p=2p。
-        // validation 暴露 20_000 read-ends → end-RPM=500；三个分布窗口合计
-        // 300/3000=10% → PASS；split 只形成独立 integration evidence。
-        // target_1 validation 完全无证据，仍以 p=1 进入固定检验族，但不生成候选行。
         let contigs = vec![
             reference::ContigMeta {
                 name: "target_0".into(),
@@ -1652,8 +1616,6 @@ mod tests {
 
     #[test]
     fn split_evidence_does_not_remove_direct_detection_counts() {
-        // reads=3、split qnames ["a","a","b"]；通用检测仍只按 3 个直接 read-end
-        // 计数，split 不再从统计量中扣除或提升候选判定。
         let contigs = vec![
             reference::ContigMeta {
                 name: "target_0".into(),
@@ -1693,9 +1655,6 @@ mod tests {
 
     #[test]
     fn low_end_rpm_is_not_a_hard_gate_but_breadth_and_windows_are() {
-        // 两目标分层相同、诱饵零 reads；精确率检验仍给出有限 p。low_rpm 只有 5 个 read-end，
-        // 但跨 3 个分区且 breadth=10%，因此不因未校准 RPM 被拒；narrow 即使深度
-        // 很高，breadth=2% 仍 BELOW_THRESHOLD。
         let contigs = vec![
             reference::ContigMeta {
                 name: "low_rpm".into(),

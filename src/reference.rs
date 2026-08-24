@@ -1,6 +1,6 @@
-//! 参考序列加载与 minimap2 索引构建。
-//! 用户输入 4 类 FASTA：宿主/人类、目标/病毒、诱饵、常见污染。
-//! 合并为单一 composite FASTA（contig 重命名为 `{role}_{i}`），并构建 sr 预设索引。
+//! Reference loading and minimap2 index construction.
+//! Four FASTA roles—host, target, decoy, and contaminant—are merged into one composite FASTA.
+//! Contigs are renamed to `{role}_{i}` before building an `sr` preset index.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -8,18 +8,18 @@ use std::path::{Path, PathBuf};
 
 use minimap2::Aligner;
 
-/// 竞争比对要求所有角色在同一 minimap2 分片内参与主次命中与 MAPQ 计算。
+/// Competitive alignment requires every role to share one minimap2 shard for MAPQ calculation.
 const SINGLE_PART_BATCH_SIZE: u64 = u64::MAX;
 
 pub(crate) fn ensure_single_part_index(part_count: usize) -> Result<(), &'static str> {
     if part_count == 1 {
         Ok(())
     } else {
-        Err("minimap2 索引包含多个分片；竞争比对要求单分片索引，请重建索引")
+        Err("The minimap2 index contains multiple shards; rebuild it as a single-shard index for competitive alignment")
     }
 }
 
-/// 参考序列类别。污染类在判定时按宿主对待（只作噪声，不产出候选）。
+/// Reference role. Contaminants are background-only and never produce candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Host,
@@ -43,7 +43,7 @@ impl Role {
 pub struct Contig {
     pub name: String,
     pub role: Role,
-    pub seq: Vec<u8>, // 大写 ACGTN
+    pub seq: Vec<u8>, // Uppercase ACGTN
     pub gc_frac: f64,
 }
 
@@ -57,8 +57,8 @@ impl Contig {
     }
 }
 
-/// contig 元数据（索引 manifest 中持久化的最小信息）：下游聚合与统计判定
-/// 只依赖 name/role/len/gc，不依赖序列本身，加载索引时无需保留序列。
+/// Minimal contig metadata persisted in the index manifest. Downstream aggregation and testing
+/// depend only on name, role, length, and GC content, so loaded indexes need not retain sequences.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContigMeta {
     pub name: String,
@@ -78,15 +78,15 @@ impl From<&Contig> for ContigMeta {
     }
 }
 
-/// 解析 FASTA（允许序列换行；仅保留 ACGTN，忽略其他字符）。
+/// Parse multiline FASTA, retaining only ACGTN characters.
 pub fn parse_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let file = File::open(path).map_err(|e| format!("无法打开 {}: {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
     let reader = BufReader::new(file);
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut header: Option<String> = None;
     let mut seq: Vec<u8> = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+        let line = line.map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
         if let Some(h) = line.strip_prefix('>') {
             if let Some(hdr) = header.take() {
                 records.push((hdr, std::mem::take(&mut seq)));
@@ -116,24 +116,27 @@ pub fn gc_fraction(seq: &[u8]) -> f64 {
     gc as f64 / acgt as f64
 }
 
-/// 加载 4 类 FASTA，重命名 contig 为 `{role}_{i}`，合并写出 composite FASTA，
-/// 并构建 minimap2 sr 索引。返回 `(索引路径, 全部 contig)`。
+/// Load the four FASTA roles, rename contigs to `{role}_{i}`, write a composite FASTA, and build
+/// a minimap2 `sr` index. Returns the index path and all contigs.
 pub fn build_reference(
     fastas: &[(Role, PathBuf)],
     work_dir: &Path,
     index_threads: usize,
 ) -> Result<(PathBuf, Vec<Contig>), String> {
     std::fs::create_dir_all(work_dir)
-        .map_err(|e| format!("无法创建工作目录 {}: {e}", work_dir.display()))?;
+        .map_err(|e| format!("Cannot create work directory {}: {e}", work_dir.display()))?;
     let composite_path = work_dir.join("composite.fa");
     let mmi_path = work_dir.join("index.mmi");
 
     let mut contigs = Vec::new();
     for (role, path) in fastas {
-        // 每个角色独立编号：host_0、target_0、decoy_0…（避免全局计数导致目标≠target_0）
+        // Number each role independently so the first target is always target_0.
         for (counter, (orig_header, seq)) in parse_fasta(path)?.into_iter().enumerate() {
             if seq.is_empty() {
-                return Err(format!("{} 中存在空序列: {orig_header}", path.display()));
+                return Err(format!(
+                    "{} contains an empty sequence: {orig_header}",
+                    path.display()
+                ));
             }
             let name = format!("{}_{}", role.prefix(), counter);
             contigs.push(Contig {
@@ -147,35 +150,35 @@ pub fn build_reference(
 
     {
         let file = File::create(&composite_path)
-            .map_err(|e| format!("无法创建 {}: {e}", composite_path.display()))?;
+            .map_err(|e| format!("Cannot create {}: {e}", composite_path.display()))?;
         let mut writer = BufWriter::new(file);
         for contig in &contigs {
             writeln!(writer, ">{}", contig.name)
-                .map_err(|e| format!("写入 composite FASTA 失败: {e}"))?;
+                .map_err(|e| format!("Failed to write composite FASTA: {e}"))?;
             for chunk in contig.seq.chunks(60) {
                 writer
                     .write_all(chunk)
-                    .map_err(|e| format!("写入 composite FASTA 失败: {e}"))?;
+                    .map_err(|e| format!("Failed to write composite FASTA: {e}"))?;
                 writer
                     .write_all(b"\n")
-                    .map_err(|e| format!("写入 composite FASTA 失败: {e}"))?;
+                    .map_err(|e| format!("Failed to write composite FASTA: {e}"))?;
             }
         }
         writer
             .flush()
-            .map_err(|e| format!("写入 composite FASTA 失败: {e}"))?;
+            .map_err(|e| format!("Failed to write composite FASTA: {e}"))?;
     }
 
     let mmi_str = mmi_path
         .to_str()
-        .ok_or_else(|| "索引路径非 UTF-8".to_string())?;
+        .ok_or_else(|| "Index path is not valid UTF-8".to_string())?;
     let mut builder = Aligner::builder()
         .sr()
         .with_index_threads(index_threads.max(1));
     builder.idxopt.batch_size = SINGLE_PART_BATCH_SIZE;
     let aligner = builder
         .with_index(&composite_path, Some(mmi_str))
-        .map_err(|e| format!("minimap2 索引构建失败: {e}"))?;
+        .map_err(|e| format!("Failed to build minimap2 index: {e}"))?;
     ensure_single_part_index(aligner.idx_parts.len())?;
 
     Ok((mmi_path, contigs))

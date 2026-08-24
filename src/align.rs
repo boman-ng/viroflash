@@ -1,6 +1,10 @@
-//! 竞争比对 + 候选证据：minimap2 sr 预设（Rust 绑定），fragment 级竞争裁决，
-//! split-read / discordant 证据提取，以及有界队列 + 有序聚合的并行处理。
-//! minimap2 通过 Rust 原生绑定调用，不启动外部 CLI。
+//! Competitive minimap2 alignment, ambiguity auditing, and bounded ordered parallelism.
+//!
+//! Host, target, decoy, and contaminant roles compete in one single-shard index. The ordinary
+//! mapper handles clear hits; selected reads use ALL_CHAINS auditing so hidden alternatives cannot
+//! become false empty evidence. Role margins, MAPQ, edit-distance, split, and discordant thresholds
+//! are centralized here. Worker results are emitted in input order, with caller-runs backpressure
+//! and explicit propagation of stream, worker, sink, and audit-overflow failures.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -12,45 +16,38 @@ use minimap2::{Aligner, Built, Mapping};
 
 use crate::reference::Role;
 
-/// 竞争裁决阈值。
 pub const MIN_MAPQ: u32 = 20;
 pub const MIN_AS_DIFF: i32 = 12;
 pub const MAX_NM: i32 = 8;
-/// split-read 阈值（ViFi 社区惯例）。
+
 pub const SPLIT_SOFTCLIP: i32 = 20;
 pub const SPLIT_MAPQ: u32 = 10;
-/// minimap2 二级命中保留数量。
+
 pub const BEST_N: i32 = 15;
-/// 单 read ALL_CHAINS 审计最多接受的命中数。4096 相对 fast `BEST_N` 保留超过
-/// 两个数量级的审计余量，同时把后续克隆、按 contig 去重和稳定排序限制在线性
-/// 内存与可控 CPU 内；超限是显式审计状态，不能当作空证据。
+
 pub const MAX_AUDIT_HITS: usize = 4096;
-/// 全进程 kalloc 预算 1GB，按线程均分。
+
 const TOTAL_KALLOC_BUDGET: i64 = 1_000_000_000;
 
 pub struct CompetitiveAligner {
     aligner: Arc<Aligner<Built>>,
-    /// 从 fast aligner cheap clone；底层 `idx`/`idx_parts` 由 `Arc` 共享。
+
     audit_aligner: Arc<Aligner<Built>>,
-    /// 比对 worker 线程数 = N−1（N 为计算线程预算；低占用解压 helper 不从中
-    /// 扣减，见 lib::thread_budget）；0 表示 `--threads 1`：走主线程内联路径。
+
     pub threads: usize,
 }
 
 impl CompetitiveAligner {
-    /// `workers` 为比对 worker 线程数（= N−1，见 lib::thread_budget）；
-    /// 0 表示 `--threads 1`：走主线程内联路径。
     pub fn open(mmi_path: &Path, workers: usize) -> Result<Self, &'static str> {
         let mut builder = Aligner::builder().sr().with_cigar();
         builder.mapopt.best_n = BEST_N;
-        // 队列饱和时主线程也会 caller-runs，最大并发 mapper = workers + 1；
-        // 内联路径 workers=0 时仍为 1。1GB kalloc 预算按该上界均分。
+
         let mapper_concurrency = workers.saturating_add(1);
         let mapper_concurrency = i64::try_from(mapper_concurrency).unwrap_or(i64::MAX);
         builder.mapopt.cap_kalloc = (TOTAL_KALLOC_BUDGET / mapper_concurrency).max(1);
         let aligner = builder.with_index(mmi_path, None)?;
         crate::reference::ensure_single_part_index(aligner.idx_parts.len())?;
-        // `Aligner::clone` 只复制 mapopt 等轻量状态，索引由内部 Arc 共享；MMI 不再加载。
+
         let mut audit_aligner = aligner.clone();
         audit_aligner.mapopt.flag |= minimap2::ffi::MM_F_ALL_CHAINS as i64;
         Ok(Self {
@@ -70,15 +67,11 @@ impl CompetitiveAligner {
             .map_pair(r1, r2, false, false, None, None, Some(name.as_bytes()))
     }
 
-    /// 单端模式：只比对一条 read。
     pub fn map_seq(&self, seq: &[u8], name: &str) -> Result<Vec<Mapping>, &'static str> {
         self.aligner
             .map(seq, false, false, None, None, Some(name.as_bytes()))
     }
 
-    /// 单 read 歧义审计：保留 minimap2 的全部 chains，供 [`adjudicate_audit`] 使用。
-    /// 生产检测对 bottom-k 样本中通过 Bloom 的每条 read 直接调用此路径；普通
-    /// `best_n=15` mapper 仅保留给公开的常规映射/证据工具，不参与主检测裁决。
     pub fn audit_map_seq(&self, seq: &[u8], name: &str) -> Result<Vec<Mapping>, &'static str> {
         self.audit_aligner
             .map(seq, false, false, None, None, Some(name.as_bytes()))
@@ -102,7 +95,6 @@ pub struct Hit {
     pub strand: char,
 }
 
-/// 提取一条 read 的全部命中（含 supplementary，即 SA 样式的 split 另一半）。
 pub fn hits_of(mappings: &[Mapping], roles: &HashMap<String, Role>) -> Vec<Hit> {
     mappings
         .iter()
@@ -133,15 +125,12 @@ pub fn hits_of(mappings: &[Mapping], roles: &HashMap<String, Role>) -> Vec<Hit> 
         .collect()
 }
 
-/// 单 read ALL_CHAINS 歧义审计结果。`Overflow` 与 `NoEvidence` 分离，防止资源
-/// 超限被误当成成功形状的空证据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditDecision {
-    /// 仅产出 Target 或 Decoy 的直接、精确最高 AS 命中。
     Resolved { role: Role, hits: Vec<Hit> },
-    /// 审计完整执行，但没有角色满足保守胜出条件。
+
     NoEvidence,
-    /// ALL_CHAINS 命中数超过单 read 资源上限，裁决未执行。
+
     Overflow { hit_count: usize, limit: usize },
 }
 
@@ -172,7 +161,6 @@ fn resolve_audit_role(hits: &[Hit], role: Role) -> Option<Vec<Hit>> {
         return None;
     }
 
-    // 第一版只接受角色内精确最高 AS ties；ΔAS>0 的兼容窗口延期到匹配校准后。
     let mut by_contig: BTreeMap<&str, Hit> = BTreeMap::new();
     for hit in hits
         .iter()
@@ -197,12 +185,7 @@ fn resolve_audit_role(hits: &[Hit], role: Role) -> Option<Vec<Hit>> {
     (!resolved.is_empty()).then_some(resolved)
 }
 
-/// 对单 read 的 ALL_CHAINS 命中作保守审计裁决。
-///
-/// Target 必须以至少 [`MIN_AS_DIFF`] 严格跨过 Host/Contaminant/Decoy；Decoy
-/// 对所有非 Decoy 角色应用同一门槛。角色内只返回 `AS == S_best` 且
-/// `NM <= MAX_NM` 的直接命中，按 contig 去重；不维护静态 component，也不做
-/// A-B-C 传递。`ΔAS>0` 的角色内兼容窗口明确延期到匹配校准后。
+/// Conservatively adjudicate one read's ALL_CHAINS hits across reference roles.
 pub fn adjudicate_audit(hits: &[Hit]) -> AuditDecision {
     if hits.len() > MAX_AUDIT_HITS {
         return AuditDecision::Overflow {
@@ -237,18 +220,16 @@ fn best_non_target(hits: &[Hit]) -> Option<&Hit> {
         .max_by(|a, b| a.as_score.cmp(&b.as_score).then(a.mapq.cmp(&b.mapq)))
 }
 
-/// 单 read 裁决结果。
 #[derive(Debug, Clone, Default)]
 pub struct ReadDecision {
-    /// 高置信目标命中（mapq≥20、nm≤8、AS 差 ≥12）。
     pub confident_target: Option<Hit>,
-    /// 最优宿主命中（不限 mapq，discordant 判定时再查阈值）。
+
     pub best_host: Option<Hit>,
-    /// split 检测用：mapq ≥ SPLIT_MAPQ 的最优目标命中。
+
     pub split_target: Option<Hit>,
-    /// split 检测用：mapq ≥ SPLIT_MAPQ 的最优宿主命中。
+
     pub split_host: Option<Hit>,
-    /// 全局最优命中（mapq≥20，纯 AS 排序），覆盖度统计用。
+
     pub best_overall: Option<Hit>,
 }
 
@@ -261,8 +242,6 @@ pub fn adjudicate_read(hits: &[Hit]) -> ReadDecision {
         .max_by(|a, b| a.as_score.cmp(&b.as_score).then(a.mapq.cmp(&b.mapq)))
         .cloned();
 
-    // 高置信目标：只在 mapq≥20 的目标命中里选最优（secondary 命中 mapq=0 会因 AS
-    // 更高而挤掉 primary，故先按 mapq 过滤再比 AS），并做 AS 竞争差 + NM 检查。
     let confident_target = {
         let best_target_conf = hits
             .iter()
@@ -299,11 +278,7 @@ pub fn adjudicate_read(hits: &[Hit]) -> ReadDecision {
     }
 }
 
-/// 普通 `best_n` 映射是否需要升级为单 read ALL_CHAINS 审计。
-///
-/// 触发条件集中为：primary 低 MAPQ、secondary 数达到 [`BEST_N`]（结果可能被
-/// 截断），或普通结果出现 Target 却未产出 `confident_target`。明确、高 MAPQ、
-/// 仅 Host 的正常路径不会无条件进入审计。
+/// Return whether an ordinary mapping requires escalation to an ALL_CHAINS ambiguity audit.
 pub fn needs_ambiguity_audit(hits: &[Hit], ordinary: &ReadDecision) -> bool {
     let has_low_mapq_primary = hits.iter().any(|hit| hit.is_primary && hit.mapq < MIN_MAPQ);
     let secondary_saturated = hits
@@ -316,7 +291,6 @@ pub fn needs_ambiguity_audit(hits: &[Hit], ordinary: &ReadDecision) -> bool {
     has_low_mapq_primary || secondary_saturated || has_unresolved_target
 }
 
-/// split-read 断点事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitEvent {
     pub target_contig: String,
@@ -324,12 +298,10 @@ pub struct SplitEvent {
     pub host_contig: String,
     pub host_pos: i32,
     pub direction: String,
-    /// 来源 fragment 的 read ID（位点支持度按唯一 qname 计数）。
+
     pub qname: String,
 }
 
-/// 双侧 softclip 达到门槛的跨类 split read。
-/// 取 AS 最高的 target/host 命中配对；候选位点支持度在聚类阶段按唯一 qname 计算。
 fn split_event(read: &ReadDecision, qname: &str) -> Option<SplitEvent> {
     let t = read.split_target.as_ref()?;
     let h = read.split_host.as_ref()?;
@@ -352,13 +324,12 @@ fn split_event(read: &ReadDecision, qname: &str) -> Option<SplitEvent> {
     })
 }
 
-/// fragment 级证据。
 #[derive(Debug, Clone, Default)]
 pub struct FragmentEvidence {
     pub r1: ReadDecision,
     pub r2: ReadDecision,
     pub split_events: Vec<SplitEvent>,
-    /// 一端高置信目标、另一端高置信宿主（mapq≥20）的目标 contig 名。
+
     pub discordant: Option<String>,
 }
 
@@ -415,16 +386,7 @@ fn accept_ordered<R, G>(
     }
 }
 
-/// 有界队列 + 有序聚合的并行处理。
-/// 主线程投递 chunk，队列饱和时 caller-runs；结果按 chunk 序确定性回调 `sink`。
-/// 输入流中的 Err 会中止处理并返回。
-/// 两个使用方：预筛+竞争比对（融合单趟，收集证据）与证据聚合（局部聚合表有序合并）。
-///
-/// 并发契约（勿破坏）：
-/// 1. worker 持有 tx_done 的克隆；主线程投递结束后 drop 自己的 tx_done，
-///    最终 recv 才会以 Err 结束（否则永不返回）。
-/// 2. 生产期每发一个 chunk 后机会式 try_recv 排空结果，避免两个有界通道互填挂死。
-/// 3. caller-runs 结果也必须经 pending/next 有序提交，不得直接调用 sink。
+/// Process chunks with bounded workers and deliver completed results in input order.
 pub(crate) fn par_map_chunks<T, R, F, G>(
     items: impl Iterator<Item = Result<T, String>>,
     workers: usize,
@@ -439,8 +401,7 @@ where
     G: FnMut(Vec<R>) -> Result<(), String>,
 {
     let chunk_size = chunk_size.max(1);
-    // workers == 0（--threads 1）：不创建 worker 线程，主线程内联处理所有 chunk，
-    // 保证"总线程数 = N"的语义在 N=1 时同样成立。
+
     if workers == 0 {
         let mut first_err: Option<String> = None;
         let mut chunk: Vec<T> = Vec::with_capacity(chunk_size);
@@ -481,8 +442,7 @@ where
     thread::scope(|scope| {
         for _ in 0..workers {
             let rx = &rx_chunk;
-            // 每个 worker 持有 Sender 克隆；主线程结束后 drop 自己的 Sender，
-            // 通道才能在对侧全部退出后关闭（否则最终 recv 永不返回 Err）。
+
             let tx = tx_done.clone();
             let process = &process;
             scope.spawn(move || loop {
@@ -509,7 +469,7 @@ where
         let mut pending: BTreeMap<usize, Vec<R>> = BTreeMap::new();
         let mut next = 0usize;
         let mut sink_err: Option<String> = None;
-        // 机会式排空结果通道：生产期也要消费结果，避免两个有界通道互填死锁。
+
         let drain = |pending: &mut BTreeMap<usize, Vec<R>>,
                      next: &mut usize,
                      sink_err: &mut Option<String>,
@@ -531,7 +491,9 @@ where
                     accept_ordered(pending, next, sink_err, sink, true, i, results);
                     Ok(())
                 }
-                Err(TrySendError::Disconnected(_)) => Err("处理 worker 意外退出".to_string()),
+                Err(TrySendError::Disconnected(_)) => {
+                    Err("processing worker exited unexpectedly".to_string())
+                }
             }
         };
         for item in items {
@@ -539,7 +501,6 @@ where
                 Ok(t) => {
                     chunk.push(t);
                     if chunk.len() >= chunk_size {
-                        // 队列满时由主线程处理当前 chunk；仍经 pending 按序提交。
                         drain(&mut pending, &mut next, &mut sink_err, &mut sink);
                         let full = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
                         if let Err(err) =
@@ -573,11 +534,9 @@ where
             drain(&mut pending, &mut next, &mut sink_err, &mut sink);
         }
         drop(tx_chunk);
-        // 主线程释放自己的 Sender：worker 全部退出后 rx_done 才会关闭，
-        // 最终 recv 循环才能以 Err 结束。
+
         drop(tx_done);
-        // 最终全量排空（worker 全部退出后 tx_done 关闭，recv 返回 Err 结束）。
-        // 无论是否有错都必须消费完结果，否则 worker 会阻塞在 tx_done.send 上。
+
         while let Ok((i, results)) = rx_done.recv() {
             accept_ordered(
                 &mut pending,
@@ -641,7 +600,7 @@ mod tests {
     fn adjudicates_confident_target_with_as_margin() {
         let hits = vec![
             hit(Role::Target, 300, 60, 0, 150, 0, 150),
-            hit(Role::Host, 280, 60, 0, 150, 0, 150), // AS 差 20 ≥ 12
+            hit(Role::Host, 280, 60, 0, 150, 0, 150),
         ];
         let d = adjudicate_read(&hits);
         assert!(d.confident_target.is_some());
@@ -651,7 +610,7 @@ mod tests {
     fn rejects_target_without_as_margin() {
         let hits = vec![
             hit(Role::Target, 300, 60, 0, 150, 0, 150),
-            hit(Role::Host, 295, 60, 0, 150, 0, 150), // AS 差 5 < 12
+            hit(Role::Host, 295, 60, 0, 150, 0, 150),
         ];
         let d = adjudicate_read(&hits);
         assert!(d.confident_target.is_none());
@@ -675,7 +634,7 @@ mod tests {
                     ["target_a", "target_b"]
                 );
             }
-            decision => panic!("目标应从 ALL_CHAINS 结果中恢复，实际为 {decision:?}"),
+            decision => panic!("target should be recovered from ALL_CHAINS; got {decision:?}"),
         }
     }
 
@@ -687,10 +646,14 @@ mod tests {
             named_hit(Role::Host, "host_0", 270, 0, 0),
         ];
         let AuditDecision::Resolved { role, hits } = adjudicate_audit(&hits) else {
-            panic!("最优目标应恢复");
+            panic!("best target should be recovered");
         };
         assert_eq!(role, Role::Target);
-        assert_eq!(hits.len(), 1, "ΔAS>0 窗口须延期到匹配校准后");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the delta-AS>0 window must remain disabled until calibration"
+        );
         assert_eq!(hits[0].contig, "target_a");
     }
 
@@ -723,7 +686,7 @@ mod tests {
             named_hit(Role::Host, "host_0", 270, 0, 0),
         ];
         let AuditDecision::Resolved { role, hits } = adjudicate_audit(&this_read) else {
-            panic!("A/B 直接命中应恢复");
+            panic!("direct A and B hits should be recovered");
         };
         assert_eq!(role, Role::Target);
         assert_eq!(
@@ -743,7 +706,7 @@ mod tests {
             named_hit(Role::Host, "host_0", 270, 0, 0),
         ];
         let AuditDecision::Resolved { role, hits } = adjudicate_audit(&hits) else {
-            panic!("目标直接命中应恢复");
+            panic!("direct target hit should be recovered");
         };
         assert_eq!(role, Role::Target);
         assert_eq!(hits.len(), 2);
@@ -762,7 +725,7 @@ mod tests {
             named_hit(Role::Target, "target_a", 279, 0, 0),
         ];
         let AuditDecision::Resolved { role, hits } = adjudicate_audit(&winning) else {
-            panic!("明确胜出的诱饵应产出同构证据");
+            panic!("a clearly winning decoy should produce symmetric evidence");
         };
         assert_eq!(role, Role::Decoy);
         assert_eq!(
@@ -770,7 +733,7 @@ mod tests {
                 .map(|hit| hit.contig.as_str())
                 .collect::<Vec<_>>(),
             ["decoy_a", "decoy_b"],
-            "Decoy 的 ΔAS>0 窗口同样须延期到匹配校准后"
+            "the decoy delta-AS>0 window must also remain disabled until calibration"
         );
 
         let near_tie = vec![
@@ -869,11 +832,11 @@ mod tests {
     #[test]
     fn split_event_requires_both_side_softclips() {
         let hits1 = vec![
-            hit(Role::Target, 200, 40, 0, 100, 0, 100),   // 右 clip 50
-            hit(Role::Host, 180, 40, 100, 150, 500, 550), // 左 clip 100
+            hit(Role::Target, 200, 40, 0, 100, 0, 100),
+            hit(Role::Host, 180, 40, 100, 150, 500, 550),
         ];
         let hits2 = vec![
-            hit(Role::Target, 200, 40, 0, 150, 0, 150), // 无 clip
+            hit(Role::Target, 200, 40, 0, 150, 0, 150),
             hit(Role::Host, 180, 40, 100, 150, 500, 550),
         ];
         let r1 = adjudicate_read(&hits1);
@@ -918,7 +881,6 @@ mod tests {
                 if std::thread::current().id() == caller {
                     caller_used.store(true, std::sync::atomic::Ordering::Release);
                 } else if value == 0 {
-                    // 固定阻塞首个 worker chunk，迫使两槽任务队列饱和并触发 caller-runs。
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                     while !caller_used.load(std::sync::atomic::Ordering::Acquire) {
                         if std::time::Instant::now() >= deadline {
@@ -942,7 +904,7 @@ mod tests {
     #[test]
     fn parallel_map_propagates_stream_error() {
         let mut items: Vec<Result<u64, String>> = (0..10).map(Ok).collect();
-        items.push(Err("流错误".into()));
+        items.push(Err("stream error".into()));
         let mut out = Vec::new();
         let result = par_map_chunks(
             items.into_iter(),
@@ -954,7 +916,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert_eq!(result.unwrap_err(), "流错误");
+        assert_eq!(result.unwrap_err(), "stream error");
     }
 
     #[test]
@@ -969,19 +931,21 @@ mod tests {
             |rs| {
                 calls += rs.len() as u64;
                 if calls > 30 {
-                    Err("sink 失败".into())
+                    Err("sink failure".into())
                 } else {
                     Ok(())
                 }
             },
         );
-        assert_eq!(result.unwrap_err(), "sink 失败");
-        assert_eq!(calls, 32, "sink 失败后不得继续回调后续 chunk");
+        assert_eq!(result.unwrap_err(), "sink failure");
+        assert_eq!(
+            calls, 32,
+            "no later chunks may be delivered after sink failure"
+        );
     }
 
     #[test]
     fn inline_map_zero_workers_is_deterministic() {
-        // --threads 1 语义：0 worker，主线程内联处理，顺序与并行路径一致。
         let items: Vec<Result<u64, String>> = (0..1000).map(Ok).collect();
         let mut out = Vec::new();
         par_map_chunks(
@@ -1008,7 +972,7 @@ mod tests {
             par_map_chunks(items.into_iter(), 0, 4, |chunk| chunk.to_vec(), |_| Ok(()),).is_ok()
         );
         let mut items: Vec<Result<u64, String>> = (0..10).map(Ok).collect();
-        items.push(Err("流错误".into()));
+        items.push(Err("stream error".into()));
         assert!(
             par_map_chunks(items.into_iter(), 0, 4, |chunk| chunk.to_vec(), |_| Ok(()),).is_err()
         );
@@ -1022,7 +986,7 @@ mod tests {
             |rs| {
                 calls += rs.len() as u64;
                 if calls > 30 {
-                    Err("sink 失败".into())
+                    Err("sink failure".into())
                 } else {
                     Ok(())
                 }
@@ -1054,10 +1018,10 @@ mod tests {
         drop(indexed);
 
         let err = match CompetitiveAligner::open(&mmi, 1) {
-            Ok(_) => panic!("多分片索引不应被接受"),
+            Ok(_) => panic!("a multi-shard index must be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("单分片"), "err={err}");
+        assert!(err.contains("single-shard"), "err={err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

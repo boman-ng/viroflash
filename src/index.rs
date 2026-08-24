@@ -1,21 +1,20 @@
-//! viroflash 索引目录：构建、加载与校验。
+//! Build, load, and validate viroflash index directories.
 //!
-//! 索引目录布局（`viroflash index --out <dir>` 产物）：
+//! Index layout produced by `viroflash index --out <dir>`:
 //! ```text
 //! <dir>/
-//!   ref.mmi        minimap2 sr 索引（minimap2 绑定 with_index(fa, Some(out)) 落盘）
-//!   bloom.bin      目标+诱饵 canonical k-mer Bloom（版本化二进制）
-//!   manifest.json  版本、k、角色→contig 元数据、诱饵来源参数、构建时间、来源 checksum
-//!   targets.fa     检测组代表序列（MMI 中 Target 角色的唯一输入）
-//!   decoys.fa      自动构建诱饵时的生成产物（+ decoys.tsv 元数据报告）
+//!   ref.mmi        minimap2 `sr` index written through `with_index(fa, Some(out))`
+//!   bloom.bin      versioned canonical k-mer Bloom filter for targets and decoys
+//!   manifest.json  version, k, role-to-contig metadata, decoy provenance, and checksums
+//!   targets.fa     detection-group representatives, the only Target inputs to the MMI
+//!   decoys.fa      generated decoys, accompanied by a decoys.tsv metadata report
 //! ```
-//! 加载路径只读 manifest/bloom/ref.mmi，不需要序列本身；来源 FASTA 以路径 + BLAKE3
-//! 记录在 manifest 中，保证索引可审计（STAR genomeParameters.txt / salmon
-//! versionInfo.json 模式的先例）。构建采用「临时目录 + 原子改名」，避免并发竞态
-//! 与半成品索引。
+//! Loading reads only the manifest, Bloom filter, and ref.mmi; source sequences are unnecessary.
+//! Source FASTA paths and BLAKE3 checksums remain in the manifest for auditability. Construction
+//! uses a temporary directory followed by an atomic rename to prevent races and partial indexes.
 //!
-//! JSON 为手工序列化/解析（延续 report.rs 零 serde 依赖约定），解析器仅支持本
-//! manifest 需要的 JSON 子集。
+//! JSON is serialized and parsed directly to preserve the no-serde convention in `report.rs`.
+//! The parser intentionally supports only the subset required by this manifest.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -29,10 +28,10 @@ use crate::prescreen::{self, KmerBloom};
 use crate::reference::{self, Contig, ContigMeta, Role};
 use crate::report::json_escape;
 
-/// manifest 索引格式版本；bloom.bin 有独立的二进制版本号。
+/// Manifest format version; `bloom.bin` has an independent binary version.
 pub const FORMAT_VERSION: u32 = 2;
-/// v1 只保留给既有未分组索引的迁移窗口；未来关闭该窗口时把此值升为 2，并删除
-/// `singleton_target_groups` 及对应 v1 回归测试。
+/// Version 1 remains supported only as a migration window for legacy ungrouped indexes. Closing
+/// that window requires raising this value to 2 and removing `singleton_target_groups` and its test.
 pub const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 pub const MANIFEST_NAME: &str = "manifest.json";
 pub const MMI_NAME: &str = "ref.mmi";
@@ -41,20 +40,20 @@ pub const TARGETS_FA_NAME: &str = "targets.fa";
 pub const DECOYS_FA_NAME: &str = "decoys.fa";
 pub const DECOYS_TSV_NAME: &str = "decoys.tsv";
 
-/// 索引构建参数（`viroflash index` 命令与 `run` 自动构建共用同一入口）。
+/// Index construction options shared by `viroflash index` and automatic construction in `run`.
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
     pub host_fa: PathBuf,
     pub target_fa: PathBuf,
     pub contam_fa: Option<PathBuf>,
     pub decoy_fa: Option<PathBuf>,
-    /// 未提供 decoy_fa 时自动生成诱饵的 ANI 层（百分比整数）。
+    /// Integer ANI percentages used to generate decoys when `decoy_fa` is absent.
     pub decoy_anis: Vec<u8>,
     pub decoy_per_layer: usize,
     pub decoy_seed: u64,
     pub out_dir: PathBuf,
     pub k: usize,
-    /// minimap2 索引构建线程数。
+    /// Number of threads used to build the minimap2 index.
     pub threads: usize,
 }
 
@@ -75,7 +74,7 @@ impl Default for IndexOptions {
     }
 }
 
-/// 诱饵来源（manifest 记录，保证零分布可审计）。
+/// Decoy provenance recorded in the manifest to keep the null distribution auditable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecoySource {
     File {
@@ -109,7 +108,8 @@ pub struct BloomInfo {
     pub fill_frac: f64,
 }
 
-/// 一个目标检测组在复合参考中的映射。代表与成员保留原始 target FASTA 名称。
+/// Mapping of one target detection group into the composite reference.
+/// Representatives and members retain their original target FASTA names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetGroupMeta {
     pub contig: String,
@@ -128,8 +128,8 @@ pub struct IndexManifest {
     pub bloom: BloomInfo,
 }
 
-/// 解析后的可用索引：构建与加载两条路径产出同一结构，
-/// `run` 管线对其余逻辑完全一致（两路径结果等价的基础）。
+/// Parsed index shared by the build and load paths, allowing `run` to use identical downstream
+/// logic and produce equivalent results through either path.
 #[derive(Debug)]
 pub struct BuiltIndex {
     pub format_version: u32,
@@ -148,8 +148,8 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 构建索引目录。`out_dir` 已存在时拒绝（不静默覆盖）；内部在临时目录构建
-/// 完成后原子改名，失败时清理临时目录。
+/// Build an index directory. Existing output is rejected rather than overwritten. Construction
+/// occurs in a temporary directory that is atomically renamed on success and cleaned on failure.
 pub fn build_index(opt: &IndexOptions) -> Result<BuiltIndex, String> {
     validate_index_options(opt)?;
     let label = opt
@@ -176,7 +176,10 @@ fn build_index_with_monitor_validated(
 ) -> Result<BuiltIndex, String> {
     monitor.stage("index_prepare");
     if opt.out_dir.exists() {
-        return Err(format!("索引目录已存在: {}", opt.out_dir.display()));
+        return Err(format!(
+            "Index directory already exists: {}",
+            opt.out_dir.display()
+        ));
     }
     let part = PathBuf::from(format!(
         "{}.part.{}",
@@ -184,7 +187,7 @@ fn build_index_with_monitor_validated(
         std::process::id()
     ));
     if part.exists() {
-        // 上次同 pid 崩溃残留：仅清理自身专属的临时目录。
+        // Remove only a stale temporary directory owned by the same process ID.
         let _ = std::fs::remove_dir_all(&part);
     }
     let result = build_index_into(&part, opt, monitor);
@@ -195,11 +198,11 @@ fn build_index_with_monitor_validated(
     if let Err(error) = std::fs::rename(&part, &opt.out_dir) {
         let _ = std::fs::remove_dir_all(&part);
         return Err(format!(
-            "索引目录定稿失败 {}: {error}",
+            "Failed to finalize index directory {}: {error}",
             opt.out_dir.display()
         ));
     }
-    // part 目录已原子改名为最终目录：返回结构中的产物路径须指向最终位置。
+    // The part directory is now final; returned artifact paths must point to its final location.
     let mut built = result?;
     built.mmi_path = opt.out_dir.join(MMI_NAME);
     Ok(built)
@@ -211,27 +214,27 @@ fn build_index_into(
     monitor: &crate::perf::PerfMonitor,
 ) -> Result<BuiltIndex, String> {
     std::fs::create_dir_all(part)
-        .map_err(|e| format!("无法创建索引目录 {}: {e}", part.display()))?;
+        .map_err(|e| format!("Cannot create index directory {}: {e}", part.display()))?;
 
-    // 1. 目标检测组：保留原始序列供 Bloom 使用，仅把每组代表写入 MMI 的目标输入。
+    // 1. Target groups: retain original sequences for Bloom insertion; write only representatives to the MMI.
     monitor.stage("index_target_groups");
     let target_records = reference::parse_fasta(&opt.target_fa)?;
     let mut original_target_names = HashSet::new();
     for (name, _) in &target_records {
         if !original_target_names.insert(name.as_str()) {
             return Err(format!(
-                "目标 FASTA 中序列名重复，无法建立唯一检测组成员: {name}"
+                "Duplicate sequence name in target FASTA; cannot create unique detection-group membership: {name}"
             ));
         }
     }
     let detection_groups =
         group::construct_detection_groups(&target_records, monitor.work_thread_budget())
-            .map_err(|e| format!("构建目标检测组失败: {e}"))?;
+            .map_err(|e| format!("Failed to build target detection groups: {e}"))?;
     let targets_path = part.join(TARGETS_FA_NAME);
     let target_groups = write_grouped_targets(&targets_path, &target_records, &detection_groups)?;
 
-    // 2. 诱饵：显式文件直接引用；否则按固定参数从检测组代表自动生成（产物留在
-    //    索引内，保证同一索引的零分布可复现、可审计）。
+    // 2. Decoys: use an explicit file or generate them from representatives with fixed parameters.
+    //    Generated artifacts remain in the index so its null distribution is reproducible.
     monitor.stage("index_decoy");
     let decoy_path: PathBuf;
     let decoy_source: DecoySource;
@@ -263,11 +266,11 @@ fn build_index_into(
         }
     }
 
-    // 3. 复合参考 + minimap2 索引（构建在 build/ 子目录，落盘后移入根并丢弃 composite）。
+    // 3. Composite reference and minimap2 index. Build below build/, move the MMI, then discard the composite.
     monitor.stage("index_reference_mmi");
     let build_dir = part.join("build");
     std::fs::create_dir_all(&build_dir)
-        .map_err(|e| format!("无法创建构建目录 {}: {e}", build_dir.display()))?;
+        .map_err(|e| format!("Cannot create build directory {}: {e}", build_dir.display()))?;
     let mut fastas = vec![
         (Role::Host, opt.host_fa.clone()),
         (Role::Target, targets_path),
@@ -279,11 +282,12 @@ fn build_index_into(
     let (mmi_built, contigs) =
         reference::build_reference(&fastas, &build_dir, monitor.work_thread_budget().max(1))?;
     let mmi_path = part.join(MMI_NAME);
-    std::fs::rename(&mmi_built, &mmi_path).map_err(|e| format!("移动索引文件失败: {e}"))?;
+    std::fs::rename(&mmi_built, &mmi_path)
+        .map_err(|e| format!("Failed to move index file: {e}"))?;
     let _ = std::fs::remove_file(build_dir.join("composite.fa"));
     let _ = std::fs::remove_dir(&build_dir);
 
-    // 4. Bloom：原始目标各插入一次，再加实际进入复合参考的诱饵；不重复插入 reps。
+    // 4. Bloom: insert every original target once plus actual decoys; do not reinsert representatives.
     monitor.stage("index_bloom");
     let original_targets: Vec<Contig> = target_records
         .into_iter()
@@ -298,13 +302,13 @@ fn build_index_into(
     bloom_refs.extend(contigs.iter().filter(|c| c.role == Role::Decoy));
     let bloom = KmerBloom::build(&bloom_refs, opt.k, prescreen::GATE_FPR).ok_or_else(|| {
         format!(
-            "原始目标+诱饵 FASTA 中没有 ≥k={} 的有效 k-mer（全部序列过短或含非 ACGT 字符）",
+            "The original target and decoy FASTA files contain no valid k-mers with k={} (all sequences are too short or contain non-ACGT characters)",
             opt.k
         )
     })?;
     write_bloom(&part.join(BLOOM_NAME), &bloom)?;
 
-    // 5. manifest（角色→contig 元数据 + 检测组 + 来源 checksum + 诱饵参数）。
+    // 5. Manifest: role-to-contig metadata, detection groups, source checksums, and decoy options.
     monitor.stage("index_manifest");
     let roles: HashMap<String, Role> = contigs.iter().map(|c| (c.name.clone(), c.role)).collect();
     let metas: Vec<ContigMeta> = contigs.iter().map(ContigMeta::from).collect();
@@ -329,7 +333,8 @@ fn build_index_into(
     };
     let text = write_manifest(&manifest);
     let manifest_path = part.join(MANIFEST_NAME);
-    std::fs::write(&manifest_path, &text).map_err(|e| format!("写 manifest.json 失败: {e}"))?;
+    std::fs::write(&manifest_path, &text)
+        .map_err(|e| format!("Failed to write manifest.json: {e}"))?;
 
     Ok(BuiltIndex {
         format_version: FORMAT_VERSION,
@@ -347,20 +352,21 @@ fn write_grouped_targets(
     records: &[(String, Vec<u8>)],
     groups: &[DetectionGroup],
 ) -> Result<Vec<TargetGroupMeta>, String> {
-    let file = File::create(path).map_err(|e| format!("无法创建 {}: {e}", path.display()))?;
+    let file = File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
     let mut writer = BufWriter::new(file);
     let mut metas = Vec::with_capacity(groups.len());
     for (group_index, detection_group) in groups.iter().enumerate() {
-        let (representative, sequence) = records
-            .get(detection_group.representative)
-            .ok_or_else(|| format!("检测组 {group_index} 的代表序列下标越界"))?;
+        let (representative, sequence) =
+            records.get(detection_group.representative).ok_or_else(|| {
+                format!("Representative index is out of bounds for detection group {group_index}")
+            })?;
         writeln!(writer, ">{representative}")
-            .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         for chunk in sequence.chunks(60) {
             writer
                 .write_all(chunk)
                 .and_then(|_| writer.write_all(b"\n"))
-                .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         }
 
         let members = detection_group
@@ -370,7 +376,7 @@ fn write_grouped_targets(
                 records
                     .get(member_index)
                     .map(|(name, _)| name.clone())
-                    .ok_or_else(|| format!("检测组 {group_index} 的成员下标越界: {member_index}"))
+                    .ok_or_else(|| format!("Member index is out of bounds for detection group {group_index}: {member_index}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         metas.push(TargetGroupMeta {
@@ -381,7 +387,7 @@ fn write_grouped_targets(
     }
     writer
         .flush()
-        .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     Ok(metas)
 }
 
@@ -402,7 +408,7 @@ fn validate_contig_names(contigs: &[ContigMeta]) -> Result<(), String> {
     for contig in contigs {
         if !names.insert(contig.name.as_str()) {
             return Err(format!(
-                "manifest.json contigs 中 contig 重名: {}",
+                "Duplicate contig name in manifest.json contigs: {}",
                 contig.name
             ));
         }
@@ -425,19 +431,19 @@ fn validate_target_groups(
     for target_group in target_groups {
         if !grouped_contigs.insert(target_group.contig.as_str()) {
             return Err(format!(
-                "manifest.json target_groups 中 contig 重名: {}",
+                "Duplicate contig name in manifest.json target_groups: {}",
                 target_group.contig
             ));
         }
         if !target_contigs.contains(target_group.contig.as_str()) {
             return Err(format!(
-                "manifest.json target_groups 含未知 Target contig: {}",
+                "manifest.json target_groups contains unknown Target contig: {}",
                 target_group.contig
             ));
         }
         if target_group.members.is_empty() {
             return Err(format!(
-                "manifest.json target_groups 的 {} 没有成员",
+                "manifest.json target group {} has no members",
                 target_group.contig
             ));
         }
@@ -447,7 +453,7 @@ fn validate_target_groups(
             .any(|member| member == &target_group.representative)
         {
             return Err(format!(
-                "manifest.json target_groups 的 {} 代表不在成员中: {}",
+                "Representative is not a member of manifest.json target group {}: {}",
                 target_group.contig, target_group.representative
             ));
         }
@@ -455,19 +461,19 @@ fn validate_target_groups(
         for member in &target_group.members {
             if member.is_empty() {
                 return Err(format!(
-                    "manifest.json target_groups 的 {} 含空成员名",
+                    "manifest.json target group {} contains an empty member name",
                     target_group.contig
                 ));
             }
             if !local_members.insert(member.as_str()) {
                 return Err(format!(
-                    "manifest.json target_groups 的 {} 含重复成员: {member}",
+                    "manifest.json target group {} contains duplicate member: {member}",
                     target_group.contig
                 ));
             }
             if !grouped_members.insert(member.as_str()) {
                 return Err(format!(
-                    "manifest.json target_groups 的成员跨组重复: {member}"
+                    "Member appears in multiple manifest.json target groups: {member}"
                 ));
             }
         }
@@ -482,7 +488,7 @@ fn validate_target_groups(
         .collect();
     if !missing.is_empty() {
         return Err(format!(
-            "manifest.json target_groups 缺少 Target contig: {}",
+            "manifest.json target_groups is missing Target contig: {}",
             missing.join(", ")
         ));
     }
@@ -496,45 +502,45 @@ fn file_info(p: &Path) -> Result<FileInfo, String> {
     })
 }
 
-/// 加载既有索引目录并校验：存在性、格式版本、k 一致性、bloom 完整性。
+/// Load an index and validate existence, format version, k consistency, and Bloom integrity.
 pub fn load_index(dir: &Path, k: usize) -> Result<BuiltIndex, String> {
     if !dir.is_dir() {
-        return Err(format!("索引目录不存在: {}", dir.display()));
+        return Err(format!("Index directory does not exist: {}", dir.display()));
     }
     let manifest_path = dir.join(MANIFEST_NAME);
     let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
         format!(
-            "读取 {} 失败（不是 viroflash 索引目录或缺少 manifest.json）: {e}",
+            "Failed to read {} (not a viroflash index directory or manifest.json is missing): {e}",
             manifest_path.display()
         )
     })?;
     let manifest = parse_manifest(&text)?;
     if manifest.format_version < MIN_SUPPORTED_FORMAT_VERSION {
         return Err(format!(
-            "索引格式版本 {} 低于当前支持的 {}，请用当前版本重新构建索引",
+            "Index format version {} is older than the supported version {}; rebuild the index with the current viroflash version",
             manifest.format_version, MIN_SUPPORTED_FORMAT_VERSION
         ));
     }
     if manifest.format_version > FORMAT_VERSION {
         return Err(format!(
-            "索引格式版本 {} 高于当前支持的 {}，请用当前版本重新构建索引",
+            "Index format version {} is newer than the supported version {}; use a compatible viroflash version",
             manifest.format_version, FORMAT_VERSION
         ));
     }
     if manifest.k != k {
         return Err(format!(
-            "索引 k={} 与 --k={} 不一致（Bloom 与索引均按 k 构建，需以同一 k 重建索引）",
+            "Index k={} does not match --k={} (the Bloom filter and index must be rebuilt with the same k)",
             manifest.k, k
         ));
     }
     let mmi_path = dir.join(MMI_NAME);
     if !mmi_path.is_file() {
-        return Err(format!("索引缺少 {}", MMI_NAME));
+        return Err(format!("Index is missing {}", MMI_NAME));
     }
     let bloom = read_bloom(&dir.join(BLOOM_NAME))?;
     if bloom.k != manifest.k {
         return Err(format!(
-            "{} 与 {} 的 k 不一致（{} / {}），索引损坏，请重建",
+            "{} and {} have mismatched k values ({} / {}); the index is corrupt and must be rebuilt",
             BLOOM_NAME, MANIFEST_NAME, bloom.k, manifest.k
         ));
     }
@@ -557,38 +563,40 @@ pub fn load_index(dir: &Path, k: usize) -> Result<BuiltIndex, String> {
 fn validate_index_options(opt: &IndexOptions) -> Result<(), String> {
     if !(1..=prescreen::K_MAX).contains(&opt.k) {
         return Err(format!(
-            "--k 必须在 1..={} 之间（2-bit 编码上限），得到 {}",
+            "--k must be between 1 and {} (the 2-bit encoding limit); got {}",
             prescreen::K_MAX,
             opt.k
         ));
     }
     if opt.threads == 0 {
-        return Err("--threads 必须大于 0".into());
+        return Err("--threads must be greater than 0".into());
     }
     if opt.host_fa.as_os_str().is_empty() || opt.target_fa.as_os_str().is_empty() {
-        return Err("构建索引需要 --host-fa 与 --target-fa".into());
+        return Err("Building an index requires --host-fa and --target-fa".into());
     }
     if opt.out_dir.as_os_str().is_empty() {
-        return Err("构建索引需要 --out".into());
+        return Err("Building an index requires --out".into());
     }
     if opt.decoy_fa.is_none() {
         if opt.decoy_anis.is_empty() {
-            return Err("--decoy-ani 至少一层".into());
+            return Err("--decoy-ani requires at least one layer".into());
         }
         for &a in &opt.decoy_anis {
             if a == 0 || a >= 100 {
-                return Err(format!("--decoy-ani 层 {a} 非法（须在 1..99 之间）"));
+                return Err(format!(
+                    "Invalid --decoy-ani layer {a} (must be between 1 and 99)"
+                ));
             }
         }
         if opt.decoy_per_layer == 0 {
-            return Err("--decoy-per-layer 必须大于 0".into());
+            return Err("--decoy-per-layer must be greater than 0".into());
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Bloom 二进制序列化（私有格式，带魔数与版本；跨平台确定性）
+// Bloom binary serialization: private, versioned, magic-tagged, and cross-platform deterministic.
 // ---------------------------------------------------------------------------
 
 const BLOOM_MAGIC: [u8; 4] = *b"VFB1";
@@ -597,7 +605,8 @@ const BLOOM_IO_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 fn write_bloom(path: &Path, bloom: &KmerBloom) -> Result<(), String> {
     let (words, _mask) = bloom.to_raw();
-    let file = File::create(path).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+    let file =
+        File::create(path).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writer
         .write_all(&BLOOM_MAGIC)
@@ -605,7 +614,7 @@ fn write_bloom(path: &Path, bloom: &KmerBloom) -> Result<(), String> {
         .and_then(|_| writer.write_all(&(bloom.k as u64).to_le_bytes()))
         .and_then(|_| writer.write_all(&bloom.n_inserted.to_le_bytes()))
         .and_then(|_| writer.write_all(&(words.len() as u64).to_le_bytes()))
-        .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
 
     let words_per_chunk = BLOOM_IO_BUFFER_BYTES / 8;
     let mut bytes = Vec::with_capacity(words.len().min(words_per_chunk) * 8);
@@ -616,61 +625,65 @@ fn write_bloom(path: &Path, bloom: &KmerBloom) -> Result<(), String> {
         }
         writer
             .write_all(&bytes)
-            .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     }
     writer
         .flush()
-        .map_err(|e| format!("写 {} 失败: {e}", path.display()))
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 fn read_bloom(path: &Path) -> Result<KmerBloom, String> {
     const HEADER_LEN: usize = 4 + 4 + 8 + 8 + 8;
-    let mut file =
-        File::open(path).map_err(|e| format!("索引缺少或无法读取 {}: {e}", path.display()))?;
+    let mut file = File::open(path)
+        .map_err(|e| format!("Index is missing or unreadable {}: {e}", path.display()))?;
     let file_len = file
         .metadata()
-        .map_err(|e| format!("读取 {} 元数据失败: {e}", path.display()))?
+        .map_err(|e| format!("Failed to read metadata for {}: {e}", path.display()))?
         .len();
     if file_len < HEADER_LEN as u64 {
-        return Err(format!("{} 损坏（长度不足）", path.display()));
+        return Err(format!("{} is corrupt (too short)", path.display()));
     }
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     if header[..4] != BLOOM_MAGIC {
         return Err(format!(
-            "{} 魔数不匹配（版本不兼容或文件损坏）",
+            "{} has an invalid magic number (incompatible version or corrupt file)",
             path.display()
         ));
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     if version > BLOOM_VERSION {
         return Err(format!(
-            "{} 版本 {version} 高于当前支持的 {BLOOM_VERSION}，请重建索引",
+            "{} version {version} is newer than supported version {BLOOM_VERSION}; rebuild the index",
             path.display()
         ));
     }
     let k = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
     if !(1..=prescreen::K_MAX).contains(&k) {
-        return Err(format!("{} 损坏（k 非法: {k}）", path.display()));
+        return Err(format!("{} is corrupt (invalid k: {k})", path.display()));
     }
     let n_inserted = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let words_len_u64 = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    let words_len = usize::try_from(words_len_u64)
-        .map_err(|_| format!("{} 损坏（位容量超出平台上限）", path.display()))?;
+    let words_len = usize::try_from(words_len_u64).map_err(|_| {
+        format!(
+            "{} is corrupt (bit capacity exceeds the platform limit)",
+            path.display()
+        )
+    })?;
     if words_len == 0 || !words_len.is_power_of_two() {
         return Err(format!(
-            "{} 损坏（位容量非 2 的幂: {words_len}）",
+            "{} is corrupt (bit capacity is not a power of two: {words_len})",
             path.display()
         ));
     }
     let expected_len = words_len_u64
         .checked_mul(8)
         .and_then(|n| n.checked_add(HEADER_LEN as u64))
-        .ok_or_else(|| format!("{} 损坏（长度溢出）", path.display()))?;
+        .ok_or_else(|| format!("{} is corrupt (length overflow)", path.display()))?;
     if file_len != expected_len {
         return Err(format!(
-            "{} 损坏（长度不一致: 期望 {}，实际 {}）",
+            "{} is corrupt (length mismatch: expected {}, got {})",
             path.display(),
             expected_len,
             file_len
@@ -678,9 +691,12 @@ fn read_bloom(path: &Path) -> Result<KmerBloom, String> {
     }
 
     let mut words = Vec::new();
-    words
-        .try_reserve_exact(words_len)
-        .map_err(|e| format!("加载 {} 内存分配失败: {e}", path.display()))?;
+    words.try_reserve_exact(words_len).map_err(|e| {
+        format!(
+            "Failed to allocate memory while loading {}: {e}",
+            path.display()
+        )
+    })?;
     let chunk_words_capacity = words_len.min(BLOOM_IO_BUFFER_BYTES / 8);
     let mut bytes = vec![0u8; chunk_words_capacity * 8];
     while words.len() < words_len {
@@ -688,7 +704,7 @@ fn read_bloom(path: &Path) -> Result<KmerBloom, String> {
         let chunk_words = remaining.min(bytes.len() / 8);
         let chunk_bytes = chunk_words * 8;
         file.read_exact(&mut bytes[..chunk_bytes])
-            .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
         for raw in bytes[..chunk_bytes].chunks_exact(8) {
             words.push(u64::from_le_bytes(raw.try_into().unwrap()));
         }
@@ -702,7 +718,7 @@ fn read_bloom(path: &Path) -> Result<KmerBloom, String> {
 }
 
 // ---------------------------------------------------------------------------
-// manifest JSON 写/读（手工序列化，零依赖）
+// Dependency-free manifest JSON serialization and parsing.
 // ---------------------------------------------------------------------------
 
 fn write_manifest(m: &IndexManifest) -> String {
@@ -743,8 +759,8 @@ fn write_manifest(m: &IndexManifest) -> String {
     s.push_str("  },\n");
     s.push_str("  \"contigs\": [\n");
     for (i, c) in m.contigs.iter().enumerate() {
-        // gc 用 f64 最短往返表示（Display），解析后与构建时逐位一致，
-        // 避免 6 位截断在分层边界（0.40/0.50/0.60）上翻转 stratum。
+        // Use f64's shortest round-trip representation so parsed GC values remain bit-identical.
+        // Six-digit truncation could otherwise change strata at 0.40/0.50/0.60 boundaries.
         s.push_str(&format!(
             "    {{\"name\": \"{}\", \"role\": \"{}\", \"len\": {}, \"gc\": {}}}{}\n",
             json_escape(&c.name),
@@ -798,7 +814,7 @@ fn file_info_json(f: &FileInfo) -> String {
     )
 }
 
-// --- 最小 JSON 解析器（仅本 manifest 所需子集） ---
+// --- Minimal JSON parser for the subset required by this manifest ---
 
 #[derive(Debug, PartialEq)]
 enum Json {
@@ -824,7 +840,10 @@ impl<'a> JsonParser<'a> {
     }
 
     fn err(&self, msg: &str) -> String {
-        format!("manifest.json 解析失败（偏移 {}）: {msg}", self.pos)
+        format!(
+            "Failed to parse manifest.json at offset {}: {msg}",
+            self.pos
+        )
     }
 
     fn ws(&mut self) {
@@ -840,7 +859,7 @@ impl<'a> JsonParser<'a> {
         self.bytes
             .get(self.pos)
             .copied()
-            .ok_or_else(|| self.err("意外结束"))
+            .ok_or_else(|| self.err("Unexpected end of input"))
     }
 
     fn expect(&mut self, b: u8) -> Result<(), String> {
@@ -848,7 +867,7 @@ impl<'a> JsonParser<'a> {
             self.pos += 1;
             Ok(())
         } else {
-            Err(self.err(&format!("期望 '{}'", b as char)))
+            Err(self.err(&format!("Expected '{}'", b as char)))
         }
     }
 
@@ -856,7 +875,7 @@ impl<'a> JsonParser<'a> {
         let v = self.parse_value()?;
         self.ws();
         if self.pos != self.bytes.len() {
-            return Err(self.err("多余内容"));
+            return Err(self.err("Trailing content"));
         }
         Ok(v)
     }
@@ -879,7 +898,7 @@ impl<'a> JsonParser<'a> {
                 Ok(Json::Null)
             }
             b'-' | b'0'..=b'9' => self.parse_number(),
-            other => Err(self.err(&format!("非法字符 '{}'", other as char))),
+            other => Err(self.err(&format!("Invalid character '{}'", other as char))),
         }
     }
 
@@ -888,7 +907,7 @@ impl<'a> JsonParser<'a> {
             if self.peek()? == b {
                 self.pos += 1;
             } else {
-                return Err(self.err("非法字面量"));
+                return Err(self.err("Invalid literal"));
             }
         }
         Ok(())
@@ -915,7 +934,9 @@ impl<'a> JsonParser<'a> {
                     break;
                 }
                 other => {
-                    return Err(self.err(&format!("期望 ',' 或 '}}'，得到 '{}'", other as char)))
+                    return Err(
+                        self.err(&format!("Expected ','  or  '}}'; got '{}'", other as char))
+                    )
                 }
             }
         }
@@ -940,7 +961,7 @@ impl<'a> JsonParser<'a> {
                     break;
                 }
                 other => {
-                    return Err(self.err(&format!("期望 ',' 或 ']'，得到 '{}'", other as char)))
+                    return Err(self.err(&format!("Expected ','  or  ']'; got '{}'", other as char)))
                 }
             }
         }
@@ -955,7 +976,7 @@ impl<'a> JsonParser<'a> {
             let b = *self
                 .bytes
                 .get(self.pos)
-                .ok_or_else(|| self.err("字符串未闭合"))?;
+                .ok_or_else(|| self.err("Unterminated string"))?;
             self.pos += 1;
             match b {
                 b'"' => break,
@@ -963,7 +984,7 @@ impl<'a> JsonParser<'a> {
                     let e = *self
                         .bytes
                         .get(self.pos)
-                        .ok_or_else(|| self.err("转义未闭合"))?;
+                        .ok_or_else(|| self.err("Unterminated escape sequence"))?;
                     self.pos += 1;
                     match e {
                         b'"' => out.push('"'),
@@ -975,47 +996,55 @@ impl<'a> JsonParser<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => out.push(self.parse_unicode_escape()?),
-                        other => return Err(self.err(&format!("非法转义 '\\{}'", other as char))),
+                        other => {
+                            return Err(
+                                self.err(&format!("Invalid escape sequence '\\{}'", other as char))
+                            )
+                        }
                     }
                 }
                 0x20..=0x7e => out.push(b as char),
                 0x80..=0xff => {
                     let tail = std::str::from_utf8(&self.bytes[byte_pos..])
-                        .map_err(|_| self.err("字符串含非法 UTF-8"))?;
+                        .map_err(|_| self.err("String contains invalid UTF-8"))?;
                     let character = tail
                         .chars()
                         .next()
-                        .ok_or_else(|| self.err("字符串未闭合"))?;
+                        .ok_or_else(|| self.err("Unterminated string"))?;
                     self.pos = byte_pos + character.len_utf8();
                     out.push(character);
                 }
-                other => return Err(self.err(&format!("字符串中非法控制字符 0x{other:02x}"))),
+                other => {
+                    return Err(self.err(&format!(
+                        "Invalid control character in string 0x{other:02x}"
+                    )))
+                }
             }
         }
         Ok(out)
     }
 
-    /// \uXXXX，含代理对组合。
+    /// Parse `\uXXXX`, including surrogate pairs.
     fn parse_unicode_escape(&mut self) -> Result<char, String> {
         let hi = self.parse_hex4()?;
         let cp = if (0xD800..=0xDBFF).contains(&hi) {
-            // 高代理：必须跟随 \uDC00-\uDFFF。
+            // A high surrogate must be followed by \uDC00-\uDFFF.
             if self.bytes.get(self.pos) == Some(&b'\\')
                 && self.bytes.get(self.pos + 1) == Some(&b'u')
             {
                 self.pos += 2;
                 let lo = self.parse_hex4()?;
                 if !(0xDC00..=0xDFFF).contains(&lo) {
-                    return Err(self.err("非法低代理"));
+                    return Err(self.err("Invalid low surrogate"));
                 }
                 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
             } else {
-                return Err(self.err("高代理未配低代理"));
+                return Err(self.err("High surrogate is not followed by a low surrogate"));
             }
         } else {
             hi
         };
-        char::from_u32(cp).ok_or_else(|| self.err("非法 Unicode 码点"))
+        char::from_u32(cp).ok_or_else(|| self.err("Invalid Unicode code point"))
     }
 
     fn parse_hex4(&mut self) -> Result<u32, String> {
@@ -1024,14 +1053,14 @@ impl<'a> JsonParser<'a> {
             let b = *self
                 .bytes
                 .get(self.pos)
-                .ok_or_else(|| self.err("\\u 转义截断"))?;
+                .ok_or_else(|| self.err("Truncated \\u escape"))?;
             self.pos += 1;
             v = v * 16
                 + match b {
                     b'0'..=b'9' => u32::from(b - b'0'),
                     b'a'..=b'f' => u32::from(b - b'a' + 10),
                     b'A'..=b'F' => u32::from(b - b'A' + 10),
-                    _ => return Err(self.err("\\u 转义中非法十六进制")),
+                    _ => return Err(self.err("Invalid hexadecimal digit in \\u escape")),
                 };
         }
         Ok(v)
@@ -1047,15 +1076,15 @@ impl<'a> JsonParser<'a> {
         {
             self.pos += 1;
         }
-        let text =
-            std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|_| self.err("非法数字"))?;
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| self.err("Invalid number"))?;
         text.parse::<f64>()
             .map(Json::Num)
-            .map_err(|_| self.err(&format!("非法数字: {text}")))
+            .map_err(|_| self.err(&format!("Invalid number: {text}")))
     }
 }
 
-// --- 从解析结果提取 manifest 字段 ---
+// --- Extract manifest fields from the parsed representation ---
 
 fn obj_get<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
     obj.iter().find(|(k, _)| k == key).map(|(_, v)| v)
@@ -1064,28 +1093,30 @@ fn obj_get<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 fn as_obj<'a>(v: &'a Json, what: &str) -> Result<&'a [(String, Json)], String> {
     match v {
         Json::Obj(pairs) => Ok(pairs),
-        _ => Err(format!("manifest.json 字段 {what} 应为对象")),
+        _ => Err(format!("manifest.json field {what} must be an object")),
     }
 }
 
 fn as_str<'a>(v: &'a Json, what: &str) -> Result<&'a str, String> {
     match v {
         Json::Str(s) => Ok(s),
-        _ => Err(format!("manifest.json 字段 {what} 应为字符串")),
+        _ => Err(format!("manifest.json field {what} must be a string")),
     }
 }
 
 fn as_u64(v: &Json, what: &str) -> Result<u64, String> {
     match v {
         Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= u64::MAX as f64 => Ok(*n as u64),
-        _ => Err(format!("manifest.json 字段 {what} 应为非负整数")),
+        _ => Err(format!(
+            "manifest.json field {what} must be a non-negative integer"
+        )),
     }
 }
 
 fn as_f64(v: &Json, what: &str) -> Result<f64, String> {
     match v {
         Json::Num(n) => Ok(*n),
-        _ => Err(format!("manifest.json 字段 {what} 应为数字")),
+        _ => Err(format!("manifest.json field {what} must be a number")),
     }
 }
 
@@ -1095,51 +1126,55 @@ fn role_from_str(s: &str) -> Result<Role, String> {
         "target" => Ok(Role::Target),
         "decoy" => Ok(Role::Decoy),
         "contam" => Ok(Role::Contaminant),
-        other => Err(format!("manifest.json 中未知角色: {other}")),
+        other => Err(format!("Unknown role in manifest.json: {other}")),
     }
 }
 
 fn parse_manifest(text: &str) -> Result<IndexManifest, String> {
     let root = JsonParser::new(text).parse()?;
-    let top = as_obj(&root, "根")?;
+    let top = as_obj(&root, "root")?;
     let format = as_str(
-        obj_get(top, "format").ok_or("manifest.json 缺少 format 字段")?,
+        obj_get(top, "format").ok_or("manifest.json is missing field format")?,
         "format",
     )?;
     if format != "viroflash.index" {
         return Err(format!(
-            "manifest.json format 应为 \"viroflash.index\"，得到 \"{format}\""
+            "manifest.json format must be \"viroflash.index\"; got \"{format}\""
         ));
     }
     let format_version = as_u64(
-        obj_get(top, "version").ok_or("manifest.json 缺少 version 字段")?,
+        obj_get(top, "version").ok_or("manifest.json is missing field version")?,
         "version",
     )? as u32;
-    let k = as_u64(obj_get(top, "k").ok_or("manifest.json 缺少 k 字段")?, "k")? as usize;
+    let k = as_u64(
+        obj_get(top, "k").ok_or("manifest.json is missing field k")?,
+        "k",
+    )? as usize;
     if !(1..=prescreen::K_MAX).contains(&k) {
-        return Err(format!("manifest.json 中 k 非法: {k}"));
+        return Err(format!("Invalid k in manifest.json: {k}"));
     }
     let created_at_unix = as_u64(
-        obj_get(top, "created_at_unix").ok_or("manifest.json 缺少 created_at_unix 字段")?,
+        obj_get(top, "created_at_unix").ok_or("manifest.json is missing field created_at_unix")?,
         "created_at_unix",
     )?;
     let refs_root = as_obj(
-        obj_get(top, "refs").ok_or("manifest.json 缺少 refs 字段")?,
+        obj_get(top, "refs").ok_or("manifest.json is missing field refs")?,
         "refs",
     )?;
     let parse_file = |key: &str| -> Result<FileInfo, String> {
         let o = as_obj(
-            obj_get(refs_root, key).ok_or_else(|| format!("manifest.json refs 缺少 {key}"))?,
+            obj_get(refs_root, key)
+                .ok_or_else(|| format!("manifest.json refs is missing {key}"))?,
             key,
         )?;
         Ok(FileInfo {
             path: as_str(
-                obj_get(o, "path").ok_or_else(|| format!("refs.{key} 缺少 path"))?,
+                obj_get(o, "path").ok_or_else(|| format!("refs.{key} is missing path"))?,
                 "path",
             )?
             .to_string(),
             blake3: as_str(
-                obj_get(o, "blake3").ok_or_else(|| format!("refs.{key} 缺少 blake3"))?,
+                obj_get(o, "blake3").ok_or_else(|| format!("refs.{key} is missing blake3"))?,
                 "blake3",
             )?
             .to_string(),
@@ -1150,90 +1185,95 @@ fn parse_manifest(text: &str) -> Result<IndexManifest, String> {
         Some(_) => Some(parse_file("contam")?),
     };
     let decoy = as_obj(
-        obj_get(refs_root, "decoy").ok_or("manifest.json refs 缺少 decoy")?,
+        obj_get(refs_root, "decoy").ok_or("manifest.json refs is missing decoy")?,
         "decoy",
     )?;
     let decoy_source = if let Some(v) = obj_get(decoy, "file") {
         let o = as_obj(v, "decoy.file")?;
         DecoySource::File {
-            path: as_str(obj_get(o, "path").ok_or("decoy.file 缺少 path")?, "path")?.to_string(),
+            path: as_str(
+                obj_get(o, "path").ok_or("decoy.file is missing path")?,
+                "path",
+            )?
+            .to_string(),
             blake3: as_str(
-                obj_get(o, "blake3").ok_or("decoy.file 缺少 blake3")?,
+                obj_get(o, "blake3").ok_or("decoy.file is missing blake3")?,
                 "blake3",
             )?
             .to_string(),
         }
     } else if let Some(v) = obj_get(decoy, "generated") {
         let o = as_obj(v, "decoy.generated")?;
-        let anis = match obj_get(o, "anis").ok_or("decoy.generated 缺少 anis")? {
+        let anis = match obj_get(o, "anis").ok_or("decoy.generated is missing anis")? {
             Json::Arr(items) => items
                 .iter()
                 .map(|i| as_u64(i, "anis").map(|n| n as u8))
                 .collect::<Result<Vec<u8>, _>>()?,
-            _ => return Err("decoy.generated.anis 应为数组".into()),
+            _ => return Err("decoy.generated.anis must be an array".into()),
         };
         DecoySource::Generated {
             anis,
             per_layer: as_u64(
-                obj_get(o, "per_layer").ok_or("decoy.generated 缺少 per_layer")?,
+                obj_get(o, "per_layer").ok_or("decoy.generated is missing per_layer")?,
                 "per_layer",
             )? as usize,
             seed: as_u64(
-                obj_get(o, "seed").ok_or("decoy.generated 缺少 seed")?,
+                obj_get(o, "seed").ok_or("decoy.generated is missing seed")?,
                 "seed",
             )?,
         }
     } else {
-        return Err("manifest.json refs.decoy 应为 file 或 generated".into());
+        return Err("manifest.json refs.decoy must be file or generated".into());
     };
-    let contigs = match obj_get(top, "contigs").ok_or("manifest.json 缺少 contigs 字段")? {
+    let contigs = match obj_get(top, "contigs").ok_or("manifest.json is missing field contigs")? {
         Json::Arr(items) => items
             .iter()
             .map(|v| {
                 let o = as_obj(v, "contigs[]")?;
                 Ok(ContigMeta {
-                    name: as_str(obj_get(o, "name").ok_or("contig 缺少 name")?, "name")?
+                    name: as_str(obj_get(o, "name").ok_or("contig is missing name")?, "name")?
                         .to_string(),
                     role: role_from_str(as_str(
-                        obj_get(o, "role").ok_or("contig 缺少 role")?,
+                        obj_get(o, "role").ok_or("contig is missing role")?,
                         "role",
                     )?)?,
-                    len: as_u64(obj_get(o, "len").ok_or("contig 缺少 len")?, "len")?,
-                    gc_frac: as_f64(obj_get(o, "gc").ok_or("contig 缺少 gc")?, "gc")?,
+                    len: as_u64(obj_get(o, "len").ok_or("contig is missing len")?, "len")?,
+                    gc_frac: as_f64(obj_get(o, "gc").ok_or("contig is missing gc")?, "gc")?,
                 })
             })
             .collect::<Result<Vec<ContigMeta>, String>>()?,
-        _ => return Err("manifest.json contigs 应为数组".into()),
+        _ => return Err("manifest.json contigs must be an array".into()),
     };
     validate_contig_names(&contigs)?;
     let target_groups = match obj_get(top, "target_groups") {
         None if format_version == 1 => singleton_target_groups(&contigs),
         None => {
             return Err(format!(
-                "manifest.json 格式版本 {format_version} 缺少 target_groups"
+                "manifest.json format version {format_version} is missing target_groups"
             ));
         }
         Some(Json::Arr(items)) => items
             .iter()
             .map(|value| {
                 let group = as_obj(value, "target_groups[]")?;
-                let members = match obj_get(group, "members").ok_or("target_group 缺少 members")?
+                let members = match obj_get(group, "members")
+                    .ok_or("target_group is missing members")?
                 {
                     Json::Arr(items) => items
                         .iter()
                         .map(|item| as_str(item, "target_group.members[]").map(str::to_string))
                         .collect::<Result<Vec<_>, _>>()?,
-                    _ => return Err("manifest.json target_group.members 应为数组".into()),
+                    _ => return Err("manifest.json target_group.members must be an array".into()),
                 };
                 Ok(TargetGroupMeta {
                     contig: as_str(
-                        obj_get(group, "contig").ok_or("target_group 缺少 contig")?,
+                        obj_get(group, "contig").ok_or("target_group is missing contig")?,
                         "target_group.contig",
                     )?
                     .to_string(),
                     representative: as_str(
                         obj_get(group, "representative")
-                            .ok_or("target_group 缺少 representative")?,
+                            .ok_or("target_group is missing representative")?,
                         "target_group.representative",
                     )?
                     .to_string(),
@@ -1241,22 +1281,22 @@ fn parse_manifest(text: &str) -> Result<IndexManifest, String> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
-        Some(_) => return Err("manifest.json target_groups 应为数组".into()),
+        Some(_) => return Err("manifest.json target_groups must be an array".into()),
     };
     if (2..=FORMAT_VERSION).contains(&format_version) {
         validate_target_groups(&contigs, &target_groups)?;
     }
     let bloom_root = as_obj(
-        obj_get(top, "bloom").ok_or("manifest.json 缺少 bloom 字段")?,
+        obj_get(top, "bloom").ok_or("manifest.json is missing field bloom")?,
         "bloom",
     )?;
     let bloom = BloomInfo {
         n_inserted: as_u64(
-            obj_get(bloom_root, "n_inserted").ok_or("bloom 缺少 n_inserted")?,
+            obj_get(bloom_root, "n_inserted").ok_or("bloom is missing n_inserted")?,
             "n_inserted",
         )?,
         fill_frac: as_f64(
-            obj_get(bloom_root, "fill_frac").ok_or("bloom 缺少 fill_frac")?,
+            obj_get(bloom_root, "fill_frac").ok_or("bloom is missing fill_frac")?,
             "fill_frac",
         )?,
     };
@@ -1412,7 +1452,7 @@ mod tests {
         assert_eq!(loaded.manifest_blake3, built.manifest_blake3);
         assert_eq!(loaded.bloom.k, built.bloom.k);
         assert_eq!(loaded.bloom.n_inserted, built.bloom.n_inserted);
-        // 角色齐全：host/target/decoy/contam 各 1。
+        // One contig for each role: host, target, decoy, and contaminant.
         let counts = |c: &[ContigMeta], r: Role| c.iter().filter(|x| x.role == r).count();
         assert_eq!(counts(&loaded.contigs, Role::Host), 1);
         assert_eq!(counts(&loaded.contigs, Role::Target), 1);
@@ -1455,7 +1495,7 @@ mod tests {
                 .filter(|contig| contig.role == Role::Decoy)
                 .count(),
             1,
-            "自动诱饵应按折叠后的 targets.fa 生成"
+            "generated decoys must use the collapsed targets.fa"
         );
         assert_eq!(
             built.target_groups,
@@ -1499,7 +1539,7 @@ mod tests {
         {
             "original" => (original.as_slice(), variant.as_slice()),
             "variant" => (variant.as_slice(), original.as_slice()),
-            other => panic!("未知代表序列: {other}"),
+            other => panic!("unknown representative sequence: {other}"),
         };
         let representative_kmers: HashSet<_> = representative_sequence
             .windows(opt.k)
@@ -1509,10 +1549,12 @@ mod tests {
             .windows(opt.k)
             .filter_map(canonical_kmer)
             .find(|code| !representative_kmers.contains(code))
-            .expect("被折叠成员应有代表序列不含的私有 k-mer");
+            .expect(
+                "a collapsed member should have a private k-mer absent from its representative",
+            );
         assert!(
             built.bloom.probe(private_kmer),
-            "被折叠非代表序列的私有 k-mer 不得出现 Bloom 假阴性"
+            "private k-mers from collapsed non-representatives must not produce Bloom false negatives"
         );
 
         let decoy_kmers: usize = reference::parse_fasta(opt.decoy_fa.as_deref().unwrap())
@@ -1523,7 +1565,7 @@ mod tests {
         let expected_insertions = 2 * (original.len() - opt.k + 1) + decoy_kmers;
         assert_eq!(
             built.bloom.n_inserted, expected_insertions as u64,
-            "Bloom 应仅含原始 targets 各一次和实际 decoy，不应重复计 reps"
+            "the Bloom filter must contain each original target once and each actual decoy, without recounting representatives"
         );
 
         let representatives = reference::parse_fasta(&opt.out_dir.join(TARGETS_FA_NAME)).unwrap();
@@ -1577,8 +1619,8 @@ mod tests {
             ],
             target_groups: vec![TargetGroupMeta {
                 contig: "target_0".into(),
-                representative: "病毒-a".into(),
-                members: vec!["病毒-a".into(), "病毒-b".into()],
+                representative: "virus-a".into(),
+                members: vec!["virus-a".into(), "virus-b".into()],
             }],
             bloom: BloomInfo {
                 n_inserted: 42,
@@ -1587,7 +1629,7 @@ mod tests {
         };
         let parsed = parse_manifest(&write_manifest(&m)).unwrap();
         assert_eq!(parsed, m);
-        // 字符串转义往返：路径含引号/反斜杠/控制字符。
+        // Round-trip string escapes in paths containing quotes, backslashes, and control characters.
         let mut m2 = m.clone();
         m2.refs.host.path = "a\"b\\c\nd".into();
         m2.target_groups[0].members[1] = "b\"c\\d\ne".into();
@@ -1634,7 +1676,7 @@ mod tests {
         };
 
         let error = parse_manifest(&without_target_groups(write_manifest(&manifest))).unwrap_err();
-        assert!(error.contains("缺少 target_groups"), "error={error}");
+        assert!(error.contains("missing target_groups"), "error={error}");
 
         let mut duplicate_non_target = manifest.clone();
         let host = ContigMeta {
@@ -1646,13 +1688,13 @@ mod tests {
         duplicate_non_target.contigs.push(host.clone());
         duplicate_non_target.contigs.push(host);
         let error = parse_manifest(&write_manifest(&duplicate_non_target)).unwrap_err();
-        assert!(error.contains("contig 重名"), "error={error}");
+        assert!(error.contains("Duplicate contig"), "error={error}");
 
         manifest
             .target_groups
             .push(manifest.target_groups[0].clone());
         let error = parse_manifest(&write_manifest(&manifest)).unwrap_err();
-        assert!(error.contains("重名"), "error={error}");
+        assert!(error.contains("Duplicate"), "error={error}");
 
         manifest.target_groups = vec![TargetGroupMeta {
             contig: "target_1".into(),
@@ -1660,11 +1702,11 @@ mod tests {
             members: vec!["virus".into()],
         }];
         let error = parse_manifest(&write_manifest(&manifest)).unwrap_err();
-        assert!(error.contains("未知"), "error={error}");
+        assert!(error.contains("unknown"), "error={error}");
 
         manifest.target_groups.clear();
         let error = parse_manifest(&write_manifest(&manifest)).unwrap_err();
-        assert!(error.contains("缺少"), "error={error}");
+        assert!(error.contains("missing"), "error={error}");
 
         manifest.target_groups = vec![TargetGroupMeta {
             contig: "target_0".into(),
@@ -1672,7 +1714,10 @@ mod tests {
             members: vec!["virus".into()],
         }];
         let error = parse_manifest(&write_manifest(&manifest)).unwrap_err();
-        assert!(error.contains("代表不在成员中"), "error={error}");
+        assert!(
+            error.contains("Representative is not a member"),
+            "error={error}"
+        );
 
         manifest.target_groups[0] = TargetGroupMeta {
             contig: "target_0".into(),
@@ -1680,7 +1725,7 @@ mod tests {
             members: vec!["virus".into(), "virus".into()],
         };
         let error = parse_manifest(&write_manifest(&manifest)).unwrap_err();
-        assert!(error.contains("重复成员"), "error={error}");
+        assert!(error.contains("duplicate member"), "error={error}");
     }
 
     #[test]
@@ -1717,8 +1762,8 @@ mod tests {
         let opt = default_index_opts(&dir);
         build_index(&opt).unwrap();
         let err = load_index(&opt.out_dir, opt.k + 1).unwrap_err();
-        assert!(err.contains("不一致"), "err={err}");
-        // 支持版本范围之外：手工改写 version 字段后必须拒绝。
+        assert!(err.contains("does not match"), "err={err}");
+        // Reject versions outside the supported range after manually changing the version field.
         let mp = opt.out_dir.join(MANIFEST_NAME);
         let original = std::fs::read_to_string(&mp).unwrap();
         let text = original.replacen(
@@ -1728,7 +1773,7 @@ mod tests {
         );
         std::fs::write(&mp, text).unwrap();
         let err = load_index(&opt.out_dir, opt.k).unwrap_err();
-        assert!(err.contains("高于"), "err={err}");
+        assert!(err.contains("newer"), "err={err}");
 
         let text = original.replacen(
             &format!("\"version\": {FORMAT_VERSION}"),
@@ -1737,7 +1782,7 @@ mod tests {
         );
         std::fs::write(&mp, text).unwrap();
         let err = load_index(&opt.out_dir, opt.k).unwrap_err();
-        assert!(err.contains("低于"), "err={err}");
+        assert!(err.contains("older"), "err={err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1746,17 +1791,17 @@ mod tests {
         let dir = tmp_dir("corrupt");
         let opt = default_index_opts(&dir);
         build_index(&opt).unwrap();
-        // 缺 manifest（空目录）
+        // Missing manifest in an empty directory.
         let empty = dir.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         let err = load_index(&empty, opt.k).unwrap_err();
         assert!(err.contains("manifest.json"), "err={err}");
-        // bloom 截断
+        // Truncated Bloom file.
         let bp = opt.out_dir.join(BLOOM_NAME);
         let bytes = std::fs::read(&bp).unwrap();
         std::fs::write(&bp, &bytes[..bytes.len() / 2]).unwrap();
         let err = load_index(&opt.out_dir, opt.k).unwrap_err();
-        assert!(err.contains("损坏"), "err={err}");
+        assert!(err.contains("corrupt"), "err={err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1766,8 +1811,8 @@ mod tests {
         let mut opt = default_index_opts(&dir);
         build_index(&opt).unwrap();
         let err = build_index(&opt).unwrap_err();
-        assert!(err.contains("已存在"), "err={err}");
-        // 构建失败须清理临时目录。
+        assert!(err.contains("already exists"), "err={err}");
+        // Failed construction must clean its temporary directory.
         opt.out_dir = dir.join("idx2");
         opt.k = 0;
         let err = build_index(&opt).unwrap_err();
@@ -1777,7 +1822,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("idx2"))
             .collect();
-        assert!(leftovers.is_empty(), "失败后残留临时目录");
+        assert!(
+            leftovers.is_empty(),
+            "failed builds must not leave temporary directories"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1790,7 +1838,7 @@ mod tests {
         opt.decoy_per_layer = 2;
         opt.decoy_seed = 3;
         let built = build_index(&opt).unwrap();
-        // host + target + 2 层 × 2 = 6 个 contig（无 contam 时省略污染）。
+        // host + target + 2 layers x 2 = 6 contigs; contaminant is omitted.
         let mut opt_nc = opt.clone();
         opt_nc.out_dir = dir.join("idx_nc");
         opt_nc.contam_fa = None;

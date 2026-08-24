@@ -1,35 +1,23 @@
-//! k-mer 预筛：单列 Bloom 词典 + 比例门 + SDUST 掩蔽。
+//! Canonical k-mer Bloom prescreening with SDUST low-complexity masking.
 //!
-//! - 词典：COBS 式单列 Bloom（f=0.1, h=1），使用 canonical 编码
-//!   （min(正链, 反补链)）；位容量取 2 的幂，以掩码代替取模。按总碱基数
-//!   上界预分配，重复插入只降低有效 FPR。
-//! - 门控：`hits ≥ max(10, ⌈0.35·n_q_eff⌉)`；绝对命中下限与 KMCP
-//!   `--min-kmers=10` 一致。
-//! - 早拒：掩蔽只会减少 hits，raw hits < 10 的 read 可在 SDUST 前直接拒绝，
-//!   其结果与完整路径一致。
-//! - 掩蔽：按 minimap2 `sdust.c` 实现对称 DUST，使用相同的 W=64/T=20。
-//!   掩蔽结果为区间列表；门控扫描使用双指针跳过起点落在区间内的 k-mer，
-//!   read 本身保持不变并继续进入后续比对。热路径通过栈上环形队列和
-//!   `GateScratch` 复用缓冲区。
-//!
-//! 算法出处：COBS (arXiv:1905.09624)；KMCP
-//! (DOI 10.1093/bioinformatics/btac845)；DUST/SDUST (PMID 16796549)；
-//! splitmix64 (DOI 10.1145/2660193.2660195)。
+//! The Bloom filter is sized from observed occupancy to enforce the configured false-positive
+//! bound without introducing false negatives. Rolling forward/reverse-complement encoders produce
+//! canonical k-mers, while SDUST masking removes low-complexity windows from both the hit count and
+//! effective denominator. Implementations preserve deterministic behavior across platforms.
 
 use crate::reference::Contig;
 
 pub const DEFAULT_K: usize = 21;
-/// 2-bit 编码上限：k>31 时 u64 装不下（2k>62 位）。入口校验见 lib.rs run_pipeline。
+
 pub const K_MAX: usize = 31;
 
-/// 单 k-mer 假阳性率（COBS/KMCP 风格 f=0.1 + 比例门）。
 pub const GATE_FPR: f64 = 0.1;
-/// 绝对命中下限（与 KMCP `--min-kmers=10` 一致）。
+
 pub const GATE_MIN_HITS: u64 = 10;
-/// 命中率门 0.35 = 7/20，为低一致度目标保留更多候选 reads。
+
 pub const GATE_HIT_FRAC_NUM: u64 = 7;
 pub const GATE_HIT_FRAC_DEN: u64 = 20;
-/// SDUST 窗口/阈值（与 minimap2 sdust.c 相同）。
+
 pub const SDUST_W: usize = 64;
 pub const SDUST_T: i64 = 20;
 
@@ -67,7 +55,6 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// 单次滚动扫描产生全部有效 canonical k-mer；含非 A/C/G/T 的窗口自动跳过。
 #[inline]
 fn for_each_canonical_kmer<F>(seq: &[u8], k: usize, mut visit: F)
 where
@@ -99,8 +86,6 @@ where
     }
 }
 
-/// splitmix64 终结器（Steele et al. 2014；纯函数，k-mer 码 → 均匀 u64）。
-/// 诱饵生成也使用该函数派生确定性随机种子。
 pub(crate) fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -109,24 +94,19 @@ pub(crate) fn splitmix64(mut x: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// 单列 Bloom 词典
+
 // ---------------------------------------------------------------------------
 
-/// 单列 Bloom：`words` 打包 m 位（m 为 2 的幂，`mask = m−1` 代替取模）。
 #[derive(Debug)]
 pub struct KmerBloom {
     words: Vec<u64>,
     mask: u64,
     pub k: usize,
-    /// 插入次数（非去重计数；审计用）。
+
     pub n_inserted: u64,
 }
 
 impl KmerBloom {
-    /// 从目标+诱饵 contigs 构建 canonical k-mer Bloom（诱饵 reads 须能通过比例门）。
-    /// 无有效 k-mer（全部过短/全 N）返回 None。位容量 m = pow2(⌈Σ碱基数 × (−1/ln(1−fpr))⌉)，
-    /// 先尝试 m/2 并实测填充率，超界才回退 m；直接 m/2 与构建 m 后高低半区 OR
-    /// 逐位等价。随后继续安全折叠空余高位；fpr 始终为单哈希假阳性率上界。
     pub fn build(contigs: &[&Contig], k: usize, fpr: f64) -> Option<Self> {
         let full_capacity = Self::capacity_bits(contigs, k, fpr)?;
         if full_capacity > 64 {
@@ -177,8 +157,6 @@ impl KmerBloom {
         bloom
     }
 
-    /// 将 hash 空间减半等价于把 Bloom 的高、低半区按位 OR；因此不会产生假阴性。
-    /// 仅在折叠后的实测占位率仍不超过 fpr 时接受，并重复到最小安全容量。
     fn fold_to_fpr(&mut self, fpr: f64) {
         while self.words.len() > 1 {
             let half = self.words.len() / 2;
@@ -198,25 +176,21 @@ impl KmerBloom {
         self.words.shrink_to_fit();
     }
 
-    /// 探测一个（canonical）k-mer 码。无假阴性；假阳性率 ≤ 构建时的 fpr 上界。
     #[inline]
     pub fn probe(&self, code: u64) -> bool {
         let idx = (splitmix64(code) & self.mask) as usize;
         (self.words[idx >> 6] >> (idx & 63)) & 1 == 1
     }
 
-    /// 实际填充位比例（审计/校准用；构建后应 ≈ 1−e^{−n/m}）。
     pub fn fill_frac(&self) -> f64 {
         let set: u64 = self.words.iter().map(|w| u64::from(w.count_ones())).sum();
         set as f64 / (self.words.len() * 64) as f64
     }
 
-    /// 序列化支持（index.rs 专用）：拆解内部字段。
     pub(crate) fn to_raw(&self) -> (&[u64], u64) {
         (&self.words, self.mask)
     }
 
-    /// 反序列化支持（index.rs 专用）：按已验证字段重建。
     pub(crate) fn from_raw(words: Vec<u64>, mask: u64, k: usize, n_inserted: u64) -> Self {
         Self {
             words,
@@ -228,10 +202,9 @@ impl KmerBloom {
 }
 
 // ---------------------------------------------------------------------------
-// SDUST 低复杂度掩蔽（minimap2 sdust.c 直译）
+
 // ---------------------------------------------------------------------------
 
-/// 单个 perfect interval（find_perfect 维护，按 start 降序 + 密度剪枝）。
 struct PerfectIntv {
     start: usize,
     finish: usize,
@@ -239,8 +212,6 @@ struct PerfectIntv {
     l: i64,
 }
 
-/// `save_masked_regions` 直译：把已滑出窗口的区间定稿（与上一区间重叠/相邻
-/// 则合并），并移除 start < 窗口起点的区间（P 按 start 降序 → 尾部连续段）。
 fn save_masked_regions(res: &mut Vec<(usize, usize)>, p: &mut Vec<PerfectIntv>, start: usize) {
     if p.is_empty() || p[p.len() - 1].start >= start {
         return;
@@ -265,8 +236,6 @@ fn save_masked_regions(res: &mut Vec<(usize, usize)>, p: &mut Vec<PerfectIntv>, 
     p.truncate(keep);
 }
 
-/// 栈上环形队列（minimap2 kdq 语义）：容量 128（2 的幂，掩码代替取模），
-/// 杜绝每 read 堆分配。队列长度上限 = W−2 = 62（pop 条件 len ≥ W−2 后 push）。
 const RING_CAP: usize = 128;
 const RING_MASK: usize = RING_CAP - 1;
 
@@ -301,16 +270,13 @@ impl Ring {
         self.len -= 1;
         t
     }
-    /// 从队首数第 i 个元素（kdq_at 语义）。
+
     #[inline]
     fn at(&self, i: usize) -> u32 {
         self.buf[(self.head + i) & RING_MASK]
     }
 }
 
-/// `shift_window` 直译：滑入当前 triplet，维护 rw/rv 与对称修剪（SDUST 核心：
-/// 某 triplet 计数超 2T/10 时从左裁到该 triplet 上一次出现，保证掩蔽与扫描方向无关）。
-// 参数逐项对应 SDUST 原算法状态，封装为结构体会掩盖直译关系。
 #[allow(clippy::too_many_arguments)]
 fn shift_window(
     que: &mut Ring,
@@ -325,7 +291,7 @@ fn shift_window(
 ) {
     if que.len() >= w - 2 {
         // W - SD_WLEN + 1 = 62
-        let s = (que.pop_front() as usize) & 63; // t3 为 6-bit，掩码消 bounds check
+        let s = (que.pop_front() as usize) & 63;
         cw[s] -= 1;
         *rw -= cw[s];
         if *lcap > que.len() {
@@ -336,7 +302,7 @@ fn shift_window(
     }
     que.push(t3);
     *lcap += 1;
-    let s = t3 as usize; // t3 已 & 0x3F，编译器可证 <64
+    let s = t3 as usize;
     *rw += cw[s];
     cw[s] += 1;
     *rv += cv[s];
@@ -354,8 +320,6 @@ fn shift_window(
     }
 }
 
-/// `find_perfect` 直译：窗口左侧延伸扫描（size−L−1 .. 0），密度剪枝维护
-/// perfect 区间集（P 按 start 降序，同 end = 窗口尾）。
 fn find_perfect(
     p: &mut Vec<PerfectIntv>,
     que: &Ring,
@@ -401,11 +365,9 @@ fn find_perfect(
     }
 }
 
-/// `sdust_core` 直译：把掩蔽区间 [start, finish) 追加写入 `out`（清空后复用，
-/// 热路径零分配）。N 断开连续段（C 版在 N 处不清队列，此处照搬保持语义一致）。
 pub fn sdust_intervals_into(seq: &[u8], w: usize, t: i64, out: &mut Vec<(usize, usize)>) {
     out.clear();
-    let mut p: Vec<PerfectIntv> = Vec::new(); // 通常为空：无 perfect 区间时零分配
+    let mut p: Vec<PerfectIntv> = Vec::new();
     let mut que = Ring::new();
     let mut cw = [0i64; 64];
     let mut cv = [0i64; 64];
@@ -434,7 +396,6 @@ pub fn sdust_intervals_into(seq: &[u8], w: usize, t: i64, out: &mut Vec<(usize, 
                 }
             }
         } else {
-            // N 或序列尾：清空未定稿区间（start 逐步推进，每次定稿一个）
             let mut start = l.saturating_sub(w.saturating_sub(1)) + (i + 1 - l);
             while !p.is_empty() {
                 save_masked_regions(out, &mut p, start);
@@ -446,14 +407,12 @@ pub fn sdust_intervals_into(seq: &[u8], w: usize, t: i64, out: &mut Vec<(usize, 
     }
 }
 
-/// 掩蔽区间列表（分配版；测试/审计用，热路径用 `sdust_intervals_into`）。
 pub fn sdust_intervals(seq: &[u8], w: usize, t: i64) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     sdust_intervals_into(seq, w, t, &mut out);
     out
 }
 
-/// 每碱基掩码：掩蔽区间内 base 置 true（finish 截断到序列长）。
 pub fn sdust_mask(seq: &[u8], w: usize, t: i64) -> Vec<bool> {
     let mut mask = vec![false; seq.len()];
     for (s, f) in sdust_intervals(seq, w, t) {
@@ -466,11 +425,9 @@ pub fn sdust_mask(seq: &[u8], w: usize, t: i64) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// 比例门
+
 // ---------------------------------------------------------------------------
 
-/// 比例门：`hits ≥ max(GATE_MIN_HITS, ⌈0.35·n_q_eff⌉)`（整数精确）。
-/// n_q_eff = 0（无未掩蔽 k-mer 窗口）恒不过门。
 pub fn gate_passes(hits: u64, n_eff: u64) -> bool {
     if n_eff == 0 {
         return false;
@@ -479,10 +436,6 @@ pub fn gate_passes(hits: u64, n_eff: u64) -> bool {
     hits >= GATE_MIN_HITS.max(frac)
 }
 
-/// 滚动双码扫描（Bloom 查询 + SDUST 掩蔽集成）：正链码左移、反补码右移（低位=最近碱基），
-/// canonical = min(正链, 反补)。返回 (命中 k-mer 数, 有效 k-mer 数 n_q_eff)。
-/// `intervals` = sdust 掩蔽区间（按 start 递增、互不重叠）；k-mer **起点**落在
-/// 区间内（或含 N）不探测、不计 n_eff。掩蔽区间内的 read 本身保留。
 pub fn read_gate_hits(
     seq: &[u8],
     k: usize,
@@ -493,9 +446,8 @@ pub fn read_gate_hits(
     if k == 0 || k > K_MAX || seq.len() < k {
         return (0, 0);
     }
-    let mut it = 0usize; // 双指针：当前候选掩蔽区间
+    let mut it = 0usize;
     for_each_canonical_kmer(seq, k, |start, canon| {
-        // 推进到可能覆盖 start 的区间（区间按 start 递增）
         while it < intervals.len() && intervals[it].1 <= start {
             it += 1;
         }
@@ -510,22 +462,17 @@ pub fn read_gate_hits(
     (hits, n_eff)
 }
 
-/// 门控 scratch：worker 线程级复用，热路径零分配。
 #[derive(Default)]
 pub struct GateScratch {
     pub intervals: Vec<(usize, usize)>,
 }
 
-/// 单 read 完整门控（热路径版本）：
-/// 早拒（raw hits < 10 恒拒，免 SDUST）→ SDUST 掩蔽（复用 scratch）→ 命中扫描 → 比例门。
 pub fn read_passes_gate_scratched(
     seq: &[u8],
     k: usize,
     bloom: &KmerBloom,
     scratch: &mut GateScratch,
 ) -> bool {
-    // 早拒依据：掩蔽只会把 k-mer 移出计数（hits、n_eff 同减），故 masked hits ≤ raw hits；
-    // 门要求 hits ≥ GATE_MIN_HITS，raw < GATE_MIN_HITS 时无论掩蔽与否恒拒。
     let (raw_hits, _) = read_gate_hits(seq, k, bloom, &[]);
     if raw_hits < GATE_MIN_HITS {
         return false;
@@ -535,7 +482,6 @@ pub fn read_passes_gate_scratched(
     gate_passes(hits, n_eff)
 }
 
-/// 单 read 完整门控（便捷版；测试/审计用，热路径用 `read_passes_gate_scratched`）。
 pub fn read_passes_gate(seq: &[u8], k: usize, bloom: &KmerBloom) -> bool {
     let mut scratch = GateScratch::default();
     read_passes_gate_scratched(seq, k, bloom, &mut scratch)
@@ -555,7 +501,6 @@ mod tests {
         }
     }
 
-    /// xorshift64*（Vigna 2016）——确定性伪随机序列（测试用）。
     fn xorshift64_star(mut s: u64) -> u64 {
         s ^= s >> 12;
         s ^= s << 25;
@@ -573,12 +518,10 @@ mod tests {
         out
     }
 
-    /// 随机 contig（非低复杂度，SDUST 不掩蔽；确定性 seed）。
     fn random_contig(len: usize, seed: u64) -> Contig {
         contig(&pseudo_random_seq(len, seed))
     }
 
-    /// 优化前的逐窗口实现，用作 rolling 编码的位级回归 oracle。
     fn build_slice_oracle(contigs: &[&Contig], k: usize, fpr: f64) -> Option<KmerBloom> {
         if k == 0 || k > K_MAX {
             return None;
@@ -619,7 +562,7 @@ mod tests {
         assert_eq!(dna_bits(b'N'), None);
         let fwd = encode_kmer(b"ACGT").unwrap();
         let rc = encode_kmer(&reverse_complement(b"ACGT")).unwrap();
-        assert_eq!(fwd, rc); // ACGT 的回文反向互补
+        assert_eq!(fwd, rc);
         let a = encode_kmer(b"AAAA").unwrap();
         let t = encode_kmer(b"TTTT").unwrap();
         assert_ne!(a, t);
@@ -652,7 +595,6 @@ mod tests {
         assert!(folded.words.len() < unfolded.words.len());
         assert!(folded.fill_frac() <= GATE_FPR);
 
-        // 每个原占位映射到缩短 mask 后仍占位，直接验证 OR 折叠无假阴性。
         for (word_index, &word) in unfolded.words.iter().enumerate() {
             let mut set = word;
             while set != 0 {
@@ -667,7 +609,6 @@ mod tests {
         let code = encode_kmer(&c.seq[..21]).unwrap();
         assert!(folded.probe(code));
 
-        // 直接按较小 mask 构建与保守容量逐次 OR 折叠逐位相同。
         unfolded.fold_to_fpr(GATE_FPR);
         assert_eq!(folded.mask, unfolded.mask);
         assert_eq!(folded.n_inserted, unfolded.n_inserted);
@@ -680,7 +621,10 @@ mod tests {
         let refs = [&c];
         let mut unfolded = KmerBloom::build_unfolded(&refs, 21, GATE_FPR).unwrap();
         let half = KmerBloom::build_with_capacity(&refs, 21, unfolded.mask.div_ceil(2));
-        assert!(half.fill_frac() > GATE_FPR, "fixture 必须触发保守容量回退");
+        assert!(
+            half.fill_frac() > GATE_FPR,
+            "fixture must trigger conservative capacity fallback"
+        );
 
         unfolded.fold_to_fpr(GATE_FPR);
         let built = KmerBloom::build(&refs, 21, GATE_FPR).unwrap();
@@ -691,40 +635,40 @@ mod tests {
 
     #[test]
     fn bloom_all_contig_kmers_probe_true() {
-        // 无假阴性：正链/反补链全部 k-mer 的 canonical 码必命中。
         let c = random_contig(60, 1);
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         let rc = reverse_complement(&c.seq);
         for i in 0..60 - 6 + 1 {
             let f = encode_kmer(&c.seq[i..i + 6]).unwrap();
             let r = encode_kmer(&rc[60 - 6 - i..60 - i]).unwrap();
-            assert!(bloom.probe(f.min(r)), "k-mer @{i} 应命中");
+            assert!(bloom.probe(f.min(r)), "k-mer @{i} should be present");
         }
     }
 
     #[test]
     fn bloom_fpr_within_bound() {
-        // 随机 k-mer 假阳性率 ≤ 构建 fpr 上界（pow2 取整后 f_eff 更低，断言放宽到 0.2）。
         let c = contig(b"ACGTACGTACGTACGTACGTAC");
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         let ff = bloom.fill_frac();
-        assert!(ff > 0.0 && ff < 1.0, "填充率异常: {ff}");
+        assert!(ff > 0.0 && ff < 1.0, "invalid fill fraction: {ff}");
         let n = 50_000;
         let mut fp = 0u64;
         let mut s = 99u64;
         for _ in 0..n {
             s = xorshift64_star(s);
-            let code = (s >> 34) & ((1u64 << 12) - 1); // 随机 6-mer 2-bit 码
+            let code = (s >> 34) & ((1u64 << 12) - 1);
             if bloom.probe(code) {
                 fp += 1;
             }
         }
-        assert!((fp as f64) < 0.2 * n as f64, "FP 率超界: {fp}/{n}");
+        assert!(
+            (fp as f64) < 0.2 * n as f64,
+            "false-positive rate exceeds limit: {fp}/{n}"
+        );
     }
 
     #[test]
     fn gate_passes_thresholds() {
-        // ⌈0.35·100⌉=35，下限 10
         assert!(!gate_passes(34, 100));
         assert!(gate_passes(35, 100));
         // max(10, ⌈0.35·50⌉=18) = 18
@@ -733,15 +677,13 @@ mod tests {
         // max(10, ⌈0.35·10⌉=4) = 10
         assert!(!gate_passes(9, 10));
         assert!(gate_passes(10, 10));
-        // 退化
+
         assert!(!gate_passes(0, 0));
         assert!(!gate_passes(5, 3));
     }
 
     #[test]
     fn read_passes_gate_fwd_and_rc_reads() {
-        // 随机 contig（非低复杂度，SDUST 不掩蔽）：正链 read n_eff=hits=55，
-        // 阈值 max(10, ⌈0.45·55⌉=25) → 过门；反补链 read canonical 覆盖同样过门。
         let c = random_contig(60, 1);
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         assert!(read_passes_gate(&c.seq, 6, &bloom));
@@ -751,8 +693,6 @@ mod tests {
 
     #[test]
     fn early_reject_identical_to_full_path() {
-        // 早拒与全路径严格等价：无论 raw hits 是否 ≥ GATE_MIN_HITS，
-        // 早拒分支结果必须与"始终跑 SDUST + 比例门"逐 read 一致。
         let c = random_contig(60, 5);
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         let mut scratch = GateScratch::default();
@@ -763,9 +703,12 @@ mod tests {
             sdust_intervals_into(&read, SDUST_W, SDUST_T, &mut iv);
             let (hits, n_eff) = read_gate_hits(&read, 6, &bloom, &iv);
             let full = gate_passes(hits, n_eff);
-            assert_eq!(fast, full, "seed={seed} 早拒与全路径分歧");
+            assert_eq!(
+                fast, full,
+                "seed={seed}: early rejection differs from full path"
+            );
         }
-        // 低复杂度掺杂 read（SDUST 掩蔽生效）走同一断言
+
         for seed in [16u64, 17] {
             let mut read = pseudo_random_seq(60, seed);
             read[10..40].copy_from_slice(&[b'A'; 30]);
@@ -774,7 +717,10 @@ mod tests {
             sdust_intervals_into(&read, SDUST_W, SDUST_T, &mut iv);
             let (hits, n_eff) = read_gate_hits(&read, 6, &bloom, &iv);
             let full = gate_passes(hits, n_eff);
-            assert_eq!(fast, full, "seed={seed} 低复杂度 read 早拒与全路径分歧");
+            assert_eq!(
+                fast, full,
+                "seed={seed}: low-complexity early rejection differs from full path"
+            );
         }
     }
 
@@ -795,8 +741,6 @@ mod tests {
 
     #[test]
     fn bloom_superset_of_hashset_on_reads() {
-        // 对照 HashSet 等价验证：Bloom 无假阴性（hits_bloom ≥ hits_set），
-        // 且纯假命中增量不超过 n_eff/3。
         let c = random_contig(60, 3);
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         let rc = reverse_complement(&c.seq);
@@ -821,10 +765,13 @@ mod tests {
                     sh += 1;
                 }
             }
-            assert!(bh >= sh, "Bloom 不得漏检: {bh} < {sh}");
+            assert!(
+                bh >= sh,
+                "Bloom filter must not miss true hits: {bh} < {sh}"
+            );
             assert!(
                 bh - sh <= bn / 3,
-                "假命中增量超界: +{} (n_eff={bn})",
+                "false-hit increase exceeds limit: +{} (n_eff={bn})",
                 bh - sh
             );
         }
@@ -832,13 +779,12 @@ mod tests {
 
     #[test]
     fn sdust_masks_low_complexity() {
-        // poly-A 与双碱基周期（AC 交替）全掩；均匀随机序列近零掩蔽。
         let poly_a = vec![b'A'; 200];
         let m = sdust_mask(&poly_a, 64, 20);
         let masked = m.iter().filter(|&&x| x).count();
         assert!(
             masked as f64 >= 0.9 * 200.0,
-            "poly-A 掩蔽不足: {masked}/200"
+            "insufficient poly-A masking: {masked}/200"
         );
 
         let ac: Vec<u8> = (0..200)
@@ -848,7 +794,7 @@ mod tests {
         let masked = m.iter().filter(|&&x| x).count();
         assert!(
             masked as f64 >= 0.9 * 200.0,
-            "AC 交替掩蔽不足: {masked}/200"
+            "insufficient alternating-AC masking: {masked}/200"
         );
 
         let rnd = pseudo_random_seq(500, 42);
@@ -856,28 +802,27 @@ mod tests {
         let masked = m.iter().filter(|&&x| x).count();
         assert!(
             (masked as f64) <= 0.05 * 500.0,
-            "随机序列误掩蔽: {masked}/500"
+            "random sequence was over-masked: {masked}/500"
         );
     }
 
     #[test]
     fn sdust_symmetric_under_reverse_complement() {
-        // SDUST 对称性（Morgulis 2006 核心性质）：掩码在反补反转下逐位对应。
-        // 这是直译正确性的强检验（打乱方向/平局裁决会破坏对称）。
         let seq = pseudo_random_seq(300, 7);
         let rc = reverse_complement(&seq);
         let m1 = sdust_mask(&seq, 64, 20);
         let m2 = sdust_mask(&rc, 64, 20);
         for i in 0..seq.len() {
-            assert_eq!(m1[i], m2[seq.len() - 1 - i], "对称性破坏 @{i}");
+            assert_eq!(
+                m1[i],
+                m2[seq.len() - 1 - i],
+                "reverse-complement symmetry broken at {i}"
+            );
         }
     }
 
     #[test]
     fn masked_kmers_excluded_from_n_eff() {
-        // poly-A 前缀被掩：n_eff 收缩；随机 contig 段窗口保留（高复杂度不掩），
-        // 且未掩蔽窗口全部命中（Bloom 无假阴性）。hits_u 可能略高于 hits_m
-        // （poly-A 窗口对词典的随机假命中），故只做单向断言。
         let c = random_contig(60, 4);
         let bloom = KmerBloom::build(&[&c], 6, GATE_FPR).unwrap();
         let seq: Vec<u8> = [vec![b'A'; 60], c.seq.clone()].concat();
@@ -885,8 +830,14 @@ mod tests {
         let (hits_m, n_m) = read_gate_hits(&seq, 6, &bloom, &iv);
         let (_, n_u) = read_gate_hits(&seq, 6, &bloom, &[]);
         assert_eq!(n_u, (seq.len() - 6 + 1) as u64);
-        assert!(n_m < n_u, "掩蔽应收缩 n_eff: {n_m} vs {n_u}");
-        assert!(n_m >= 50, "contig 段 55 窗口应基本保留: n_eff={n_m}");
-        assert!(hits_m >= 50, "未掩蔽窗口无假阴性: hits={hits_m}");
+        assert!(n_m < n_u, "masking should reduce n_eff: {n_m} vs {n_u}");
+        assert!(
+            n_m >= 50,
+            "the 55-window contig segment should remain mostly available: n_eff={n_m}"
+        );
+        assert!(
+            hits_m >= 50,
+            "unmasked windows must have no false negatives: hits={hits_m}"
+        );
     }
 }

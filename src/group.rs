@@ -1,6 +1,7 @@
-//! 纯序列检测组：固定参数的候选筛选和代表序列星形确认。
+//! Sequence-only detection groups using fixed candidate screening and representative-star confirmation.
 //!
-//! 这里的边只用于寻找一个代表序列可能覆盖的成员；不会把连通分量当作等价类。
+//! Edges only identify members that one representative may cover; connected components are not
+//! treated as equivalence classes.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -24,8 +25,8 @@ const COVERAGE_DENOMINATOR: usize = 100;
 const POSITION_BINS: usize = 16;
 const MIN_POSITION_BINS: usize = 14;
 
-/// 一个检测组。`representative` 和 `members` 是调用方输入切片中的下标。
-/// `members` 包含 representative，且每个输入下标恰好出现一次。
+/// One detection group. `representative` and `members` index the caller's input slice.
+/// `members` includes the representative, and every input index appears exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectionGroup {
     pub representative: usize,
@@ -34,8 +35,8 @@ pub struct DetectionGroup {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Token {
-    // splitmix64 是 u64 上的双射，而 canonical k=21 码只占 42 bit；仍保留 code，
-    // 使 token 身份和全局 `(df, canonical code)` 次序不依赖这一性质。
+    // splitmix64 is bijective over u64 while canonical k=21 codes occupy 42 bits. Retaining the
+    // code keeps token identity and global `(df, canonical code)` order independent of that fact.
     hash: u64,
     code: u64,
 }
@@ -58,9 +59,9 @@ struct ExactClass {
 
 type ClassRank<'a> = (usize, std::cmp::Reverse<usize>, [u8; 32], &'a [u8]);
 
-/// 用固定 k=21、scaled=64 FracMinHash、bottom-k Mash 和 minimap2 asm5 构造组。
+/// Build groups with fixed k=21, scaled=64 FracMinHash, bottom-k Mash, and minimap2 `asm5`.
 ///
-/// `threads == 0` 表示内联执行；任何正数都会限制预计算和确认时的工作线程数。
+/// `threads == 0` runs inline; positive values bound precomputation and confirmation workers.
 pub fn construct_detection_groups(
     records: &[(String, Vec<u8>)],
     threads: usize,
@@ -72,8 +73,8 @@ pub fn construct_detection_groups(
     populate_signatures(&mut classes, threads)?;
 
     let lengths: Vec<usize> = classes.iter().map(|class| class.sequence.len()).collect();
-    // PPJoin 是 sample 的最后消费者；转移所有权，避免在 classes、调用点和函数内
-    // 同时保留三份 canonical FracMinHash。
+    // PPJoin is the sample's final consumer. Transfer ownership to avoid retaining three copies of
+    // canonical FracMinHash values across classes, the call site, and this function.
     let samples: Vec<Vec<Token>> = classes
         .iter_mut()
         .map(|class| std::mem::take(&mut class.sample))
@@ -92,8 +93,8 @@ pub fn construct_detection_groups(
 }
 
 fn exact_classes(records: &[(String, Vec<u8>)]) -> Vec<ExactClass> {
-    // 摘要只作候选桶，桶内仍比较完整序列，因此不把每条大基因组再复制一份作为
-    // BTreeMap key，也不把哈希碰撞误折叠成 exact duplicate。
+    // Digests only select candidate buckets; full sequences are still compared within each bucket.
+    // This avoids copying large genomes into BTreeMap keys and prevents collision-based collapsing.
     let mut by_digest = BTreeMap::<[u8; 32], Vec<usize>>::new();
     let mut classes = Vec::<ExactClass>::new();
     for (source_index, (_, raw_sequence)) in records.iter().enumerate() {
@@ -162,7 +163,7 @@ fn populate_signatures(classes: &mut [ExactClass], threads: usize) -> Result<(),
         drop(sender);
         for (index, sample, sketch) in receiver {
             let Some(signature) = signatures.get_mut(index) else {
-                return Err("检测组签名索引越界".to_string());
+                return Err("Detection-group signature index out of bounds".to_string());
             };
             *signature = Some((sample, sketch));
         }
@@ -170,7 +171,7 @@ fn populate_signatures(classes: &mut [ExactClass], threads: usize) -> Result<(),
     })?;
     for (class, signature) in classes.iter_mut().zip(signatures) {
         let Some((sample, sketch)) = signature else {
-            return Err("检测组签名未完成".to_string());
+            return Err("Detection-group signature is incomplete".to_string());
         };
         class.sample = sample;
         class.sketch = sketch;
@@ -211,7 +212,8 @@ fn frac_sample(sequence: &[u8]) -> Vec<Token> {
     let mut filled = 0_usize;
     let mut interval_index = 0_usize;
     let mut tokens = Vec::with_capacity(sequence.len() / FRAC_SCALE as usize + 1);
-    // 加入 k-1 个环绕起点，使同一环状序列的旋转拥有相同候选集；最终比对仍严格确认。
+    // Add k-1 wrapped starts so rotations of one circular sequence share candidates; final alignment
+    // still performs strict confirmation.
     for end in 0..sequence.len() + K - 1 {
         let base = sequence[end % sequence.len()];
         let Some(bits) = dna_bits(base) else {
@@ -294,8 +296,8 @@ fn bottom_sketch(sequence: &[u8]) -> Vec<SketchEntry> {
     sketch
 }
 
-/// AllPairs/PPJoin 前缀连接。候选仅来自稀有 token 前缀，不枚举全局 posting 对；
-/// 最终交集下界为 `ceil((|A| + |B|) / 9)`。
+/// AllPairs/PPJoin prefix join. Candidates arise only from rare-token prefixes without enumerating
+/// all global posting pairs; the final intersection lower bound is `ceil((|A| + |B|) / 9)`.
 fn ppjoin_pairs(mut samples: Vec<Vec<Token>>) -> Vec<(usize, usize)> {
     for sample in &mut samples {
         sample.sort_unstable();
@@ -565,7 +567,7 @@ fn confirm_stars(
     let mut groups = Vec::new();
     while remaining_count != 0 {
         let center = choose_center(&remaining, adjacency, &ranks)
-            .ok_or_else(|| "检测组剩余状态不一致".to_string())?;
+            .ok_or_else(|| "Inconsistent remaining detection-group state".to_string())?;
         let mut member_classes = vec![center];
         let candidates: Vec<_> = adjacency[center]
             .iter()
@@ -590,7 +592,7 @@ fn confirm_stars(
             .source_indices
             .first()
             .copied()
-            .ok_or_else(|| "检测组缺少代表序列".to_string())?;
+            .ok_or_else(|| "Detection group has no representative sequence".to_string())?;
         groups.push((
             representative_class,
             DetectionGroup {
@@ -648,7 +650,7 @@ fn confirm_members(
     builder.mapopt.cap_kalloc = (800_000_000_i64 / worker_count as i64).max(1);
     let aligner = builder
         .with_seq_and_id(center, b"group-center")
-        .map_err(|error| format!("minimap2 检测组索引构建失败: {error}"))?;
+        .map_err(|error| format!("Failed to build minimap2 detection-group index: {error}"))?;
     if worker_count == 1 {
         let mut accepted = Vec::new();
         for &candidate in candidates {
@@ -700,7 +702,7 @@ fn strict_confirmation(
     }
     let mappings = aligner
         .map(member, false, false, None, None, Some(b"group-member"))
-        .map_err(|error| format!("minimap2 检测组确认失败: {error}"))?;
+        .map_err(|error| format!("Failed to confirm minimap2 detection group: {error}"))?;
     Ok(mappings
         .iter()
         .any(|mapping| linear_match(mapping, center.len(), member.len()))

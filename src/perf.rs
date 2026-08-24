@@ -1,7 +1,7 @@
-//! 进程内性能监控：以低频定向 refresh 采集当前 Viroflash 进程，输出独立 JSON/TSV。
+//! In-process performance telemetry with low-frequency targeted refreshes of the viroflash process.
 //!
-//! `sysinfo` 只负责可移植的进程 CPU/RSS/虚拟内存/I/O 与整机 CPU/内存；PSS、
-//! NUMA、cache miss 和内存带宽不在本模块伪装实现，需由专项外部工具采集。
+//! `sysinfo` provides portable process CPU, RSS, virtual-memory, I/O, and system-level metrics.
+//! PSS, NUMA, cache misses, and memory bandwidth require dedicated external instrumentation.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -276,7 +276,8 @@ impl PerfMonitor {
         out_prefix: &Path,
         configured_threads: usize,
     ) -> Result<Self, String> {
-        let pid = get_current_pid().map_err(|e| format!("性能监控无法取得当前 PID: {e}"))?;
+        let pid = get_current_pid()
+            .map_err(|e| format!("Performance monitor cannot obtain the current PID: {e}"))?;
         let paths = report_paths(out_prefix);
         let interval = SAMPLE_INTERVAL.max(MINIMUM_CPU_UPDATE_INTERVAL);
         let physical_core_count = System::physical_core_count();
@@ -308,7 +309,7 @@ impl PerfMonitor {
         let handle = std::thread::Builder::new()
             .name("viroflash-perf".to_string())
             .spawn(move || sampler_loop(pid, interval, rx, ready_tx))
-            .map_err(|e| format!("无法启动性能采样线程: {e}"))?;
+            .map_err(|e| format!("Cannot start performance sampling thread: {e}"))?;
         let logical_cpu_count = match ready_rx.recv() {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -317,7 +318,9 @@ impl PerfMonitor {
             }
             Err(e) => {
                 let _ = handle.join();
-                return Err(format!("性能采样线程初始化失败: {e}"));
+                return Err(format!(
+                    "Performance sampling thread failed to initialize: {e}"
+                ));
             }
         };
         Ok(Self {
@@ -332,8 +335,8 @@ impl PerfMonitor {
         })
     }
 
-    /// `--threads` 保持为数据管线的工作线程预算；低频 telemetry sampler 不占用
-    /// mapper/decompressor 名额，避免启用监控后改变既有吞吐语义。
+    /// `--threads` remains the data-pipeline worker budget. The low-frequency telemetry sampler
+    /// consumes no mapper or decompressor slot, preserving throughput semantics when enabled.
     pub(crate) fn work_thread_budget(&self) -> usize {
         self.configured_threads
     }
@@ -364,7 +367,9 @@ impl PerfMonitor {
             (Ok(value), Ok(())) => Ok(value),
             (Err(primary), Ok(_)) => Err(primary),
             (Ok(_), Err(perf)) => Err(perf),
-            (Err(primary), Err(perf)) => Err(format!("{primary}; 性能报告失败: {perf}")),
+            (Err(primary), Err(perf)) => {
+                Err(format!("{primary}; Performance report failed: {perf}"))
+            }
         }
     }
 
@@ -376,10 +381,10 @@ impl PerfMonitor {
         let collected = match self.backend {
             Backend::Periodic { tx, handle } => {
                 tx.send(Control::Stop)
-                    .map_err(|e| format!("无法停止性能采样线程: {e}"))?;
+                    .map_err(|e| format!("Cannot stop performance sampling thread: {e}"))?;
                 handle
                     .join()
-                    .map_err(|_| "性能采样线程异常退出".to_string())??
+                    .map_err(|_| "Performance sampling thread exited unexpectedly".to_string())??
             }
             Backend::Boundary(boundary) => {
                 let BoundaryBackend { state } = *boundary;
@@ -387,9 +392,9 @@ impl PerfMonitor {
                     mut system,
                     pid,
                     mut collector,
-                } = state
-                    .into_inner()
-                    .map_err(|_| "性能边界采样状态锁损坏".to_string())?;
+                } = state.into_inner().map_err(|_| {
+                    "Performance boundary-sampling state lock is poisoned".to_string()
+                })?;
                 match refresh(&mut system, pid) {
                     Ok(raw) => collector.observe(raw),
                     Err(_) => collector.sample_error(),
@@ -429,7 +434,7 @@ fn sampler_loop(
     };
     let mut collector = Collector::new(initial);
     if ready.send(Ok(system.cpus().len())).is_err() {
-        return Err("性能监控初始化接收端已关闭".to_string());
+        return Err("Performance monitor initialization receiver is closed".to_string());
     }
 
     loop {
@@ -447,7 +452,7 @@ fn sampler_loop(
                 Err(_) => collector.sample_error(),
             },
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("性能监控控制通道提前关闭".to_string());
+                return Err("Performance monitor control channel closed early".to_string());
             }
         }
     }
@@ -463,9 +468,12 @@ fn refresh(system: &mut System, pid: Pid) -> Result<RawMetrics, String> {
         .with_disk_usage()
         .without_tasks();
     system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), false, kind);
-    let process = system
-        .process(pid)
-        .ok_or_else(|| format!("性能监控找不到当前进程 PID {}", pid.as_u32()))?;
+    let process = system.process(pid).ok_or_else(|| {
+        format!(
+            "Performance monitor cannot find current process PID {}",
+            pid.as_u32()
+        )
+    })?;
     let disk = process.disk_usage();
     Ok(RawMetrics {
         at: Instant::now(),
@@ -615,10 +623,18 @@ fn write_report_files(paths: &PerfPaths, json: &[u8], tsv: &[u8]) -> Result<(), 
     let result = (|| {
         write_new(&json_tmp, json)?;
         write_new(&tsv_tmp, tsv)?;
-        std::fs::rename(&json_tmp, &paths.json)
-            .map_err(|e| format!("性能 JSON 定稿失败 {}: {e}", paths.json.display()))?;
-        std::fs::rename(&tsv_tmp, &paths.tsv)
-            .map_err(|e| format!("性能 TSV 定稿失败 {}: {e}", paths.tsv.display()))?;
+        std::fs::rename(&json_tmp, &paths.json).map_err(|e| {
+            format!(
+                "Failed to finalize performance JSON {}: {e}",
+                paths.json.display()
+            )
+        })?;
+        std::fs::rename(&tsv_tmp, &paths.tsv).map_err(|e| {
+            format!(
+                "Failed to finalize performance TSV {}: {e}",
+                paths.tsv.display()
+            )
+        })?;
         Ok(())
     })();
     if result.is_err() {
@@ -633,10 +649,15 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|e| format!("无法创建性能报告临时文件 {}: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "Cannot create temporary performance-report file {}: {e}",
+                path.display()
+            )
+        })?;
     file.write_all(bytes)
         .and_then(|_| file.flush())
-        .map_err(|e| format!("写性能报告 {} 失败: {e}", path.display()))
+        .map_err(|e| format!("Failed to write performance report {}: {e}", path.display()))
 }
 
 #[cfg(test)]
