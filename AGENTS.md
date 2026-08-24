@@ -5,7 +5,7 @@
 `viroflash` 是一个 Rust 2021 单 crate 命令行项目。它读取单端或双端
 FASTQ/FASTQ.gz，配合可复用索引（宿主、目标、诱饵、污染参考 + k-mer Bloom +
 manifest），执行 k-mer 预筛、minimap2 竞争比对、候选聚合和统计判定，输出
-候选级 JSON 与 TSV。
+候选级 JSON/TSV 与独立性能 JSON/TSV。
 
 命令结构为两阶段：`viroflash index` 构建索引目录；`viroflash run` 用
 `--index` 复用，或直接给参考 FASTA 自动构建（两条路径共用同一构建入口，
@@ -30,6 +30,7 @@ src/cluster.rs             位点聚类与去重
 src/stats.rs               Poisson/NB 与 q 值计算
 src/decoy.rs               确定性 SNP-only 诱饵生成
 src/report.rs              JSON/TSV 序列化
+src/perf.rs                当前进程性能采样、阶段聚合和性能 JSON/TSV
 tests/smoke.rs             确定性合成端到端测试
 scripts/                   可移植的合成数据工具
 ```
@@ -40,6 +41,8 @@ scripts/                   可移植的合成数据工具
 ## 索引契约
 
 - 索引是目录：`ref.mmi` + `bloom.bin` + `manifest.json`（+ 自动诱饵产物）。
+- `ref.mmi` 必须恰好一个 minimap2 分片；构建端强制并验证单分片，加载端拒绝
+  多分片索引，避免跨角色竞争的 MAPQ 被分片局部计算。
 - `manifest.json` 是角色→contig 元数据的唯一来源；加载路径不解析参考 FASTA。
 - 索引格式带版本号（`index::FORMAT_VERSION`），加载时校验：版本高于当前支持、
   `--k` 与索引不一致、bloom 与 manifest 不一致都必须报错，不得静默错用。
