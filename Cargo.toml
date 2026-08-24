@@ -2,7 +2,7 @@
 name = "viroflash"
 version = "0.1.0"
 edition = "2021"
-description = "病毒候选检测命令行工具"
+description = "Command-line tool for viral candidate detection"
 publish = false
 
 [dependencies]
