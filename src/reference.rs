@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 use minimap2::Aligner;
 
+/// 竞争比对要求所有角色在同一 minimap2 分片内参与主次命中与 MAPQ 计算。
+const SINGLE_PART_BATCH_SIZE: u64 = u64::MAX;
+
+pub(crate) fn ensure_single_part_index(part_count: usize) -> Result<(), &'static str> {
+    if part_count == 1 {
+        Ok(())
+    } else {
+        Err("minimap2 索引包含多个分片；竞争比对要求单分片索引，请重建索引")
+    }
+}
+
 /// 参考序列类别。污染类在判定时按宿主对待（只作噪声，不产出候选）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -158,11 +169,14 @@ pub fn build_reference(
     let mmi_str = mmi_path
         .to_str()
         .ok_or_else(|| "索引路径非 UTF-8".to_string())?;
-    Aligner::builder()
+    let mut builder = Aligner::builder()
         .sr()
-        .with_index_threads(index_threads.max(1))
+        .with_index_threads(index_threads.max(1));
+    builder.idxopt.batch_size = SINGLE_PART_BATCH_SIZE;
+    let aligner = builder
         .with_index(&composite_path, Some(mmi_str))
         .map_err(|e| format!("minimap2 索引构建失败: {e}"))?;
+    ensure_single_part_index(aligner.idx_parts.len())?;
 
     Ok((mmi_path, contigs))
 }

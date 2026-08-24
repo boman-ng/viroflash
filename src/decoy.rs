@@ -8,15 +8,17 @@
 //!   150kb 最长同源 run 期望 ≈51/61/76bp 与真实近缘同分布，设上限反使诱饵偏离真实行为）。
 //! - 门禁：GC 偏差 ≤1% 生成时软检查（超限记录警告，不静默）；层内互斥与
 //!   ANI 精度可用 minimap2 验证（生成器不依赖比对）。
-//! - k-mer 共享率：与目标精确 21-mer 共享率 = p²¹ = 1.5%/3.3%/6.8%
-//!   （82/85/88 层）。
+//! - 默认运行层固定为 ANI 85（21-mer 理论共享率约 3.3%）且每代表一条；额外
+//!   ANI 层和重复仅由显式参数用于压力测试，避免默认索引按层数×重复数膨胀。
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 
 use crate::reference::{self, gc_fraction};
 
-pub const DEFAULT_ANIS: [u8; 3] = [82, 85, 88];
-pub const DEFAULT_PER_LAYER: usize = 4;
+pub const DEFAULT_ANIS: [u8; 1] = [85];
+pub const DEFAULT_PER_LAYER: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct DecoyOptions {
@@ -113,18 +115,15 @@ fn decoy_seq(src: &[u8], r: f64, gc: f64, rng: &mut Rng) -> Vec<u8> {
         .collect()
 }
 
-fn write_fasta(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
-    let mut out = String::new();
-    for (name, seq) in entries {
-        out.push('>');
-        out.push_str(name);
-        out.push('\n');
-        for chunk in seq.chunks(60) {
-            out.push_str(std::str::from_utf8(chunk).map_err(|e| e.to_string())?);
-            out.push('\n');
-        }
+fn write_fasta_record<W: Write>(out: &mut W, name: &str, seq: &[u8]) -> std::io::Result<()> {
+    out.write_all(b">")?;
+    out.write_all(name.as_bytes())?;
+    out.write_all(b"\n")?;
+    for chunk in seq.chunks(60) {
+        out.write_all(chunk)?;
+        out.write_all(b"\n")?;
     }
-    std::fs::write(path, out).map_err(|e| format!("写 {} 失败: {e}", path.display()))
+    Ok(())
 }
 
 /// 生成诱饵面板。返回摘要（条数、GC 警告数、输出路径）。
@@ -148,9 +147,22 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
         return Err("目标 FASTA 中没有序列".into());
     }
 
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut report_rows: Vec<String> =
-        vec!["name\tsource\tani\tr\tlen\tgc_src\tgc_decoy\tseed".to_string()];
+    let report_path = opt.report.clone().unwrap_or_else(|| {
+        let mut p = opt.out.clone().into_os_string();
+        p.push(".tsv");
+        PathBuf::from(p)
+    });
+    let fasta_file =
+        File::create(&opt.out).map_err(|e| format!("无法创建 {}: {e}", opt.out.display()))?;
+    let report_file = File::create(&report_path)
+        .map_err(|e| format!("无法创建报告 {}: {e}", report_path.display()))?;
+    let mut fasta_out = BufWriter::with_capacity(1 << 20, fasta_file);
+    let mut report_out = BufWriter::with_capacity(1 << 20, report_file);
+    report_out
+        .write_all(b"name\tsource\tani\tr\tlen\tgc_src\tgc_decoy\tseed\n")
+        .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
+
+    let mut entry_count = 0usize;
     let mut gc_warnings = 0usize;
 
     for (name, seq) in &fasta {
@@ -169,27 +181,29 @@ pub fn generate(opt: &DecoyOptions) -> Result<String, String> {
                     gc_warnings += 1;
                 }
                 let decoy_name = format!("decoy:{name}:ani{ani}:i{idx}");
-                report_rows.push(format!(
+                write_fasta_record(&mut fasta_out, &decoy_name, &decoy)
+                    .map_err(|e| format!("写 {} 失败: {e}", opt.out.display()))?;
+                writeln!(
+                    report_out,
                     "{decoy_name}\t{name}\t{ani}\t{r:.6}\t{}\t{gc:.6}\t{decoy_gc:.6}\t{seed}",
                     decoy.len()
-                ));
-                entries.push((decoy_name, decoy));
+                )
+                .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
+                entry_count += 1;
             }
         }
     }
 
-    write_fasta(&opt.out, &entries)?;
-    let report_path = opt.report.clone().unwrap_or_else(|| {
-        let mut p = opt.out.clone().into_os_string();
-        p.push(".tsv");
-        PathBuf::from(p)
-    });
-    std::fs::write(&report_path, report_rows.join("\n") + "\n")
+    fasta_out
+        .flush()
+        .map_err(|e| format!("写 {} 失败: {e}", opt.out.display()))?;
+    report_out
+        .flush()
         .map_err(|e| format!("写报告 {} 失败: {e}", report_path.display()))?;
 
     Ok(format!(
         "诱饵 {} 条（目标 {} 条 × 层 {} × 每层 {}）→ {}；报告 {}；GC 偏差超 1% 警告 {} 条",
-        entries.len(),
+        entry_count,
         fasta.len(),
         opt.anis.len(),
         opt.per_layer,
@@ -218,8 +232,21 @@ mod tests {
         d
     }
 
-    fn parse_back(path: &Path) -> Vec<(String, Vec<u8>)> {
+    fn parse_back(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         reference::parse_fasta(path).unwrap()
+    }
+
+    #[test]
+    fn fasta_record_writer_wraps_at_sixty_bases() {
+        let seq = vec![b'A'; 121];
+        let mut out = Vec::new();
+        write_fasta_record(&mut out, "target", &seq).unwrap();
+        let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+        assert_eq!(lines[0], b">target");
+        assert_eq!(lines[1].len(), 60);
+        assert_eq!(lines[2].len(), 60);
+        assert_eq!(lines[3].len(), 1);
+        assert!(lines[4].is_empty());
     }
 
     #[test]

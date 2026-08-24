@@ -67,6 +67,38 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// 单次滚动扫描产生全部有效 canonical k-mer；含非 A/C/G/T 的窗口自动跳过。
+#[inline]
+fn for_each_canonical_kmer<F>(seq: &[u8], k: usize, mut visit: F)
+where
+    F: FnMut(usize, u64),
+{
+    if k == 0 || k > K_MAX || seq.len() < k {
+        return;
+    }
+    let kmask = (1u64 << (2 * k)) - 1;
+    let mut fwd = 0u64;
+    let mut rev = 0u64;
+    let mut filled = 0usize;
+    for (i, &c) in seq.iter().enumerate() {
+        match dna_bits(c) {
+            Some(b) => {
+                fwd = ((fwd << 2) | u64::from(b)) & kmask;
+                rev = (rev >> 2) | (u64::from(3 - b) << (2 * k - 2));
+                filled = (filled + 1).min(k);
+                if filled == k {
+                    visit(i + 1 - k, fwd.min(rev));
+                }
+            }
+            None => {
+                fwd = 0;
+                rev = 0;
+                filled = 0;
+            }
+        }
+    }
+}
+
 /// splitmix64 终结器（Steele et al. 2014；纯函数，k-mer 码 → 均匀 u64）。
 /// 诱饵生成也使用该函数派生确定性随机种子。
 pub(crate) fn splitmix64(mut x: u64) -> u64 {
@@ -93,8 +125,29 @@ pub struct KmerBloom {
 impl KmerBloom {
     /// 从目标+诱饵 contigs 构建 canonical k-mer Bloom（诱饵 reads 须能通过比例门）。
     /// 无有效 k-mer（全部过短/全 N）返回 None。位容量 m = pow2(⌈Σ碱基数 × (−1/ln(1−fpr))⌉)，
-    /// fpr 为上界（canonical 去重与含 N 窗口跳过后实际 FPR 更低）。
+    /// 先尝试 m/2 并实测填充率，超界才回退 m；直接 m/2 与构建 m 后高低半区 OR
+    /// 逐位等价。随后继续安全折叠空余高位；fpr 始终为单哈希假阳性率上界。
     pub fn build(contigs: &[&Contig], k: usize, fpr: f64) -> Option<Self> {
+        let full_capacity = Self::capacity_bits(contigs, k, fpr)?;
+        if full_capacity > 64 {
+            let mut candidate = Self::build_with_capacity(contigs, k, full_capacity / 2);
+            if candidate.fill_frac() <= fpr {
+                candidate.fold_to_fpr(fpr);
+                return Some(candidate);
+            }
+        }
+        let mut bloom = Self::build_with_capacity(contigs, k, full_capacity);
+        bloom.fold_to_fpr(fpr);
+        Some(bloom)
+    }
+
+    #[cfg(test)]
+    fn build_unfolded(contigs: &[&Contig], k: usize, fpr: f64) -> Option<Self> {
+        let capacity = Self::capacity_bits(contigs, k, fpr)?;
+        Some(Self::build_with_capacity(contigs, k, capacity))
+    }
+
+    fn capacity_bits(contigs: &[&Contig], k: usize, fpr: f64) -> Option<u64> {
         if k == 0 || k > K_MAX {
             return None;
         }
@@ -103,33 +156,46 @@ impl KmerBloom {
             return None;
         }
         let m_min_bits = (bases as f64 * (-1.0 / (1.0 - fpr).ln())).ceil().max(1.0) as u64;
-        let m = m_min_bits.max(64).next_power_of_two();
-        let words = vec![0u64; (m as usize) / 64];
+        Some(m_min_bits.max(64).next_power_of_two())
+    }
+
+    fn build_with_capacity(contigs: &[&Contig], k: usize, capacity: u64) -> Self {
+        let words = vec![0u64; (capacity as usize) / 64];
         let mut bloom = Self {
             words,
-            mask: m - 1,
+            mask: capacity - 1,
             k,
             n_inserted: 0,
         };
         for c in contigs {
-            let rc = reverse_complement(&c.seq);
-            let n = c.seq.len();
-            // 窗口起点 i ∈ 0..n−k+1（n<k 时为空）；反补链镜像窗口 rc[n−k−i..n−i]。
-            // canonical = min(正链码, 反补码)，正链扫一遍即可覆盖两条链
-            // （词典减半，同 KMCP/COBS）。
-            for i in 0..n.saturating_sub(k - 1) {
-                let fwd = encode_kmer(&c.seq[i..i + k]);
-                let rev = encode_kmer(&rc[n - k - i..n - i]);
-                let (Some(f), Some(r)) = (fwd, rev) else {
-                    continue;
-                };
-                let canon = f.min(r);
+            for_each_canonical_kmer(&c.seq, k, |_, canon| {
                 let idx = (splitmix64(canon) & bloom.mask) as usize;
                 bloom.words[idx >> 6] |= 1 << (idx & 63);
                 bloom.n_inserted += 1;
-            }
+            });
         }
-        Some(bloom)
+        bloom
+    }
+
+    /// 将 hash 空间减半等价于把 Bloom 的高、低半区按位 OR；因此不会产生假阴性。
+    /// 仅在折叠后的实测占位率仍不超过 fpr 时接受，并重复到最小安全容量。
+    fn fold_to_fpr(&mut self, fpr: f64) {
+        while self.words.len() > 1 {
+            let half = self.words.len() / 2;
+            let folded_set_bits: u64 = (0..half)
+                .map(|i| u64::from((self.words[i] | self.words[i + half]).count_ones()))
+                .sum();
+            let folded_fill = folded_set_bits as f64 / (half * 64) as f64;
+            if folded_fill > fpr {
+                break;
+            }
+            for i in 0..half {
+                self.words[i] |= self.words[i + half];
+            }
+            self.words.truncate(half);
+            self.mask = (half * 64) as u64 - 1;
+        }
+        self.words.shrink_to_fit();
     }
 
     /// 探测一个（canonical）k-mer 码。无假阴性；假阳性率 ≤ 构建时的 fpr 上界。
@@ -427,41 +493,20 @@ pub fn read_gate_hits(
     if k == 0 || k > K_MAX || seq.len() < k {
         return (0, 0);
     }
-    let kmask = (1u64 << (2 * k)) - 1;
-    let mut fwd = 0u64;
-    let mut rev = 0u64;
-    let mut filled = 0usize;
     let mut it = 0usize; // 双指针：当前候选掩蔽区间
-    for (i, &c) in seq.iter().enumerate() {
-        match dna_bits(c) {
-            Some(b) => {
-                fwd = ((fwd << 2) | b as u64) & kmask;
-                rev = (rev >> 2) | (((3 - b) as u64) << (2 * k - 2));
-                if filled < k {
-                    filled += 1;
-                }
-                if filled == k {
-                    let start = i - (k - 1);
-                    // 推进到可能覆盖 start 的区间（区间按 start 递增）
-                    while it < intervals.len() && intervals[it].1 <= start {
-                        it += 1;
-                    }
-                    let masked = it < intervals.len() && intervals[it].0 <= start;
-                    if !masked {
-                        n_eff += 1;
-                        if bloom.probe(fwd.min(rev)) {
-                            hits += 1;
-                        }
-                    }
-                }
-            }
-            None => {
-                fwd = 0;
-                rev = 0;
-                filled = 0;
+    for_each_canonical_kmer(seq, k, |start, canon| {
+        // 推进到可能覆盖 start 的区间（区间按 start 递增）
+        while it < intervals.len() && intervals[it].1 <= start {
+            it += 1;
+        }
+        let masked = it < intervals.len() && intervals[it].0 <= start;
+        if !masked {
+            n_eff += 1;
+            if bloom.probe(canon) {
+                hits += 1;
             }
         }
-    }
+    });
     (hits, n_eff)
 }
 
@@ -533,6 +578,41 @@ mod tests {
         contig(&pseudo_random_seq(len, seed))
     }
 
+    /// 优化前的逐窗口实现，用作 rolling 编码的位级回归 oracle。
+    fn build_slice_oracle(contigs: &[&Contig], k: usize, fpr: f64) -> Option<KmerBloom> {
+        if k == 0 || k > K_MAX {
+            return None;
+        }
+        let bases: u64 = contigs.iter().map(|c| c.seq.len() as u64).sum();
+        if bases == 0 {
+            return None;
+        }
+        let m_min_bits = (bases as f64 * (-1.0 / (1.0 - fpr).ln())).ceil().max(1.0) as u64;
+        let m = m_min_bits.max(64).next_power_of_two();
+        let mut bloom = KmerBloom {
+            words: vec![0u64; (m as usize) / 64],
+            mask: m - 1,
+            k,
+            n_inserted: 0,
+        };
+        for c in contigs {
+            let rc = reverse_complement(&c.seq);
+            let n = c.seq.len();
+            for i in 0..n.saturating_sub(k - 1) {
+                let (Some(fwd), Some(rev)) = (
+                    encode_kmer(&c.seq[i..i + k]),
+                    encode_kmer(&rc[n - k - i..n - i]),
+                ) else {
+                    continue;
+                };
+                let idx = (splitmix64(fwd.min(rev)) & bloom.mask) as usize;
+                bloom.words[idx >> 6] |= 1 << (idx & 63);
+                bloom.n_inserted += 1;
+            }
+        }
+        Some(bloom)
+    }
+
     #[test]
     fn kmer_encode_and_rc() {
         assert_eq!(dna_bits(b'a'), Some(0));
@@ -543,6 +623,70 @@ mod tests {
         let a = encode_kmer(b"AAAA").unwrap();
         let t = encode_kmer(b"TTTT").unwrap();
         assert_ne!(a, t);
+    }
+
+    #[test]
+    fn rolling_bloom_matches_slice_oracle_bit_for_bit() {
+        let contigs = [
+            contig(b"ACGTNACGTTTTTACGCGTATACGATCGATCGATCGATC"),
+            random_contig(96, 0xDEAD_BEEF),
+            contig(b"ACGTTGCAACGTTGCAACGTTGCAACGTTGCA"),
+        ];
+        let refs: Vec<&Contig> = contigs.iter().collect();
+        for k in [1, 6, 21, 31] {
+            let rolling = KmerBloom::build_unfolded(&refs, k, GATE_FPR).unwrap();
+            let sliced = build_slice_oracle(&refs, k, GATE_FPR).unwrap();
+            assert_eq!(rolling.k, sliced.k, "k={k}");
+            assert_eq!(rolling.mask, sliced.mask, "k={k}");
+            assert_eq!(rolling.n_inserted, sliced.n_inserted, "k={k}");
+            assert_eq!(rolling.words, sliced.words, "k={k}");
+        }
+    }
+
+    #[test]
+    fn bloom_folding_reduces_capacity_without_false_negatives() {
+        let seq = vec![b'A'; 4096];
+        let c = contig(&seq);
+        let mut unfolded = KmerBloom::build_unfolded(&[&c], 21, GATE_FPR).unwrap();
+        let folded = KmerBloom::build(&[&c], 21, GATE_FPR).unwrap();
+        assert!(folded.words.len() < unfolded.words.len());
+        assert!(folded.fill_frac() <= GATE_FPR);
+
+        // 每个原占位映射到缩短 mask 后仍占位，直接验证 OR 折叠无假阴性。
+        for (word_index, &word) in unfolded.words.iter().enumerate() {
+            let mut set = word;
+            while set != 0 {
+                let bit = set.trailing_zeros() as usize;
+                let old_index = word_index * 64 + bit;
+                let new_index = old_index & folded.mask as usize;
+                assert_ne!(folded.words[new_index >> 6] & (1 << (new_index & 63)), 0);
+                set &= set - 1;
+            }
+        }
+
+        let code = encode_kmer(&c.seq[..21]).unwrap();
+        assert!(folded.probe(code));
+
+        // 直接按较小 mask 构建与保守容量逐次 OR 折叠逐位相同。
+        unfolded.fold_to_fpr(GATE_FPR);
+        assert_eq!(folded.mask, unfolded.mask);
+        assert_eq!(folded.n_inserted, unfolded.n_inserted);
+        assert_eq!(folded.words, unfolded.words);
+    }
+
+    #[test]
+    fn bloom_half_capacity_falls_back_when_fill_would_exceed_bound() {
+        let c = random_contig(4096, 0x0A11_CE55);
+        let refs = [&c];
+        let mut unfolded = KmerBloom::build_unfolded(&refs, 21, GATE_FPR).unwrap();
+        let half = KmerBloom::build_with_capacity(&refs, 21, unfolded.mask.div_ceil(2));
+        assert!(half.fill_frac() > GATE_FPR, "fixture 必须触发保守容量回退");
+
+        unfolded.fold_to_fpr(GATE_FPR);
+        let built = KmerBloom::build(&refs, 21, GATE_FPR).unwrap();
+        assert_eq!(built.mask, unfolded.mask);
+        assert_eq!(built.n_inserted, unfolded.n_inserted);
+        assert_eq!(built.words, unfolded.words);
     }
 
     #[test]
