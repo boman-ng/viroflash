@@ -10,6 +10,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 minimap2 = "0.1"
 memchr = "2"
 blake3 = "1"
+sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }
 
 [profile.release]
 opt-level = 3
