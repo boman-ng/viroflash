@@ -1,4 +1,5 @@
-//! 统计计算：Poisson/NB 上尾 p 值（辅助诊断）与分层经验 decoy q 值（主判定）。
+//! 统计计算：两 Poisson 率精确条件检验与 log-space BH（主路径），以及
+//! Poisson/NB/CDH 离散方法（诊断和已覆盖的数学原语）。
 //!
 //! - 正则化 gamma（级数 + Lentz 连分数）：Numerical Recipes 标准实现；
 //! - NB 上尾 = I_p(c, r)（r=1/α），α 估计 MoM 优先（Robinson & Smyth 2008, Biostatistics）；
@@ -288,6 +289,136 @@ pub fn expected_hits(contig_len: u64, n_total_reads: u64) -> f64 {
     contig_len as f64 * (n_total_reads as f64 / 1e7)
 }
 
+/// 可同时保留普通概率和对数概率的尾概率。
+///
+/// `underflow` 表示普通概率进入 f64 subnormal/zero 区间；此时
+/// `ln_probability` 由 log-space 递推保留主要数值信息，不表示数学概率为 0。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TailProbability {
+    pub probability: f64,
+    pub ln_probability: f64,
+    pub underflow: bool,
+}
+
+fn log_add_exp(left: f64, right: f64) -> f64 {
+    if left == f64::NEG_INFINITY {
+        return right;
+    }
+    if right == f64::NEG_INFINITY {
+        return left;
+    }
+    let high = left.max(right);
+    let low = left.min(right);
+    high + (low - high).exp().ln_1p()
+}
+
+/// 两个独立 Poisson 率的单侧精确条件检验。
+///
+/// H0：`target_count / target_exposure == background_count / background_exposure`；
+/// H1：target 率更高。对总事件数条件化后，target 计数服从
+/// `Binomial(total, target_exposure / total_exposure)`，与 R `poisson.test` 的两样本
+/// 精确检验同构。该检验能在 background_count=0 时保留有限样本不确定性，不把
+/// 观测零背景率当作已知的精确零。
+pub fn exact_poisson_rate_upper_tail(
+    target_count: u64,
+    target_exposure: f64,
+    background_count: u64,
+    background_exposure: f64,
+) -> Result<TailProbability, String> {
+    if !target_exposure.is_finite() || target_exposure <= 0.0 {
+        return Err("target exposure 必须为有限正数".to_string());
+    }
+    if !background_exposure.is_finite() || background_exposure <= 0.0 {
+        return Err("background exposure 必须为有限正数".to_string());
+    }
+    let total_count = target_count
+        .checked_add(background_count)
+        .ok_or_else(|| "Poisson 条件检验总计数溢出".to_string())?;
+    if target_count == 0 || total_count == 0 {
+        return Ok(TailProbability {
+            probability: 1.0,
+            ln_probability: 0.0,
+            underflow: false,
+        });
+    }
+
+    let target_probability = target_exposure / (target_exposure + background_exposure);
+    if !(0.0..1.0).contains(&target_probability) {
+        return Err("Poisson 条件检验 exposure 比例退化".to_string());
+    }
+
+    // P[X >= target_count] = I_p(target_count, background_count + 1)。通常直接走
+    // regularized beta；极小尾部下溢时再以 log-PMF 递推求 log-sum-exp。
+    let direct = regularized_beta(
+        target_probability,
+        target_count as f64,
+        background_count as f64 + 1.0,
+    );
+    let ln_probability = if direct.is_finite() && direct >= f64::MIN_POSITIVE {
+        direct.ln()
+    } else {
+        let n = total_count;
+        let k = target_count;
+        let ln_p = target_probability.ln();
+        let ln_one_minus_p = (-target_probability).ln_1p();
+        let mut x = k;
+        let mut ln_term =
+            ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma((n - k) as f64 + 1.0)
+                + k as f64 * ln_p
+                + (n - k) as f64 * ln_one_minus_p;
+        let mut ln_sum = ln_term;
+        while x < n {
+            ln_term += ((n - x) as f64).ln() - ((x + 1) as f64).ln() + ln_p - ln_one_minus_p;
+            ln_sum = log_add_exp(ln_sum, ln_term);
+            x += 1;
+        }
+        ln_sum.min(0.0)
+    };
+    if !ln_probability.is_finite() {
+        return Err("Poisson 条件检验产生非有限 log-p".to_string());
+    }
+    let probability = ln_probability.exp();
+    Ok(TailProbability {
+        probability,
+        ln_probability,
+        underflow: probability < f64::MIN_POSITIVE && ln_probability < 0.0,
+    })
+}
+
+/// 固定检验族的 Benjamini-Hochberg 调整；全程以 ln(p) 排序和单调化，避免极小
+/// p 在进入多重校正前先下溢为 0。
+pub fn benjamini_hochberg_from_log(ln_p_values: &[f64]) -> Result<Vec<TailProbability>, String> {
+    if ln_p_values.is_empty() {
+        return Ok(Vec::new());
+    }
+    for &ln_p in ln_p_values {
+        if !ln_p.is_finite() || ln_p > 0.0 {
+            return Err(format!("BH 输入 log-p 非法: {ln_p}"));
+        }
+    }
+    let m = ln_p_values.len();
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&left, &right| ln_p_values[left].total_cmp(&ln_p_values[right]));
+    let mut ln_q_values = vec![0.0; m];
+    let mut running_min = 0.0f64;
+    for (rank, &index) in order.iter().enumerate().rev() {
+        let adjusted = ln_p_values[index] + (m as f64).ln() - ((rank + 1) as f64).ln();
+        running_min = running_min.min(adjusted.min(0.0));
+        ln_q_values[index] = running_min;
+    }
+    Ok(ln_q_values
+        .into_iter()
+        .map(|ln_probability| {
+            let probability = ln_probability.exp();
+            TailProbability {
+                probability,
+                ln_probability,
+                underflow: probability < f64::MIN_POSITIVE && ln_probability < 0.0,
+            }
+        })
+        .collect())
+}
+
 /// BH 型单调 q：排序后 q_(i) = min(π̂0·m·p_(i)/i, q_(i+1))（Storey 2002 §3）。
 /// π̂0=1 时退化为 BH q。离散 p 主路径由 `discrete_q_values` 提供 π̂0（CDH2018）。
 fn monotone_storey_q(p_values: &[f64], pi0: f64) -> Vec<f64> {
@@ -407,6 +538,53 @@ mod tests {
         assert!((got - expect).abs() < 1e-12, "got {got} expect {expect}");
         assert_eq!(poisson_upper_tail(0, 2.0), 1.0);
         assert_eq!(poisson_upper_tail(3, 0.0), 0.0);
+    }
+
+    #[test]
+    fn exact_poisson_rate_test_handles_zero_background_without_zero_p() {
+        // 条件于总计数：exposure 1:9 时 X~Binomial(n, 0.1)。
+        let one = exact_poisson_rate_upper_tail(1, 1.0, 0, 9.0).unwrap();
+        assert!((one.probability - 0.1).abs() < 1e-12, "{one:?}");
+        assert!((one.ln_probability - 0.1f64.ln()).abs() < 1e-12);
+        assert!(!one.underflow);
+
+        let two = exact_poisson_rate_upper_tail(2, 1.0, 0, 9.0).unwrap();
+        assert!((two.probability - 0.01).abs() < 1e-12, "{two:?}");
+
+        // n=3、k=2：C(3,2)·0.1²·0.9 + 0.1³ = 0.028。
+        let mixed = exact_poisson_rate_upper_tail(2, 1.0, 1, 9.0).unwrap();
+        assert!((mixed.probability - 0.028).abs() < 1e-12, "{mixed:?}");
+    }
+
+    #[test]
+    fn exact_poisson_rate_test_preserves_log_tail_after_underflow() {
+        let tail = exact_poisson_rate_upper_tail(1_000, 1.0, 0, 999.0).unwrap();
+        assert_eq!(tail.probability, 0.0);
+        assert!(tail.underflow);
+        assert!((tail.ln_probability - 1_000.0 * 0.001f64.ln()).abs() < 1e-8);
+    }
+
+    #[test]
+    fn exact_poisson_rate_test_recomputes_subnormal_tail_in_log_space() {
+        // 0.5^1050 是正的 subnormal f64；普通值精度受限，但 log-p 应保持解析值。
+        let tail = exact_poisson_rate_upper_tail(1_050, 1.0, 0, 1.0).unwrap();
+        assert!(tail.probability > 0.0 && tail.probability < f64::MIN_POSITIVE);
+        assert!(tail.underflow);
+        assert!((tail.ln_probability - 1_050.0 * 0.5f64.ln()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn bh_adjustment_uses_log_probabilities() {
+        let ln_p = [0.001f64.ln(), 0.01f64.ln(), 0.2f64.ln(), 1.0f64.ln()];
+        let q = benjamini_hochberg_from_log(&ln_p).unwrap();
+        let expected = [0.004, 0.02, 0.266_666_666_666_666_66, 1.0];
+        for (got, want) in q.iter().zip(expected) {
+            assert!((got.probability - want).abs() < 1e-12, "{got:?} != {want}");
+        }
+
+        let tiny = benjamini_hochberg_from_log(&[-1_000.0, -900.0]).unwrap();
+        assert!(tiny[0].underflow && tiny[1].underflow);
+        assert!(tiny[0].ln_probability < tiny[1].ln_probability);
     }
 
     #[test]

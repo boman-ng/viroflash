@@ -1,5 +1,5 @@
 //! 命令行入口：`viroflash index` / `viroflash run` / `viroflash version`。
-//! 手工解析参数，保持零额外依赖（轻量约束）。
+//! 手工解析参数；性能采样由库内 `sysinfo` 模块提供。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -49,30 +49,60 @@ fn run() -> Result<(), String> {
                 opt.k
             );
             eprintln!(
-                "  ref.mmi / bloom.bin / manifest.json（manifest_blake3={}）",
+                "  ref.mmi / bloom.bin / manifest.json / targets.fa（manifest_blake3={}）",
                 built.manifest_blake3
             );
+            let perf = viroflash::perf::report_paths(&opt.out_dir);
+            eprintln!("性能报告: {} / {}", perf.json.display(), perf.tsv.display());
             Ok(())
         }
         Command::Run(opt) => {
             let summary = run_pipeline(&opt)?;
             eprintln!("输入 pairs: {}", summary.input_pairs);
-            eprintln!("预筛通过 pairs: {}", summary.prescreen_pairs);
+            eprintln!(
+                "抽样 pairs: {}（p={:.6}），抽样内预筛通过: {}",
+                summary.sampling.selected_pairs,
+                summary.sampling.inclusion_probability,
+                summary.prescreen_pairs
+            );
             if summary.map_errors > 0 {
                 eprintln!(
                     "警告: {} 个 fragment 比对失败（详见报告 run.map_errors）",
                     summary.map_errors
                 );
             }
-            eprintln!("候选数: {}", summary.candidates.len());
+            if summary.sampling.audit_overflows > 0 {
+                eprintln!(
+                    "警告: {} 个 read-end 的全链命中超限，未当作空证据（详见报告 sampling.audit_overflows）",
+                    summary.sampling.audit_overflows
+                );
+            }
+            eprintln!(
+                "固定检验族: {}，报告候选: {}",
+                summary.test_family_size,
+                summary.candidates.len()
+            );
+            eprintln!("解释范围: 候选级研究报告门，不计算样本级结论；QC=NOT_EVALUATED");
             for c in &summary.candidates {
                 eprintln!(
-                    "  {}  q={:.4}  {}  覆盖={:.2}  reads={}  split={}  discordant={}",
+                    "  hypothesis={} OR({})  代表={}  adjusted-p={}  状态={}  候选门={}  覆盖={:.2}  reads={}  integration={}  split={}  discordant={}",
                     c.contig,
-                    c.q_value,
+                    c.hypothesis_members.len(),
+                    c.representative,
+                    if c.q_underflow {
+                        format!(
+                            "{:.3e} (underflow-range, log10={:.3})",
+                            c.q_value,
+                            c.ln_q_value / std::f64::consts::LN_10
+                        )
+                    } else {
+                        format!("{:.3e}", c.q_value)
+                    },
                     c.confidence(),
+                    c.decision,
                     c.covered_frac,
                     c.reads,
+                    c.integration_evidence,
                     c.split_events,
                     c.discordant
                 );
@@ -82,6 +112,8 @@ fn run() -> Result<(), String> {
                 summary.result_json.display(),
                 summary.result_tsv.display()
             );
+            let perf = viroflash::perf::report_paths(&opt.out);
+            eprintln!("性能报告: {} / {}", perf.json.display(), perf.tsv.display());
             Ok(())
         }
     }
@@ -226,22 +258,23 @@ fn print_usage() {
   viroflash index \\\n\
     --host-fa <宿主.fa> --target-fa <目标病毒.fa> \\\n\
     [--contam-fa <污染.fa>] [--decoy-fa <诱饵.fa>] \\\n\
-    [--decoy-ani 82,85,88] [--decoy-per-layer 4] [--decoy-seed 0] \\\n\
+    [--decoy-ani 85] [--decoy-per-layer 1] [--decoy-seed 0] \\\n\
     --out <索引目录> [--k 21（1..=31）] [--threads 8]\n\
 \n\
   viroflash run \\\n\
     --r1 <reads_R1.fastq.gz> [--r2 <reads_R2.fastq.gz>] \\\n\
     (--index <索引目录> | --host-fa <宿主.fa> --target-fa <目标病毒.fa> \\\n\
       [--contam-fa <污染.fa>] [--decoy-fa <诱饵.fa>]) \\\n\
-    [--threads 8（进程总线程数）] [--out <输出前缀>] [--k 21（1..=31）]\n\
+    [--threads 8（数据管线计算线程预算）] [--out <输出前缀>] [--k 21（1..=31）]\n\
 \n\
   viroflash version\n\
 \n\
-index: 构建可复用索引目录（ref.mmi + bloom.bin + manifest.json）；未提供\n\
+index: 构建可复用索引目录（ref.mmi + bloom.bin + manifest.json + targets.fa）；未提供\n\
   --decoy-fa 时按 --decoy-ani/--decoy-per-layer/--decoy-seed 从目标自动生成诱饵。\n\
 run: --index 复用索引（与 FASTA 参数互斥，--k 需与索引一致）；未提供 --index\n\
   时自动构建（诱饵未提供时按默认参数自动生成）。\n\
-输入: 测序 fastq.gz（省略 --r2 即单端模式）；输出: <out>.json / <out>.tsv",
+输入: 测序 fastq.gz（省略 --r2 即单端模式）；输出: <out>.json / <out>.tsv\n\
+性能: index 与 run 自动输出 <out>.perf.json / <out>.perf.tsv（当前进程与阶段汇总）",
         env!("CARGO_PKG_VERSION")
     );
 }

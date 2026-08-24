@@ -1,7 +1,7 @@
 //! 合成数据端到端冒烟测试：随机宿主/目标/诱饵/污染参考 + 合成读对。
 //! 覆盖：
 //! - 「--index 加载」与「FASTA 自动构建」两条路径结果逐候选一致（等价性契约）；
-//! - 目标候选被检出且 q 值显著（背景控制、输出文件生成）；
+//! - 目标候选通过精确率检验 adjusted-p 与分布门（输出文件生成）；
 //! - 未提供 --decoy-fa 时自动生成诱饵并写入索引；
 //! - 索引 k 不一致、--index 与 FASTA 互斥的错误路径。
 
@@ -125,12 +125,17 @@ fn setup_synthetic(tag: &str) -> PathBuf {
     );
     write_fasta(&dir.join("contam.fa"), &[("mycoplasma", &contam)]);
 
-    // 30 个目标对（来自 target 两段区域）+ 30 个宿主对
+    // 30 个目标对（来自 target 三段分布区域）+ 30 个宿主对。三段使该夹具明确
+    // 覆盖通用检测的 distributed-windows PASS 路径，而不依赖 split 证据。
     let mut r1: Vec<(String, Vec<u8>)> = Vec::new();
     let mut r2: Vec<(String, Vec<u8>)> = Vec::new();
     for i in 0..30 {
         r1.push((format!("t{i}/1"), target[100..250].to_vec()));
-        r2.push((format!("t{i}/2"), reverse_complement(&target[400..550])));
+        let r2_start = if i % 2 == 0 { 400 } else { 700 };
+        r2.push((
+            format!("t{i}/2"),
+            reverse_complement(&target[r2_start..r2_start + 150]),
+        ));
     }
     for i in 0..30 {
         let off = i * 10;
@@ -169,6 +174,7 @@ fn assert_detected(summary: &viroflash::RunSummary) {
         .iter()
         .find(|c| c.contig == "target_0")
         .expect("应检出 target_0 候选");
+    assert_eq!(summary.test_family_size, 1);
     assert!(
         cand.covered_frac >= 0.2,
         "覆盖比例过低: {:.3}",
@@ -176,15 +182,46 @@ fn assert_detected(summary: &viroflash::RunSummary) {
     );
     assert!(
         cand.q_value <= 0.2,
-        "q 值应显著（同层 decoy 无覆盖）: {:.4}",
+        "模型 adjusted-p 应通过探索阈值（同层 decoy 无覆盖）: {:.4}",
         cand.q_value
+    );
+    assert_eq!(cand.decision, "PASS");
+    assert!(cand.distinct_windows >= 3);
+    assert_eq!(cand.confidence(), "UNVALIDATED");
+    assert_eq!(cand.n_plain, cand.reads, "split 不得改变通用检测计数");
+    assert_eq!(
+        cand.background_status, "SYNTHETIC_DECOY_UNVALIDATED",
+        "报告必须披露 synthetic-decoy null 未校准"
     );
     // 合成读无嵌合，不应有 split/discordant 证据
     assert_eq!(cand.split_events, 0);
     assert_eq!(cand.discordant, 0);
+    assert_eq!(cand.integration_evidence, "NONE");
 
     assert!(summary.result_json.exists());
     assert!(summary.result_tsv.exists());
+    let result_json = std::fs::read_to_string(&summary.result_json).unwrap();
+    let result_tsv = std::fs::read_to_string(&summary.result_tsv).unwrap();
+    assert!(result_json.contains("\"schema\": \"viroflash.result.v1\""));
+    assert!(result_json.contains("\"sample_conclusion\": \"not_computed\""));
+    assert!(result_json.contains("\"fdr_control_validated\": false"));
+    assert!(result_json.contains("\"test\": \"exact_conditional_two_poisson_rates\""));
+    assert!(result_tsv.contains("row_type=candidate;"));
+    assert!(result_tsv.contains("result_schema=viroflash.result.v1"));
+    assert!(result_tsv.contains("\treference_group\t"));
+    assert!(result_tsv.contains("qc_status=NOT_EVALUATED"));
+    assert!(result_tsv.contains("member_attribution=not_resolved"));
+    for line in result_tsv.lines() {
+        assert_eq!(line.split('\t').count(), 22, "TSV 固定列契约: {line}");
+    }
+    let perf_json = summary.result_json.with_extension("perf.json");
+    let perf_tsv = summary.result_tsv.with_extension("perf.tsv");
+    assert!(perf_json.exists());
+    assert!(perf_tsv.exists());
+    let perf = std::fs::read_to_string(perf_json).unwrap();
+    assert!(perf.contains("\"schema\": \"viroflash.perf.v1\""));
+    assert!(perf.contains("\"status\": \"success\""));
+    assert!(!perf.contains("reads_R1.fq.gz"), "性能报告不得泄露输入路径");
 }
 
 #[test]
@@ -203,6 +240,8 @@ fn e2e_index_and_autobuild_paths_agree() {
         ..IndexOptions::default()
     };
     let built = index::build_index(&index_opts).unwrap();
+    assert!(dir.join("idx.perf.json").is_file());
+    assert!(dir.join("idx.perf.tsv").is_file());
     assert_eq!(
         built
             .contigs
@@ -301,6 +340,7 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
     let err = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         index: Some(dir.join("idx")),
+        out: dir.join("k_mismatch"),
         k: 6,
         ..Options::default()
     })
@@ -312,6 +352,7 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
         r1: dir.join("reads_R1.fq.gz"),
         index: Some(dir.join("idx")),
         host_fa: Some(dir.join("host.fa")),
+        out: dir.join("index_fasta_conflict"),
         ..Options::default()
     })
     .unwrap_err();
@@ -321,6 +362,7 @@ fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
     let err = run_pipeline(&Options {
         r1: dir.join("reads_R1.fq.gz"),
         target_fa: Some(dir.join("target.fa")),
+        out: dir.join("missing_host"),
         ..Options::default()
     })
     .unwrap_err();

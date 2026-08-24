@@ -1,10 +1,10 @@
-//! PE fragment 的确定性 bottom-k 抽样。
+//! fragment 的确定性 bottom-k 抽样与发现/验证折分。
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// 默认抽样容量：在 500 RPM 门槛处期望约 262 个 read-side 证据
-/// （相对 Poisson SE 约 6.2%）；不是 panel 经验阈值。
+/// 默认抽样容量。它限制任意输入规模下保留的序列内存与后续比对工作量；
+/// `N <= K` 时退化为全量处理，不是 panel 或阳性判定阈值。
 pub const DEFAULT_SAMPLE_PAIRS: usize = 524_288;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,9 +19,16 @@ pub struct OwnedPair {
 pub struct SamplingResult {
     pub seen_pairs: u64,
     pub selected_pairs: u64,
-    pub selected_passed_pairs: u64,
-    pub passed_pairs: Vec<OwnedPair>,
+    pub pairs: Vec<OwnedPair>,
     pub inclusion_probability: f64,
+}
+
+/// 同一 fragment 的两个 read-end 必须进入同一折，防止一端参与发现、另一端又
+/// 参与验证。ordinal 让重复 qname 的独立输入记录不会永久绑定在同一折。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvidenceFold {
+    Discovery,
+    Validation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,7 +41,7 @@ struct InclusionKey {
 #[derive(Debug)]
 struct SelectedPair {
     key: InclusionKey,
-    pair: Option<OwnedPair>,
+    pair: OwnedPair,
 }
 
 impl PartialEq for SelectedPair {
@@ -58,9 +65,28 @@ impl Ord for SelectedPair {
 }
 
 fn inclusion_key(r1_id: &[u8], ordinal: u64) -> InclusionKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"viroflash/bottom-k/v1\0");
+    hasher.update(&(r1_id.len() as u64).to_le_bytes());
+    hasher.update(r1_id);
+    hasher.update(&ordinal.to_le_bytes());
     InclusionKey {
-        digest: *blake3::hash(r1_id).as_bytes(),
+        digest: *hasher.finalize().as_bytes(),
+        // BLAKE3 碰撞时仍以稳定唯一序号给出全序。
         ordinal,
+    }
+}
+
+pub fn evidence_fold(qname: &str, ordinal: u64) -> EvidenceFold {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"viroflash/evidence-fold/v1\0");
+    hasher.update(&(qname.len() as u64).to_le_bytes());
+    hasher.update(qname.as_bytes());
+    hasher.update(&ordinal.to_le_bytes());
+    if hasher.finalize().as_bytes()[0] & 1 == 0 {
+        EvidenceFold::Discovery
+    } else {
+        EvidenceFold::Validation
     }
 }
 
@@ -86,16 +112,15 @@ impl PairReservoir {
 
     /// 观察一个已完成配对校验的 PE fragment。
     ///
-    /// `ordinal` 必须是 fragment 在原始输入中的稳定唯一序号。通常只按 R1 ID
-    /// 的 BLAKE3 摘要决定是否入样；仅当摘要相同（重复 ID 或哈希碰撞）时，
-    /// `ordinal` 才影响选择。未通过预筛的入选项只保留键，不复制 ID 或序列。
+    /// `ordinal` 必须是 fragment 在原始输入中的稳定唯一序号。抽样层不承担
+    /// k-mer 门控：先完成 bottom-k，再只门控最终 K 项，避免对全部输入随机访问
+    /// 大 Bloom。R1 ID 与 ordinal 共同进入域分离 BLAKE3，重复 ID 仍独立抽样。
     pub fn observe(
         &mut self,
         ordinal: u64,
         r1_id: &[u8],
         r1_seq: &[u8],
         r2_seq: &[u8],
-        prescreen_pass: bool,
     ) -> Result<(), String> {
         let qname = std::str::from_utf8(r1_id)
             .map_err(|error| format!("R1 fragment ID 不是有效 UTF-8: {error}"))?;
@@ -118,26 +143,25 @@ impl PairReservoir {
         if self.selected.len() == self.capacity {
             drop(self.selected.pop());
         }
-        let pair = prescreen_pass.then(|| OwnedPair {
+        let pair = OwnedPair {
             ordinal,
             qname: qname.to_owned(),
             r1_seq: r1_seq.to_vec(),
             r2_seq: r2_seq.to_vec(),
-        });
+        };
         self.selected.push(SelectedPair { key, pair });
         Ok(())
     }
 
-    /// 完成抽样；通过预筛的入选 pair 按原始 ordinal 升序返回。
+    /// 完成抽样；入选 pair 按原始 ordinal 升序返回。
     pub fn finish(self) -> SamplingResult {
         let selected_pairs = self.selected.len() as u64;
-        let mut passed_pairs: Vec<OwnedPair> = self
+        let mut pairs: Vec<OwnedPair> = self
             .selected
             .into_iter()
-            .filter_map(|selected| selected.pair)
+            .map(|selected| selected.pair)
             .collect();
-        passed_pairs.sort_unstable_by_key(|pair| pair.ordinal);
-        let selected_passed_pairs = passed_pairs.len() as u64;
+        pairs.sort_unstable_by_key(|pair| pair.ordinal);
         let inclusion_probability = if u128::from(self.seen_pairs) <= self.capacity as u128 {
             1.0
         } else {
@@ -147,8 +171,7 @@ impl PairReservoir {
         SamplingResult {
             seen_pairs: self.seen_pairs,
             selected_pairs,
-            selected_passed_pairs,
-            passed_pairs,
+            pairs,
             inclusion_probability,
         }
     }
@@ -231,32 +254,18 @@ mod tests {
         ordinals
     }
 
-    fn observe_all(
-        records: &[Input],
-        capacity: usize,
-        passes: impl Fn(&Input) -> bool,
-    ) -> SamplingResult {
+    fn observe_all(records: &[Input], capacity: usize) -> SamplingResult {
         let mut reservoir = PairReservoir::new(capacity).expect("有效容量");
         for record in records {
             reservoir
-                .observe(
-                    record.ordinal,
-                    record.id,
-                    record.r1_seq,
-                    record.r2_seq,
-                    passes(record),
-                )
+                .observe(record.ordinal, record.id, record.r1_seq, record.r2_seq)
                 .expect("有效 fragment");
         }
         reservoir.finish()
     }
 
     fn result_ordinals(result: &SamplingResult) -> Vec<u64> {
-        result
-            .passed_pairs
-            .iter()
-            .map(|pair| pair.ordinal)
-            .collect()
+        result.pairs.iter().map(|pair| pair.ordinal).collect()
     }
 
     fn permutations(mut records: Vec<Input>) -> Vec<Vec<Input>> {
@@ -287,15 +296,14 @@ mod tests {
     fn non_utf8_id_is_rejected_without_counting_a_pair() {
         let mut reservoir = PairReservoir::new(2).unwrap();
         let error = reservoir
-            .observe(0, &[0xff], b"AC", b"GT", true)
+            .observe(0, &[0xff], b"AC", b"GT")
             .expect_err("非 UTF-8 ID 必须报错");
         assert!(error.contains("UTF-8"));
 
         let result = reservoir.finish();
         assert_eq!(result.seen_pairs, 0);
         assert_eq!(result.selected_pairs, 0);
-        assert_eq!(result.selected_passed_pairs, 0);
-        assert!(result.passed_pairs.is_empty());
+        assert!(result.pairs.is_empty());
         assert_eq!(result.inclusion_probability, 1.0);
     }
 
@@ -310,7 +318,7 @@ mod tests {
                 .map(|(_, record)| *record)
                 .collect();
             for capacity in 1..=records.len() + 1 {
-                let result = observe_all(&records, capacity, |_| true);
+                let result = observe_all(&records, capacity);
                 assert_eq!(
                     result_ordinals(&result),
                     expected_ordinals(&records, capacity),
@@ -326,7 +334,7 @@ mod tests {
         let records = inputs()[..5].to_vec();
         let expected = expected_ordinals(&records, 3);
         for permutation in permutations(records) {
-            let result = observe_all(&permutation, 3, |_| true);
+            let result = observe_all(&permutation, 3);
             assert_eq!(result_ordinals(&result), expected);
         }
     }
@@ -334,59 +342,32 @@ mod tests {
     #[test]
     fn n_at_most_k_selects_every_pair() {
         let records = inputs()[..3].to_vec();
-        let result = observe_all(&records, 5, |_| true);
+        let result = observe_all(&records, 5);
         let mut expected: Vec<u64> = records.iter().map(|record| record.ordinal).collect();
         expected.sort_unstable();
 
         assert_eq!(result.seen_pairs, 3);
         assert_eq!(result.selected_pairs, 3);
-        assert_eq!(result.selected_passed_pairs, 3);
+        assert_eq!(result.pairs.len(), 3);
         assert_eq!(result_ordinals(&result), expected);
         assert_eq!(result.inclusion_probability, 1.0);
     }
 
     #[test]
-    fn failed_prescreen_pair_occupies_sample_without_storing_sequences() {
-        let mut records = inputs()[..4].to_vec();
-        records.sort_unstable_by_key(|record| inclusion_key(record.id, record.ordinal));
-        let failed_ordinal = records[0].ordinal;
-        let expected_passed = records[1];
-        records.reverse();
-
-        let mut reservoir = PairReservoir::new(2).unwrap();
-        for record in &records {
-            reservoir
-                .observe(
-                    record.ordinal,
-                    record.id,
-                    record.r1_seq,
-                    record.r2_seq,
-                    record.ordinal != failed_ordinal,
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            reservoir
-                .selected
-                .iter()
-                .filter(|entry| entry.pair.is_none())
-                .count(),
-            1
-        );
-
-        let result = reservoir.finish();
+    fn selected_records_retain_both_sequences_for_post_sampling_gate() {
+        let records = inputs()[..4].to_vec();
+        let result = observe_all(&records, 2);
         assert_eq!(result.seen_pairs, 4);
         assert_eq!(result.selected_pairs, 2);
-        assert_eq!(result.selected_passed_pairs, 1);
-        assert_eq!(result.inclusion_probability, 0.5);
-        assert_eq!(result.passed_pairs.len(), 1);
-        assert_eq!(result.passed_pairs[0].ordinal, expected_passed.ordinal);
-        assert_eq!(result.passed_pairs[0].r1_seq, expected_passed.r1_seq);
-        assert_eq!(result.passed_pairs[0].r2_seq, expected_passed.r2_seq);
+        assert_eq!(result.pairs.len(), 2);
+        assert!(result
+            .pairs
+            .iter()
+            .all(|pair| !pair.r1_seq.is_empty() && !pair.r2_seq.is_empty()));
     }
 
     #[test]
-    fn duplicate_ids_use_ordinal_as_a_stable_tie_break() {
+    fn duplicate_ids_are_hashed_as_distinct_stable_records() {
         let records = vec![
             Input {
                 ordinal: 9,
@@ -408,9 +389,10 @@ mod tests {
             },
         ];
 
+        let expected = expected_ordinals(&records, 2);
         for permutation in permutations(records) {
-            let result = observe_all(&permutation, 2, |_| true);
-            assert_eq!(result_ordinals(&result), vec![2, 5]);
+            let result = observe_all(&permutation, 2);
+            assert_eq!(result_ordinals(&result), expected);
         }
     }
 
@@ -418,7 +400,7 @@ mod tests {
     fn finish_orders_passed_pairs_by_original_ordinal() {
         let mut records = inputs()[..6].to_vec();
         records.sort_unstable_by_key(|record| std::cmp::Reverse(record.ordinal));
-        let result = observe_all(&records, 4, |_| true);
+        let result = observe_all(&records, 4);
         let ordinals = result_ordinals(&result);
 
         assert_eq!(ordinals, expected_ordinals(&records, 4));
@@ -428,8 +410,8 @@ mod tests {
     #[test]
     fn repeated_input_produces_identical_result() {
         let records = inputs();
-        let first = observe_all(&records, 5, |record| record.ordinal % 2 == 0);
-        let second = observe_all(&records, 5, |record| record.ordinal % 2 == 0);
+        let first = observe_all(&records, 5);
+        let second = observe_all(&records, 5);
         assert_eq!(first, second);
     }
 
@@ -438,8 +420,31 @@ mod tests {
         let result = PairReservoir::new(4).unwrap().finish();
         assert_eq!(result.seen_pairs, 0);
         assert_eq!(result.selected_pairs, 0);
-        assert_eq!(result.selected_passed_pairs, 0);
-        assert!(result.passed_pairs.is_empty());
+        assert!(result.pairs.is_empty());
         assert_eq!(result.inclusion_probability, 1.0);
+    }
+
+    #[test]
+    fn fold_is_deterministic_and_shared_by_both_read_ends() {
+        let first = evidence_fold("fragment/1", 42);
+        assert_eq!(first, evidence_fold("fragment/1", 42));
+        // 调用方只按 fragment 调一次，因此两个 read-end 共享这一结果。
+        assert!(matches!(
+            first,
+            EvidenceFold::Discovery | EvidenceFold::Validation
+        ));
+    }
+
+    #[test]
+    fn duplicate_qnames_are_independent_records() {
+        let keys = (0..64)
+            .map(|ordinal| inclusion_key(b"duplicate/1", ordinal).digest)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), 64);
+
+        let folds = (0..64)
+            .map(|ordinal| evidence_fold("duplicate/1", ordinal))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(folds.len(), 2);
     }
 }
