@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Command-line tool for viral candidate detection"
 publish = false
+repository = "https://github.com/boman-ng/viroflash"
 
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

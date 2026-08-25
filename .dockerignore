@@ -1,0 +1,7 @@
+.git
+.github
+.local
+target
+synthetic.work
+*.work
+*.sif
