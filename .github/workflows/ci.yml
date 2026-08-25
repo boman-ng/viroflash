@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust quality and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Cache Cargo data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Report toolchain
+        run: rustc --version && cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check types
+        run: cargo check --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test debug profile
+        run: cargo test --all-targets --locked
+
+      - name: Test release profile
+        run: cargo test --release --locked
+
+      - name: Build production binary
+        run: cargo build --release --locked
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Build image
+        run: docker build --tag viroflash:ci .
+
+      - name: Smoke-test image
+        run: |
+          docker run --rm viroflash:ci version
+          test_dir="${RUNNER_TEMP}/viroflash-docker-test"
+          python3 scripts/make_virtual_data.py "${test_dir}" --scenario positive
+          chmod -R a+rwX "${test_dir}"
+          docker run --rm \
+            --volume "${test_dir}:/work" \
+            viroflash:ci run \
+            --r1 /work/positive/reads_R1.fq.gz \
+            --r2 /work/positive/reads_R2.fq.gz \
+            --host-fa /work/positive/host.fa \
+            --target-fa /work/positive/target.fa \
+            --decoy-fa /work/positive/decoy.fa \
+            --contam-fa /work/positive/contam.fa \
+            --threads 2 \
+            --out /work/result
+          test -s "${test_dir}/result.json"
+          test -s "${test_dir}/result.tsv"
+
+  apptainer:
+    name: Apptainer image
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Cache Cargo data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-apptainer-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Build Linux binary
+        run: cargo build --release --locked
+
+      - name: Install Apptainer
+        uses: eWaterCycle/setup-apptainer@4bb22c52d4f63406c49e94c804632975787312b3 # v2.0.0
+        with:
+          apptainer-version: 1.5.3
+
+      - name: Build image
+        run: apptainer build viroflash.sif Apptainer.def
+
+      - name: Smoke-test image
+        run: |
+          apptainer run viroflash.sif version
+          test_dir="${RUNNER_TEMP}/viroflash-apptainer-test"
+          python3 scripts/make_virtual_data.py "${test_dir}" --scenario positive
+          apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif run \
+            --r1 /work/positive/reads_R1.fq.gz \
+            --r2 /work/positive/reads_R2.fq.gz \
+            --host-fa /work/positive/host.fa \
+            --target-fa /work/positive/target.fa \
+            --decoy-fa /work/positive/decoy.fa \
+            --contam-fa /work/positive/contam.fa \
+            --threads 2 \
+            --out /work/result
+          test -s "${test_dir}/result.json"
+          test -s "${test_dir}/result.tsv"
