@@ -58,7 +58,7 @@ jobs:
           ref: ${{ needs.validate.outputs.tag }}
 
       - name: Cache Cargo data
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -120,9 +120,9 @@ jobs:
           cp "dist/viroflash-${VERSION}-x86_64-unknown-linux-gnu/viroflash" target/release/viroflash
 
       - name: Install Apptainer
-        uses: eWaterCycle/setup-apptainer@4bb22c52d4f63406c49e94c804632975787312b3 # v2.0.0
+        uses: ./.github/actions/setup-apptainer
         with:
-          apptainer-version: 1.5.3
+          version: 1.5.3
 
       - name: Build and test SIF image
         env:
