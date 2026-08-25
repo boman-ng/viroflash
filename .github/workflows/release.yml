@@ -180,7 +180,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }},enable=${{ !contains(needs.validate.outputs.version, '-') }}
             type=raw,value=latest,enable=${{ !contains(needs.validate.outputs.version, '-') }}
 
       - name: Refuse to replace a versioned image
