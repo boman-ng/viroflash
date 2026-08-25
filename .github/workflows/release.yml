@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Validate tag and package version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must have the form vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "${version}" != "${package_version}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match Cargo package version ${package_version}" >&2
+            exit 1
+          fi
+          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  binary:
+    name: Linux binary
+    needs: validate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Cache Cargo data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Build and test Linux binary
+        run: |
+          cargo build --release --locked
+          target/release/viroflash version
+          file target/release/viroflash | grep -q 'x86-64'
+
+      - name: Package binary
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          package="viroflash-${VERSION}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${package}"
+          install -m 0755 target/release/viroflash "dist/${package}/viroflash"
+          install -m 0644 README.md "dist/${package}/README.md"
+          tar --create --gzip --directory dist --file "dist/${package}.tar.gz" "${package}"
+          cd dist
+          sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binary
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  apptainer:
+    name: Apptainer SIF
+    needs: [validate, binary]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Download binary archive
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: binary
+          path: dist
+
+      - name: Stage Linux binary
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          tar --extract --gzip --file "dist/viroflash-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" --directory dist
+          mkdir -p target/release
+          cp "dist/viroflash-${VERSION}-x86_64-unknown-linux-gnu/viroflash" target/release/viroflash
+
+      - name: Install Apptainer
+        uses: eWaterCycle/setup-apptainer@4bb22c52d4f63406c49e94c804632975787312b3 # v2.0.0
+        with:
+          apptainer-version: 1.5.3
+
+      - name: Build and test SIF image
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+        run: |
+          image="viroflash-${VERSION}-x86_64.sif"
+          apptainer build \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "REVISION=${REVISION}" \
+            "dist/${image}" Apptainer.def
+          apptainer run "dist/${image}" version
+          cd dist
+          sha256sum "${image}" > "${image}.sha256"
+
+      - name: Upload SIF image
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: apptainer
+          path: |
+            dist/*.sif
+            dist/*.sif.sha256
+          if-no-files-found: error
+
+  container:
+    name: Multi-platform OCI image
+    needs: [validate, binary, apptainer]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }}
+            type=raw,value=latest,enable=${{ !contains(needs.validate.outputs.version, '-') }}
+
+      - name: Refuse to replace a versioned image
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
+            echo "Versioned OCI tag ${VERSION} already exists and is immutable" >&2
+            exit 1
+          fi
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.validate.outputs.version }}
+            VCS_REF=${{ needs.validate.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, binary, apptainer, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: "{binary,apptainer}"
+          path: release
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: release
+        run: sha256sum --check *.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "${RELEASE_TAG}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Viroflash ${RELEASE_TAG}"
