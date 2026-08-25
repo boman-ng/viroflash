@@ -26,7 +26,7 @@ The workflow publishes:
 - `viroflash-VERSION-x86_64-unknown-linux-gnu.tar.gz`, a Linux amd64 executable built on Ubuntu 22.04, plus the README;
 - `viroflash-VERSION-x86_64.sif`, an immutable Apptainer amd64 image;
 - SHA-256 checksum files for both downloadable artifacts;
-- `ghcr.io/boman-ng/viroflash:VERSION`, `:MAJOR.MINOR`, and, for stable versions, `:latest`, as a multi-platform `linux/amd64` and `linux/arm64` OCI image;
+- `ghcr.io/boman-ng/viroflash:VERSION`, `:MAJOR.MINOR`, and, for stable versions, `:latest`, as a `linux/amd64` OCI image;
 
 The repository deliberately does not publish to crates.io (`publish = false`). The OCI version tag and release assets are immutable. If a released build is defective, fix it in a new patch release; move only the convenience tags (`MAJOR.MINOR` and `latest`) forward. Never replace a versioned asset or OCI tag with different bytes.
 
@@ -52,7 +52,7 @@ apptainer build viroflash.sif Apptainer.def
 apptainer run --bind "$PWD:/work" --pwd /work viroflash.sif version
 ```
 
-Apptainer runs with the invoking host UID and is the preferred image for shared HPC filesystems. The published SIF is amd64-only. The standalone binary targets the Ubuntu 22.04 glibc ABI; the SIF carries that runtime and does not impose a host glibc version requirement. On arm64 HPC systems, use the arm64 OCI image directly or convert its versioned GHCR tag with a native arm64 Apptainer installation.
+Apptainer runs with the invoking host UID and is the preferred image for shared HPC filesystems. Published binaries, SIF files, and OCI images are amd64-only. The standalone binary targets the Ubuntu 22.04 glibc ABI; the SIF carries that runtime and does not impose a host glibc version requirement.
 
 ## Verification
 

@@ -12,7 +12,7 @@ cargo run --locked -- --help
 
 ## Containers
 
-Published releases provide a multi-platform Docker/OCI image at `ghcr.io/boman-ng/viroflash` and an amd64 Apptainer SIF file on the GitHub release. Input datasets and indexes are mounted at runtime; they are never embedded in an image.
+Published releases provide an amd64 Docker/OCI image at `ghcr.io/boman-ng/viroflash` and an amd64 Apptainer SIF file on the GitHub release. Input datasets and indexes are mounted at runtime; they are never embedded in an image.
 
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/boman-ng/viroflash:0.1.0 version
