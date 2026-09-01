@@ -12,6 +12,41 @@ use flate2::Compression;
 use viroflash::index::{self, IndexOptions};
 use viroflash::{run_pipeline, Options};
 
+fn parse_csv_record(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                fields.push(std::mem::take(&mut field));
+            }
+            _ => field.push(ch),
+        }
+    }
+    assert!(!quoted, "unterminated quoted CSV field: {line}");
+    fields.push(field);
+    fields
+}
+
+fn assert_only_perf_json(out_prefix: &std::path::Path) {
+    let parent = out_prefix.parent().unwrap();
+    let label = out_prefix.file_name().unwrap().to_string_lossy();
+    let mut reports: Vec<String> = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&format!("{label}.perf.")))
+        .collect();
+    reports.sort();
+    assert_eq!(reports, vec![format!("{label}.perf.json")]);
+}
+
 /// Deterministic xorshift64 random source.
 struct Rng(u64);
 
@@ -220,9 +255,51 @@ fn assert_detected(summary: &viroflash::RunSummary) {
     assert!(result_html.contains("FDR not validated"));
     assert!(result_html.contains("data-decision=\"PASS\""));
     assert!(result_html.contains("Download core CSV"));
-    assert!(result_csv.starts_with("csv_schema,result_schema,sample_id"));
+    assert!(result_csv
+        .starts_with("csv_schema,result_schema,sample_id,sample_conclusion,qc_status,qc_issues"));
     assert!(result_csv.contains("viroflash.candidates.csv.v1"));
-    assert!(result_csv.contains("not_resolved,PASS"));
+    assert!(result_csv.contains("not_computed,NOT_EVALUATED"));
+    assert!(result_csv.contains("model_adjusted_p_max"));
+    assert!(result_csv.contains("coverage_min"));
+    assert!(result_csv.contains("min_distributed_windows"));
+    assert!(result_csv.contains("manifest_blake3"));
+    let json: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+    let mut csv_lines = result_csv.lines();
+    let csv_header = parse_csv_record(csv_lines.next().unwrap());
+    let csv_record = parse_csv_record(csv_lines.next().unwrap());
+    assert_eq!(csv_header.len(), csv_record.len());
+    assert!(csv_lines.next().is_none());
+    let csv: std::collections::HashMap<_, _> = csv_header
+        .iter()
+        .zip(csv_record.iter())
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let json_candidate = &json["candidates"][0];
+    assert_eq!(csv["member_attribution"], "not_resolved");
+    assert_eq!(csv["sample_id"], json["run"]["sample"].as_str().unwrap());
+    assert_eq!(csv["qc_status"], json["quality_control"]["status"]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(csv["qc_issues"]).unwrap(),
+        json["quality_control"]["issues"]
+    );
+    assert_eq!(
+        csv["input_pairs"].parse::<u64>().unwrap(),
+        json["run"]["input_pairs"].as_u64().unwrap()
+    );
+    assert_eq!(csv["candidate_id"], json_candidate["contig"]);
+    assert_eq!(csv["decision"], json_candidate["decision"]);
+    assert_eq!(
+        csv["validation_read_ends"].parse::<u64>().unwrap(),
+        json_candidate["evidence"]["reads"].as_u64().unwrap()
+    );
+    assert_eq!(
+        csv["coverage_breadth"].parse::<f64>().unwrap(),
+        json_candidate["evidence"]["covered_frac"].as_f64().unwrap()
+    );
+    assert_eq!(
+        csv["manifest_blake3"],
+        json["index"]["manifest_blake3"].as_str().unwrap()
+    );
     for line in result_tsv.lines() {
         assert_eq!(
             line.split('\t').count(),
@@ -231,9 +308,8 @@ fn assert_detected(summary: &viroflash::RunSummary) {
         );
     }
     let perf_json = summary.result_json.with_extension("perf.json");
-    let perf_tsv = summary.result_tsv.with_extension("perf.tsv");
     assert!(perf_json.exists());
-    assert!(perf_tsv.exists());
+    assert_only_perf_json(&summary.result_json.with_extension(""));
     let perf = std::fs::read_to_string(perf_json).unwrap();
     assert!(perf.contains("\"schema\": \"viroflash.perf.v1\""));
     assert!(perf.contains("\"status\": \"success\""));
@@ -260,7 +336,7 @@ fn e2e_index_and_autobuild_paths_agree() {
     };
     let built = index::build_index(&index_opts).unwrap();
     assert!(dir.join("idx.perf.json").is_file());
-    assert!(dir.join("idx.perf.tsv").is_file());
+    assert_only_perf_json(&dir.join("idx"));
     assert_eq!(
         built
             .contigs

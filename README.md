@@ -52,10 +52,10 @@ Open `result.html` in a web browser. It is self-contained, works offline, and su
 | File | Use |
 | --- | --- |
 | `result.html` | Primary human-readable report |
-| `result.csv` | One row per reported candidate for spreadsheets or downstream analysis |
+| `result.csv` | One row per reported candidate, including decision evidence, sampling/QC context, thresholds, and index provenance |
 | `result.json` | Complete structured result and audit metadata |
 | `result.tsv` | Fixed-column compatibility table |
-| `result.perf.json`, `result.perf.tsv` | Runtime and resource metrics |
+| `result.perf.json` | Runtime and resource metrics |
 
 ## Reuse an index
 
