@@ -17,13 +17,13 @@ Releases are immutable and tag-driven. The package version in `Cargo.toml` is th
 Prepare a release as follows:
 
 1. Update the version in `Cargo.toml`, run `cargo check` to refresh `Cargo.lock`, then run `cargo check --locked` to verify it, update user-facing documentation, and merge the change through CI.
-2. Create an annotated or signed tag at the reviewed commit, for example `git tag -s v0.1.0`.
-3. Push only that tag after CI is green: `git push origin v0.1.0`.
+2. Create an annotated or signed tag at the reviewed commit, for example `git tag -s v0.2.0`.
+3. Push only that tag after CI is green: `git push origin v0.2.0`.
 4. Wait for the `Release` workflow. It publishes the GitHub release only after every binary, SIF, and OCI job succeeds.
 
 The workflow publishes:
 
-- `viroflash-VERSION-x86_64-unknown-linux-gnu.tar.gz`, a Linux amd64 executable built on Ubuntu 22.04, plus the README;
+- `viroflash-VERSION-linux-x86_64.tar.gz`, a static Linux amd64 executable plus the README;
 - `viroflash-VERSION-x86_64.sif`, an immutable Apptainer amd64 image;
 - SHA-256 checksum files for both downloadable artifacts;
 - `ghcr.io/boman-ng/viroflash:VERSION`, `:MAJOR.MINOR`, and, for stable versions, `:latest`, as a `linux/amd64` OCI image;
@@ -44,23 +44,28 @@ docker run --rm -v "$PWD:/work" viroflash:local run --help
 
 The Docker image runs as UID/GID `65532`. A bind-mounted output directory must therefore be writable by that identity. Input data and indexes are not embedded in the image.
 
-Build the Linux binary and Apptainer image on Ubuntu 22.04 or an ABI-compatible system:
+Build the static Linux binary and Apptainer image on Ubuntu 22.04 or an ABI-compatible system:
 
 ```bash
-cargo build --release --locked
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker" \
+  cargo build --release --locked --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/viroflash target/release/viroflash
 apptainer build viroflash.sif Apptainer.def
 apptainer run --bind "$PWD:/work" --pwd /work viroflash.sif version
 ```
 
-Apptainer runs with the invoking host UID and is the preferred image for shared HPC filesystems. Published binaries, SIF files, and OCI images are amd64-only. The standalone binary targets the Ubuntu 22.04 glibc ABI; the SIF carries that runtime and does not impose a host glibc version requirement.
+Apptainer runs with the invoking host UID and is the preferred image for shared HPC filesystems. Published binaries, SIF files, and OCI images are amd64-only. The standalone binary is statically linked and has no host glibc or zlib requirement.
 
 ## Verification
 
 Verify downloaded files before use:
 
 ```bash
-sha256sum --check viroflash-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-sha256sum --check viroflash-0.1.0-x86_64.sif.sha256
+sha256sum --check viroflash-0.2.0-linux-x86_64.tar.gz.sha256
+sha256sum --check viroflash-0.2.0-x86_64.sif.sha256
 ```
 
 Prefer versioned image tags or recorded OCI digests in production and HPC workflows. `latest` is only a discovery convenience.

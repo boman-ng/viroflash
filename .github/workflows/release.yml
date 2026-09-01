@@ -66,23 +66,66 @@ jobs:
             target
           key: cargo-release-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
-      - name: Build and test Linux binary
+      - name: Install static Linux toolchain
         run: |
-          cargo build --release --locked
-          target/release/viroflash version
-          file target/release/viroflash | grep -q 'x86-64'
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build and inspect static Linux binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/viroflash
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          "${binary}" version
+          file "${binary}" | grep -q 'x86-64'
+          if readelf --program-headers "${binary}" | grep -q INTERP; then
+            echo "Release binary requires a runtime loader" >&2
+            exit 1
+          fi
+          if readelf --dynamic "${binary}" | grep -q '(NEEDED)'; then
+            echo "Release binary has dynamic runtime dependencies" >&2
+            exit 1
+          fi
 
       - name: Package binary
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          package="viroflash-${VERSION}-x86_64-unknown-linux-gnu"
+          package="viroflash-${VERSION}-linux-x86_64"
           mkdir -p "dist/${package}"
-          install -m 0755 target/release/viroflash "dist/${package}/viroflash"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/viroflash "dist/${package}/viroflash"
           install -m 0644 README.md "dist/${package}/README.md"
           tar --create --gzip --directory dist --file "dist/${package}.tar.gz" "${package}"
           cd dist
           sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+
+      - name: Test unpacked release
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          package="viroflash-${VERSION}-linux-x86_64"
+          unpacked="${RUNNER_TEMP}/viroflash-unpacked"
+          data="${RUNNER_TEMP}/viroflash-release-test"
+          mkdir -p "${unpacked}"
+          tar --extract --gzip --file "dist/${package}.tar.gz" --directory "${unpacked}"
+          "${unpacked}/${package}/viroflash" version
+          python3 scripts/make_virtual_data.py "${data}" --scenario positive
+          "${unpacked}/${package}/viroflash" run \
+            --r1 "${data}/positive/reads_R1.fq.gz" \
+            --r2 "${data}/positive/reads_R2.fq.gz" \
+            --host-fa "${data}/positive/host.fa" \
+            --target-fa "${data}/positive/target.fa" \
+            --decoy-fa "${data}/positive/decoy.fa" \
+            --contam-fa "${data}/positive/contam.fa" \
+            --threads 2 \
+            --out "${data}/result"
+          test -s "${data}/result.html"
+          test -s "${data}/result.csv"
+          test -s "${data}/result.json"
+          test -s "${data}/result.tsv"
 
       - name: Upload binary archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -115,9 +158,9 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          tar --extract --gzip --file "dist/viroflash-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" --directory dist
+          tar --extract --gzip --file "dist/viroflash-${VERSION}-linux-x86_64.tar.gz" --directory dist
           mkdir -p target/release
-          cp "dist/viroflash-${VERSION}-x86_64-unknown-linux-gnu/viroflash" target/release/viroflash
+          cp "dist/viroflash-${VERSION}-linux-x86_64/viroflash" target/release/viroflash
 
       - name: Install Apptainer
         uses: ./.github/actions/setup-apptainer
