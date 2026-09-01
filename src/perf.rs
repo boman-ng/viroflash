@@ -21,17 +21,8 @@ const SCHEMA: &str = "viroflash.perf.v1";
 const SYSINFO_VERSION: &str = "0.38.4";
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone)]
-pub struct PerfPaths {
-    pub json: PathBuf,
-    pub tsv: PathBuf,
-}
-
-pub fn report_paths(out_prefix: &Path) -> PerfPaths {
-    PerfPaths {
-        json: PathBuf::from(format!("{}.perf.json", out_prefix.display())),
-        tsv: PathBuf::from(format!("{}.perf.tsv", out_prefix.display())),
-    }
+pub fn report_path(out_prefix: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.perf.json", out_prefix.display()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -265,7 +256,7 @@ pub(crate) struct PerfMonitor {
     logical_cpu_count: usize,
     physical_core_count: Option<usize>,
     interval: Duration,
-    paths: PerfPaths,
+    path: PathBuf,
     backend: Backend,
 }
 
@@ -278,7 +269,7 @@ impl PerfMonitor {
     ) -> Result<Self, String> {
         let pid = get_current_pid()
             .map_err(|e| format!("Performance monitor cannot obtain the current PID: {e}"))?;
-        let paths = report_paths(out_prefix);
+        let path = report_path(out_prefix);
         let interval = SAMPLE_INTERVAL.max(MINIMUM_CPU_UPDATE_INTERVAL);
         let physical_core_count = System::physical_core_count();
 
@@ -293,7 +284,7 @@ impl PerfMonitor {
                 logical_cpu_count,
                 physical_core_count,
                 interval,
-                paths,
+                path,
                 backend: Backend::Boundary(Box::new(BoundaryBackend {
                     state: Mutex::new(BoundaryState {
                         system,
@@ -330,7 +321,7 @@ impl PerfMonitor {
             logical_cpu_count,
             physical_core_count,
             interval,
-            paths,
+            path,
             backend: Backend::Periodic { tx, handle },
         })
     }
@@ -413,7 +404,7 @@ impl PerfMonitor {
             logical_cpu_count: self.logical_cpu_count,
             physical_core_count: self.physical_core_count,
         };
-        write_reports(&self.paths, &metadata, &collected)?;
+        write_report(&self.path, &metadata, &collected)?;
         Ok(())
     }
 }
@@ -505,28 +496,7 @@ fn fmt_opt(value: Option<f64>) -> String {
     value.map_or_else(|| "null".to_string(), |v| format!("{v:.3}"))
 }
 
-fn fmt_opt_tsv(value: Option<f64>) -> String {
-    value.map_or_else(|| "-".to_string(), |v| format!("{v:.3}"))
-}
-
-fn tsv_escape(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if matches!(c, '\t' | '\n' | '\r') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-fn write_reports(
-    paths: &PerfPaths,
-    meta: &ReportMetadata<'_>,
-    c: &Collected,
-) -> Result<(), String> {
+fn write_report(path: &Path, meta: &ReportMetadata<'_>, c: &Collected) -> Result<(), String> {
     let mut json = String::new();
     json.push_str("{\n");
     json.push_str(&format!("  \"schema\": \"{SCHEMA}\",\n"));
@@ -587,59 +557,24 @@ fn write_reports(
     }
     json.push_str("  ]\n}\n");
 
-    let tsv = format!(
-        "schema\tcommand\tlabel\tstatus\tthread_budget\twork_thread_budget\tsampling_mode\tinterval_ms\twall_time_ms\tsample_count\tvalid_cpu_samples\tprocess_cpu_pct_mean\tprocess_cpu_pct_peak\tprocess_cpu_time_ms\trss_bytes_peak\tvirtual_bytes_peak\tread_bytes\twritten_bytes\tsystem_cpu_pct_mean\tsystem_cpu_pct_peak\tsystem_memory_total_bytes\tsystem_memory_available_bytes_min\tsample_errors\n{SCHEMA}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        meta.command,
-        tsv_escape(meta.label),
-        meta.status,
-        meta.configured_threads,
-        meta.work_thread_budget,
-        meta.sampling_mode,
-        meta.interval_ms,
-        c.wall_time_ms,
-        c.sample_count,
-        c.valid_cpu_samples,
-        fmt_opt_tsv(c.process_cpu_pct_mean),
-        fmt_opt_tsv(c.process_cpu_pct_peak),
-        c.process_cpu_time_ms,
-        c.rss_bytes_peak,
-        c.virtual_bytes_peak,
-        c.read_bytes,
-        c.written_bytes,
-        fmt_opt_tsv(c.system_cpu_pct_mean),
-        fmt_opt_tsv(c.system_cpu_pct_peak),
-        c.system_memory_total_bytes,
-        c.system_memory_available_bytes_min,
-        c.sample_errors
-    );
-
-    write_report_files(paths, json.as_bytes(), tsv.as_bytes())
+    write_report_file(path, json.as_bytes())
 }
 
-fn write_report_files(paths: &PerfPaths, json: &[u8], tsv: &[u8]) -> Result<(), String> {
+fn write_report_file(path: &Path, json: &[u8]) -> Result<(), String> {
     let suffix = format!(".part.{}", std::process::id());
-    let json_tmp = PathBuf::from(format!("{}{}", paths.json.display(), suffix));
-    let tsv_tmp = PathBuf::from(format!("{}{}", paths.tsv.display(), suffix));
+    let json_tmp = PathBuf::from(format!("{}{}", path.display(), suffix));
     let result = (|| {
         write_new(&json_tmp, json)?;
-        write_new(&tsv_tmp, tsv)?;
-        std::fs::rename(&json_tmp, &paths.json).map_err(|e| {
+        std::fs::rename(&json_tmp, path).map_err(|e| {
             format!(
                 "Failed to finalize performance JSON {}: {e}",
-                paths.json.display()
-            )
-        })?;
-        std::fs::rename(&tsv_tmp, &paths.tsv).map_err(|e| {
-            format!(
-                "Failed to finalize performance TSV {}: {e}",
-                paths.tsv.display()
+                path.display()
             )
         })?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&json_tmp);
-        let _ = std::fs::remove_file(&tsv_tmp);
     }
     result
 }
@@ -711,19 +646,11 @@ mod tests {
         let started = Instant::now();
         monitor.complete(Ok(())).unwrap();
         assert!(started.elapsed() < SAMPLE_INTERVAL);
-        let paths = report_paths(&prefix);
-        let json = std::fs::read_to_string(&paths.json).unwrap();
-        let tsv = std::fs::read_to_string(&paths.tsv).unwrap();
+        let path = report_path(&prefix);
+        let json = std::fs::read_to_string(path).unwrap();
         assert!(json.contains("\"schema\": \"viroflash.perf.v1\""));
         assert!(json.contains("\"sampling_mode\": \"periodic\""));
         assert!(json.contains("\"name\": \"test\""));
-        assert!(tsv.starts_with("schema\tcommand\tlabel"));
-        let mut rows = tsv.lines();
-        assert_eq!(
-            rows.next().unwrap().split('\t').count(),
-            rows.next().unwrap().split('\t').count()
-        );
-        assert!(rows.next().is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -736,8 +663,7 @@ mod tests {
         assert_eq!(monitor.work_thread_budget(), 1);
         monitor.stage("test");
         monitor.complete(Ok(())).unwrap();
-        let paths = report_paths(&prefix);
-        let json = std::fs::read_to_string(paths.json).unwrap();
+        let json = std::fs::read_to_string(report_path(&prefix)).unwrap();
         assert!(json.contains("\"sampling_mode\": \"boundary_only\""));
         assert!(json.contains("\"sample_count\": 3"));
         assert!(json.contains("\"name\": \"test\""));

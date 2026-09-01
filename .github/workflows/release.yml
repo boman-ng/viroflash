@@ -126,6 +126,8 @@ jobs:
           test -s "${data}/result.csv"
           test -s "${data}/result.json"
           test -s "${data}/result.tsv"
+          test -s "${data}/result.perf.json"
+          test "$(find "${data}" -maxdepth 1 -type f -name 'result.perf.*' | wc -l)" -eq 1
 
       - name: Upload binary archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

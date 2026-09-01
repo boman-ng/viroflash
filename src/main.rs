@@ -52,12 +52,8 @@ fn run() -> Result<(), String> {
                 "  ref.mmi / bloom.bin / manifest.json / targets.fa (manifest_blake3={})",
                 built.manifest_blake3
             );
-            let perf = viroflash::perf::report_paths(&opt.out_dir);
-            eprintln!(
-                "Performance reports: {} / {}",
-                perf.json.display(),
-                perf.tsv.display()
-            );
+            let perf = viroflash::perf::report_path(&opt.out_dir);
+            eprintln!("Performance report: {}", perf.display());
             Ok(())
         }
         Command::Run(opt) => {
@@ -118,12 +114,8 @@ fn run() -> Result<(), String> {
                 summary.result_html.display(),
                 summary.result_csv.display()
             );
-            let perf = viroflash::perf::report_paths(&opt.out);
-            eprintln!(
-                "Performance reports: {} / {}",
-                perf.json.display(),
-                perf.tsv.display()
-            );
+            let perf = viroflash::perf::report_path(&opt.out);
+            eprintln!("Performance report: {}", perf.display());
             Ok(())
         }
     }
@@ -284,7 +276,7 @@ index: build a reusable index directory (ref.mmi + bloom.bin + manifest.json + t
 run: reuse --index (mutually exclusive with FASTA options; --k must match), or build one\n\
   automatically when --index is omitted.\n\
 Input: sequencing fastq.gz; omit --r2 for single-end mode. Output: <out>.json / <out>.tsv / <out>.html / <out>.csv\n\
-Performance: index and run emit <out>.perf.json / <out>.perf.tsv automatically.",
+Performance: index and run emit <out>.perf.json automatically.",
         env!("CARGO_PKG_VERSION")
     );
 }

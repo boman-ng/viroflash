@@ -12,6 +12,8 @@ use crate::report::{Candidate, SamplingReport, RESULT_SCHEMA};
 
 pub const CSV_SCHEMA: &str = "viroflash.candidates.csv.v1";
 
+const CSV_HEADER: &str = "csv_schema,result_schema,sample_id,sample_conclusion,qc_status,qc_issues,input_pairs,prescreen_pairs,selected_pairs,inclusion_probability,discovery_pairs,validation_pairs,validation_read_sides,map_errors,audit_map_error_reads,audit_overflows,target_validation_unassigned,decoy_validation_unassigned,test_family_size,reported_candidates,threads,k,index_source,index_format_version,manifest_blake3,candidate_id,representative,resolution_level,hypothesis_members,member_attribution,discovery_reads,index_member_count,target_exposure_bases,decision,decision_reasons,adjusted_p_value,log10_adjusted_p_value,adjusted_p_status,model_adjusted_p_max,p_value,log10_p_value,p_value_status,p_resolution_floor,p_resolution_floor_reached,validation_read_ends,covered_bases,contig_length,coverage_breadth,coverage_min,distributed_windows,total_windows,min_distributed_windows,end_rpm,expected_hits,depth_fold,stratum,stratum_decoy_count,background_status,background_scope,background_reads,background_reference_bases,background_cross_stratum_reads,integration_status,split_events,supported_sites,discordant_pairs,plus_strand,minus_strand";
+
 pub struct HumanReportInput<'a> {
     pub sample: &'a str,
     pub threads: usize,
@@ -41,44 +43,76 @@ pub fn write_human_report(
 fn write_csv(path: &Path, input: &HumanReportInput<'_>) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
     let mut out = BufWriter::new(file);
-    writeln!(
-        out,
-        "csv_schema,result_schema,sample_id,candidate_id,representative,resolution_level,hypothesis_members,member_attribution,decision,decision_reasons,adjusted_p_value,log10_adjusted_p_value,adjusted_p_status,p_value,log10_p_value,p_value_status,validation_read_ends,covered_bases,contig_length,coverage_breadth,distributed_windows,total_windows,end_rpm,expected_hits,depth_fold,background_status,background_scope,background_reads,integration_status,split_events,supported_sites,discordant_pairs,plus_strand,minus_strand"
-    )
-    .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    writeln!(out, "{CSV_HEADER}")
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
 
+    let qc_issues = qc_issue_codes(input);
     for candidate in input.candidates {
         let values = [
             csv_cell(CSV_SCHEMA),
             csv_cell(RESULT_SCHEMA),
             csv_cell(input.sample),
+            "not_computed".to_string(),
+            "NOT_EVALUATED".to_string(),
+            csv_cell(&json_str_array(&qc_issues)),
+            input.input_pairs.to_string(),
+            input.prescreen_pairs.to_string(),
+            input.sampling.selected_pairs.to_string(),
+            input.sampling.inclusion_probability.to_string(),
+            input.sampling.discovery_pairs.to_string(),
+            input.sampling.validation_pairs.to_string(),
+            input.sampling.validation_read_sides.to_string(),
+            input.map_errors.to_string(),
+            input.sampling.audit_map_error_reads.to_string(),
+            input.sampling.audit_overflows.to_string(),
+            input.sampling.target_validation_unassigned.to_string(),
+            input.sampling.decoy_validation_unassigned.to_string(),
+            input.test_family_size.to_string(),
+            input.candidates.len().to_string(),
+            input.threads.to_string(),
+            input.k.to_string(),
+            csv_cell(input.index_source),
+            input.index_format_version.to_string(),
+            csv_cell(input.manifest_blake3),
             csv_cell(&candidate.contig),
             csv_cell(&candidate.representative),
             "reference_group".to_string(),
             csv_cell(&json_string_array(&candidate.hypothesis_members)),
             "not_resolved".to_string(),
+            candidate.discovery_reads.to_string(),
+            candidate.index_member_count.to_string(),
+            candidate.target_exposure_bases.to_string(),
             candidate.decision.to_string(),
             csv_cell(&json_str_array(&candidate.decision_reasons)),
             candidate.q_value.to_string(),
             (candidate.ln_q_value / std::f64::consts::LN_10).to_string(),
             probability_status(candidate.q_underflow).to_string(),
+            crate::MODEL_ADJUSTED_P_MAX.to_string(),
             candidate.p_value.to_string(),
             (candidate.ln_p_value / std::f64::consts::LN_10).to_string(),
             probability_status(candidate.p_underflow).to_string(),
+            candidate.p_resolution_floor.to_string(),
+            candidate.p_floor_flag.to_string(),
             candidate.reads.to_string(),
             candidate.covered_bases.to_string(),
             candidate.contig_len.to_string(),
             candidate.covered_frac.to_string(),
+            crate::COVERAGE_MIN.to_string(),
             candidate.distinct_windows.to_string(),
             crate::DISTRIBUTED_WINDOW_BINS.to_string(),
+            crate::MIN_DISTRIBUTED_WINDOWS.to_string(),
             candidate.depth_rpm.to_string(),
             candidate.expected_hits.to_string(),
             candidate
                 .depth_fold
                 .map_or_else(String::new, |value| value.to_string()),
+            csv_cell(&candidate.stratum),
+            candidate.stratum_decoy_count.to_string(),
             candidate.background_status.to_string(),
             candidate.background_scope.to_string(),
             candidate.background_reads.to_string(),
+            candidate.background_reference_bases.to_string(),
+            candidate.background_cross_stratum_reads.to_string(),
             candidate.integration_evidence.to_string(),
             candidate.split_events.to_string(),
             candidate.sites.len().to_string(),
@@ -115,7 +149,7 @@ fn write_html(path: &Path, csv_path: &Path, input: &HumanReportInput<'_>) -> Res
         .iter()
         .filter(|candidate| candidate.integration_evidence != "NONE")
         .count();
-    let qc_issues = qc_issues(input);
+    let qc_issues = qc_issue_codes(input);
     let csv_name = csv_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -224,7 +258,10 @@ fn write_html(path: &Path, csv_path: &Path, input: &HumanReportInput<'_>) -> Res
     body.push_str("</div></section>");
 
     method_html(&mut body, input, &qc_issues);
-    body.push_str("</main><footer><p>Generated offline by viroflash. Machine contract: <code>viroflash.result.v1</code>. Human CSV contract: <code>viroflash.candidates.csv.v1</code>.</p><p>Review the JSON report for complete structured metadata and integration-site details.</p></footer>");
+    let _ = write!(
+        body,
+        "</main><footer><p>Generated offline by viroflash. Machine contract: <code>{RESULT_SCHEMA}</code>. Human CSV contract: <code>{CSV_SCHEMA}</code>.</p><p>Review the JSON report for complete structured metadata and integration-site details.</p></footer>"
+    );
     body.push_str("<script>");
     body.push_str(SCRIPT);
     body.push_str("</script></body></html>");
@@ -566,19 +603,19 @@ fn fact(out: &mut String, label: &str, value: &str) {
     );
 }
 
-fn qc_issues(input: &HumanReportInput<'_>) -> Vec<&'static str> {
+fn qc_issue_codes(input: &HumanReportInput<'_>) -> Vec<&'static str> {
     let mut issues = Vec::new();
     if input.map_errors > 0 || input.sampling.audit_map_error_reads > 0 {
-        issues.push("mapping errors observed");
+        issues.push("mapping_errors_observed");
     }
     if input.sampling.audit_overflows > 0 {
-        issues.push("ambiguity audit overflow observed");
+        issues.push("ambiguity_audit_overflow_observed");
     }
     if input.sampling.target_validation_unassigned > 0 {
-        issues.push("target validation evidence unassigned");
+        issues.push("target_validation_unassigned_observed");
     }
     if input.sampling.decoy_validation_unassigned > 0 {
-        issues.push("decoy validation evidence unassigned");
+        issues.push("decoy_validation_unassigned_observed");
     }
     issues
 }
@@ -779,6 +816,10 @@ mod tests {
         assert!(!html.contains("<h1>sample<script></h1>"));
         assert!(html.contains("No candidates reported"));
         assert!(html.contains("not equivalent to NOT_DETECTED"));
+        assert!(csv.starts_with(
+            "csv_schema,result_schema,sample_id,sample_conclusion,qc_status,qc_issues"
+        ));
+        assert!(csv.contains("background_reference_bases"));
         assert_eq!(csv.lines().count(), 1);
         let _ = std::fs::remove_file(html_path);
         let _ = std::fs::remove_file(csv_path);
