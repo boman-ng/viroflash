@@ -200,6 +200,8 @@ fn assert_detected(summary: &viroflash::RunSummary) {
 
     assert!(summary.result_json.exists());
     assert!(summary.result_tsv.exists());
+    assert!(summary.result_html.exists());
+    assert!(summary.result_csv.exists());
     let result_json = std::fs::read_to_string(&summary.result_json).unwrap();
     let result_tsv = std::fs::read_to_string(&summary.result_tsv).unwrap();
     assert!(result_json.contains("\"schema\": \"viroflash.result.v1\""));
@@ -211,6 +213,16 @@ fn assert_detected(summary: &viroflash::RunSummary) {
     assert!(result_tsv.contains("\treference_group\t"));
     assert!(result_tsv.contains("qc_status=NOT_EVALUATED"));
     assert!(result_tsv.contains("member_attribution=not_resolved"));
+    let result_html = std::fs::read_to_string(&summary.result_html).unwrap();
+    let result_csv = std::fs::read_to_string(&summary.result_csv).unwrap();
+    assert!(result_html.contains("viroflash evidence report"));
+    assert!(result_html.contains("Interpretation boundary"));
+    assert!(result_html.contains("FDR not validated"));
+    assert!(result_html.contains("data-decision=\"PASS\""));
+    assert!(result_html.contains("Download core CSV"));
+    assert!(result_csv.starts_with("csv_schema,result_schema,sample_id"));
+    assert!(result_csv.contains("viroflash.candidates.csv.v1"));
+    assert!(result_csv.contains("not_resolved,PASS"));
     for line in result_tsv.lines() {
         assert_eq!(
             line.split('\t').count(),

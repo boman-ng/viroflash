@@ -52,8 +52,25 @@ jobs:
       - name: Test release profile
         run: cargo test --release --locked
 
-      - name: Build production binary
-        run: cargo build --release --locked
+      - name: Build production static binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          binary=target/x86_64-unknown-linux-musl/release/viroflash
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          "${binary}" version
+          if readelf --program-headers "${binary}" | grep -q INTERP; then
+            echo "Release binary requires a runtime loader" >&2
+            exit 1
+          fi
+          if readelf --dynamic "${binary}" | grep -q '(NEEDED)'; then
+            echo "Release binary has dynamic runtime dependencies" >&2
+            exit 1
+          fi
 
   docker:
     name: Docker image

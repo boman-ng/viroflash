@@ -19,6 +19,7 @@ pub mod reference;
 pub mod report;
 pub mod sampling;
 pub mod stats;
+pub mod visual_report;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,8 @@ pub struct RunSummary {
     pub candidates: Vec<report::Candidate>,
     pub result_json: PathBuf,
     pub result_tsv: PathBuf,
+    pub result_html: PathBuf,
+    pub result_csv: PathBuf,
 }
 
 pub fn run_pipeline(opt: &Options) -> Result<RunSummary, String> {
@@ -256,6 +259,23 @@ fn run_pipeline_inner(
         test_family_size,
         &candidates,
     )?;
+    let (result_html, result_csv) = visual_report::write_human_report(
+        &opt.out,
+        &visual_report::HumanReportInput {
+            sample,
+            threads: opt.threads,
+            k: opt.k,
+            input_pairs,
+            prescreen_pairs,
+            map_errors,
+            index_source,
+            index_format_version: built.format_version,
+            manifest_blake3: &built.manifest_blake3,
+            sampling: &sampling,
+            test_family_size,
+            candidates: &candidates,
+        },
+    )?;
     eprintln!("[stage] reporting {:.1}s", t0.elapsed().as_secs_f64());
 
     monitor.stage("cleanup");
@@ -276,6 +296,8 @@ fn run_pipeline_inner(
         candidates,
         result_json,
         result_tsv,
+        result_html,
+        result_csv,
     })
 }
 

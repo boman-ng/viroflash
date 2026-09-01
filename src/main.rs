@@ -112,9 +112,11 @@ fn run() -> Result<(), String> {
                 );
             }
             eprintln!(
-                "Reports: {} / {}",
+                "Reports: {} / {} / {} / {}",
                 summary.result_json.display(),
-                summary.result_tsv.display()
+                summary.result_tsv.display(),
+                summary.result_html.display(),
+                summary.result_csv.display()
             );
             let perf = viroflash::perf::report_paths(&opt.out);
             eprintln!(
@@ -281,7 +283,7 @@ index: build a reusable index directory (ref.mmi + bloom.bin + manifest.json + t
   Without --decoy-fa, generate decoys using --decoy-ani/--decoy-per-layer/--decoy-seed.\n\
 run: reuse --index (mutually exclusive with FASTA options; --k must match), or build one\n\
   automatically when --index is omitted.\n\
-Input: sequencing fastq.gz; omit --r2 for single-end mode. Output: <out>.json / <out>.tsv\n\
+Input: sequencing fastq.gz; omit --r2 for single-end mode. Output: <out>.json / <out>.tsv / <out>.html / <out>.csv\n\
 Performance: index and run emit <out>.perf.json / <out>.perf.tsv automatically.",
         env!("CARGO_PKG_VERSION")
     );
