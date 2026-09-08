@@ -56,7 +56,11 @@ Build the release binary first, then the image:
 
 ```bash
 cargo build --release --locked
-apptainer build viroflash.sif Apptainer.def
+apptainer build --force viroflash.sif Apptainer.def
+metadata="$(apptainer inspect --json viroflash.sif)"
+jq -e '.data.attributes.labels["org.opencontainers.image.version"] == "dev"' <<<"${metadata}"
+jq -e '.data.attributes.labels["org.opencontainers.image.revision"] == "unknown"' <<<"${metadata}"
+jq -e '.data.attributes.labels["org.opencontainers.image.description"] == "Reference-group fragment evidence command-line tool"' <<<"${metadata}"
 test_dir="$(mktemp -d)"
 python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
 apptainer run viroflash.sif --help
