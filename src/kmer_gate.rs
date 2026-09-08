@@ -10,7 +10,7 @@ const HASH_COUNT: u32 = 4;
 const BITS_PER_KMER: usize = 16;
 const MAGIC: &[u8; 8] = b"VFBLOOM1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BloomSummary {
     pub inserted_kmers: u64,
     pub bit_count: u64,
@@ -24,6 +24,13 @@ pub struct TargetKmerBloom {
     k: usize,
     words: Vec<u64>,
     inserted_kmers: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateEvaluation {
+    Pass,
+    Negative,
+    NotEvaluable,
 }
 
 impl TargetKmerBloom {
@@ -48,14 +55,34 @@ impl TargetKmerBloom {
         bloom
     }
 
-    pub fn passes_target_kmer_gate(&self, r1: &[u8], r2: Option<&[u8]>) -> bool {
-        self.read_has_kmer(r1) || r2.is_some_and(|sequence| self.read_has_kmer(sequence))
+    pub fn evaluate_fragment(&self, r1: &[u8], r2: Option<&[u8]>) -> GateEvaluation {
+        let left = self.read_gate(r1);
+        let right = r2.map(|sequence| self.read_gate(sequence));
+        if left == GateEvaluation::Pass || right == Some(GateEvaluation::Pass) {
+            GateEvaluation::Pass
+        } else if left == GateEvaluation::NotEvaluable
+            && right.is_none_or(|evaluation| evaluation == GateEvaluation::NotEvaluable)
+        {
+            GateEvaluation::NotEvaluable
+        } else {
+            GateEvaluation::Negative
+        }
     }
 
-    fn read_has_kmer(&self, sequence: &[u8]) -> bool {
+    fn read_gate(&self, sequence: &[u8]) -> GateEvaluation {
         let mut present = false;
-        for_each_kmer(sequence, self.k, |kmer| present |= self.contains(kmer));
-        present
+        let mut evaluable = false;
+        for_each_kmer(sequence, self.k, |kmer| {
+            evaluable = true;
+            present |= self.contains(kmer);
+        });
+        if present {
+            GateEvaluation::Pass
+        } else if evaluable {
+            GateEvaluation::Negative
+        } else {
+            GateEvaluation::NotEvaluable
+        }
     }
 
     fn insert(&mut self, kmer: u64) {
@@ -229,9 +256,18 @@ mod tests {
             sequence: b"ACGTACGTACGTACGTACGTA".to_vec(),
         }];
         let bloom = TargetKmerBloom::build(&records, 21);
-        assert!(bloom.passes_target_kmer_gate(b"ACGTACGTACGTACGTACGTA", None));
-        assert!(bloom.passes_target_kmer_gate(b"NNNN", Some(b"TACGTACGTACGTACGTACGT")));
-        assert!(!bloom.passes_target_kmer_gate(b"NNNN", None));
+        assert_eq!(
+            bloom.evaluate_fragment(b"ACGTACGTACGTACGTACGTA", None),
+            GateEvaluation::Pass
+        );
+        assert_eq!(
+            bloom.evaluate_fragment(b"NNNN", Some(b"TACGTACGTACGTACGTACGT")),
+            GateEvaluation::Pass
+        );
+        assert_eq!(
+            bloom.evaluate_fragment(b"NNNN", None),
+            GateEvaluation::NotEvaluable
+        );
     }
 
     #[test]
@@ -241,6 +277,28 @@ mod tests {
             sequence: b"ACGTMRWSYKVHDBNACGTMR".to_vec(),
         }];
         let bloom = TargetKmerBloom::build(&records, 21);
-        assert!(bloom.passes_target_kmer_gate(b"acgtmrwsykvhdbnacgtmr", None));
+        assert_eq!(
+            bloom.evaluate_fragment(b"acgtmrwsykvhdbnacgtmr", None),
+            GateEvaluation::Pass
+        );
+    }
+
+    #[test]
+    fn fragments_without_an_encodable_kmer_are_not_evaluable() {
+        let bloom = TargetKmerBloom::build(
+            &[FastaRecord {
+                id: "target".into(),
+                sequence: b"ACGTACGTACGTACGTACGTACGT".to_vec(),
+            }],
+            21,
+        );
+        assert_eq!(
+            bloom.evaluate_fragment(b"ACGTACGTACGTACGTACGT", None),
+            GateEvaluation::NotEvaluable
+        );
+        assert_eq!(
+            bloom.evaluate_fragment(b"XXXXXXXXXXXXXXXXXXXXX", None),
+            GateEvaluation::NotEvaluable
+        );
     }
 }

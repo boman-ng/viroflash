@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
 use statrs::distribution::{DiscreteCDF, Hypergeometric};
 
 use crate::competitive_alignment::{FragmentAdjudication, FragmentAlignmentEvidence};
@@ -8,7 +9,8 @@ use crate::reference_group::ReferenceGroup;
 
 pub const INTERVAL_METHOD: &str = "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EvidenceStatus {
     ReferenceSignalObserved,
     IndeterminateEvidence,
@@ -22,7 +24,8 @@ impl EvidenceStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AttributionStatus {
     ResolvedToReferenceGroup,
     AmbiguousWithinGroup,
@@ -53,7 +56,7 @@ pub struct TargetGroupEvidence {
     pub supporting_selected_fragments: u64,
     pub host_confounded_fragments: u64,
     pub cross_group_ambiguous_fragments: u64,
-    intervals: Vec<(u64, u64)>,
+    intervals: IntervalUnion,
     pub split_events: u64,
     pub discordant_fragments: u64,
 }
@@ -65,7 +68,7 @@ impl TargetGroupEvidence {
             supporting_selected_fragments: 0,
             host_confounded_fragments: 0,
             cross_group_ambiguous_fragments: 0,
-            intervals: Vec::new(),
+            intervals: IntervalUnion::default(),
             split_events: 0,
             discordant_fragments: 0,
         }
@@ -96,17 +99,19 @@ impl TargetGroupEvidence {
         }
     }
     pub fn covered_bases(&self) -> u64 {
-        merged_covered_bases(&self.intervals)
+        self.intervals.covered_bases()
     }
     pub fn occupied_windows(&self, bins: usize) -> u64 {
         let mut occupied = BTreeSet::new();
-        for &(start, end) in &self.intervals {
-            for position in start..end.min(self.group.representative_length) {
-                occupied.insert(
-                    (position * bins as u64 / self.group.representative_length)
-                        .min(bins as u64 - 1),
-                );
+        for (&start, &end) in &self.intervals.segments {
+            let end = end.min(self.group.representative_length);
+            if start >= end {
+                continue;
             }
+            let first = start * bins as u64 / self.group.representative_length;
+            let last =
+                ((end - 1) * bins as u64 / self.group.representative_length).min(bins as u64 - 1);
+            occupied.extend(first..=last);
         }
         occupied.len() as u64
     }
@@ -145,14 +150,11 @@ impl EvidenceAccumulator {
             FragmentAdjudication::Supporting(group) => {
                 let target = &mut self.groups[*group];
                 target.supporting_selected_fragments += 1;
-                target.intervals.extend(
-                    evidence
-                        .target_intervals
-                        .get(group)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                );
+                for &(start, end) in evidence.target_intervals.get(group).into_iter().flatten() {
+                    target
+                        .intervals
+                        .insert(start, end.min(target.group.representative_length));
+                }
                 target.split_events += u64::from(evidence.split_groups.contains(group));
                 target.discordant_fragments +=
                     u64::from(evidence.discordant_groups.contains(group));
@@ -264,25 +266,43 @@ fn last_true(
     Ok(low)
 }
 
-fn merged_covered_bases(intervals: &[(u64, u64)]) -> u64 {
-    let mut sorted = intervals.to_vec();
-    sorted.sort_unstable();
-    let mut total = 0;
-    let mut current: Option<(u64, u64)> = None;
-    for (start, end) in sorted {
-        match current {
-            Some((left, right)) if start <= right => current = Some((left, right.max(end))),
-            Some((left, right)) => {
-                total += right - left;
-                current = Some((start, end));
-            }
-            None => current = Some((start, end)),
+#[derive(Debug, Clone, Default)]
+struct IntervalUnion {
+    segments: BTreeMap<u64, u64>,
+}
+
+impl IntervalUnion {
+    fn insert(&mut self, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
         }
+        if let Some((&previous_start, &previous_end)) = self.segments.range(..=start).next_back() {
+            if previous_end >= start {
+                start = previous_start;
+                end = end.max(previous_end);
+                self.segments.remove(&previous_start);
+            }
+        }
+        loop {
+            let next = self
+                .segments
+                .range(start..)
+                .next()
+                .map(|(&left, &right)| (left, right));
+            match next {
+                Some((next_start, next_end)) if next_start <= end => {
+                    end = end.max(next_end);
+                    self.segments.remove(&next_start);
+                }
+                _ => break,
+            }
+        }
+        self.segments.insert(start, end);
     }
-    if let Some((left, right)) = current {
-        total += right - left;
+
+    fn covered_bases(&self) -> u64 {
+        self.segments.iter().map(|(start, end)| end - start).sum()
     }
-    total
 }
 
 #[cfg(test)]
@@ -350,5 +370,15 @@ mod tests {
                 level: 0.95
             }
         );
+    }
+
+    #[test]
+    fn coverage_state_is_bounded_by_merged_reference_intervals() {
+        let mut intervals = IntervalUnion::default();
+        for offset in 0..100_000 {
+            intervals.insert(offset % 50, 100 + offset % 50);
+        }
+        assert_eq!(intervals.segments.len(), 1);
+        assert_eq!(intervals.covered_bases(), 149);
     }
 }

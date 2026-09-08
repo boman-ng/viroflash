@@ -9,22 +9,26 @@ use crate::evidence::{
 };
 use crate::fastq_input::InputCensus;
 use crate::sampling_design::SamplingDesign;
+use serde::Serialize;
 
 pub const REPORT_SCHEMA: &str = "viroflash.evidence-report.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnalysisStatus {
     ConformantComplete,
+    ConformantWithLimitations,
 }
 impl AnalysisStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConformantComplete => "CONFORMANT_COMPLETE",
+            Self::ConformantWithLimitations => "CONFORMANT_WITH_LIMITATIONS",
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunEvidence {
     pub sample_id: String,
     pub analysis_status: AnalysisStatus,
@@ -46,7 +50,7 @@ pub struct RunEvidence {
     pub read_ends_per_fragment: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetSignal {
     pub target_group_id: String,
     pub representative_id: String,
@@ -72,7 +76,7 @@ pub struct TargetSignal {
     pub limitation_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EvidenceReport {
     pub run: RunEvidence,
     pub target_signals: Vec<TargetSignal>,
@@ -86,6 +90,7 @@ pub struct ReportInputs<'a> {
     pub prescreen_passed_fragments: u64,
     pub profile: AnalysisProfile,
     pub index_digest: String,
+    pub unevaluable_fragments: u64,
 }
 
 pub fn build_evidence_report(
@@ -134,11 +139,24 @@ pub fn build_evidence_report(
             limitation_codes: Vec::new(),
         });
     }
+    let reason_codes = (inputs.unevaluable_fragments > 0)
+        .then(|| {
+            format!(
+                "TARGET_KMER_NOT_EVALUABLE_SELECTED_FRAGMENTS={}",
+                inputs.unevaluable_fragments
+            )
+        })
+        .into_iter()
+        .collect();
     Ok(EvidenceReport {
         run: RunEvidence {
             sample_id: inputs.sample_id,
-            analysis_status: AnalysisStatus::ConformantComplete,
-            reason_codes: Vec::new(),
+            analysis_status: if inputs.unevaluable_fragments == 0 {
+                AnalysisStatus::ConformantComplete
+            } else {
+                AnalysisStatus::ConformantWithLimitations
+            },
+            reason_codes,
             input_mode: inputs.census.input_mode.into(),
             input_fragments: inputs.census.fragments,
             selected_fragments: inputs.selected_fragments,
@@ -327,14 +345,20 @@ pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), Str
             signal.representative_length, signal.occupied_windows, signal.host_confounded_fragments, signal.cross_group_ambiguous_fragments, signal.split_events,
             signal.discordant_fragments, signal.integration_status));
     }
+    let embedded_report = serde_json::to_string(report)
+        .map_err(|error| format!("Cannot serialize HTML EvidenceReport model: {error}"))?
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
     let html_document = format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Viroflash evidence report</title><style>body{{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#17202a}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccd1d1;padding:.45rem;text-align:left}}code{{overflow-wrap:anywhere}}.boundary{{background:#fff4d6;padding:1rem;border-left:4px solid #d68910}}</style></head><body>
 <h1>Viroflash Evidence Report</h1><section><h2>Interpretation boundary</h2><p class="boundary">Profile-attributed fragment fraction measures input-library fragments attributed under the frozen Viroflash profile. It is not viral load, absolute quantitation, or a clinical positive/negative conclusion.</p></section>
-<section><h2>Run integrity</h2><dl><dt>Status</dt><dd>{}</dd><dt>Sample</dt><dd>{}</dd><dt>Input</dt><dd>{} fragments; {} selected at probability {}</dd><dt>Profile digest</dt><dd><code>{}</code></dd><dt>Index digest</dt><dd><code>{}</code></dd><dt>Input digest</dt><dd><code>{}</code></dd></dl></section>
+<section><h2>Run integrity</h2><dl><dt>Status</dt><dd>{}</dd><dt>Reason codes</dt><dd>{}</dd><dt>Sample</dt><dd>{}</dd><dt>Input</dt><dd>{} fragments; {} selected at probability {}</dd><dt>Profile digest</dt><dd><code>{}</code></dd><dt>Index digest</dt><dd><code>{}</code></dd><dt>Input digest</dt><dd><code>{}</code></dd></dl></section>
 <section><h2>Observed target signals</h2><table><thead><tr><th>Group</th><th>Representative</th><th>Members</th><th>Supporting fragments</th><th>Fraction</th><th>Simultaneous interval</th><th>Evidence</th><th>Attribution</th><th>Coverage</th><th>Windows</th><th>Host-confounded</th><th>Cross-group ambiguous</th><th>Split</th><th>Discordant</th><th>Integration</th></tr></thead><tbody>{}</tbody></table></section>
 <section><h2>Evidence detail</h2><p>The table reports every model value for host conflict, cross-group ambiguity, coverage, ten occupied windows, split events, discordance, and integration. These diagnostics do not create a decision cutoff.</p></section>
-<section><h2>Methods and limitations</h2><p>FASTQ is fully validated and counted in pass 1. Pass 2 applies deterministic BLAKE3 Bernoulli fragment inclusion, a target-only 21-mer Bloom workload gate, and HOST+TARGET competitive minimap2 alignment. Intervals use simultaneous equal-tailed exact hypergeometric inversion. Unknown contaminants and absent references remain unmodeled.</p></section></body></html>"#,
+<section><h2>Methods and limitations</h2><p>FASTQ is fully validated and counted in pass 1. Pass 2 applies deterministic BLAKE3 Bernoulli fragment inclusion, a target-only 21-mer Bloom workload gate, and HOST+TARGET competitive minimap2 alignment. Intervals use simultaneous equal-tailed exact hypergeometric inversion. References absent from the index remain unmodeled.</p></section><script id="evidence-report" type="application/json">{}</script></body></html>"#,
         report.run.analysis_status.as_str(),
+        html(&report.run.reason_codes.join(";")),
         html(&report.run.sample_id),
         report.run.input_fragments,
         report.run.selected_fragments,
@@ -342,7 +366,8 @@ pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), Str
         report.run.profile_digest,
         report.run.index_digest,
         report.run.input_digest,
-        rows
+        rows,
+        embedded_report
     );
     atomic_write(path, html_document.as_bytes())
 }

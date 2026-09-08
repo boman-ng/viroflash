@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{mpsc::sync_channel, Arc, Mutex};
 
 use minimap2::{Aligner, Built, Mapping, Strand};
 
@@ -72,9 +73,12 @@ pub struct AlignmentHit {
     pub target_group_ordinal: Option<usize>,
     pub alignment_score: i32,
     pub query_length: u32,
+    pub query_start: u32,
+    pub query_end: u32,
     pub target_start: u64,
     pub target_end: u64,
     pub forward: bool,
+    pub supplementary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,9 +117,12 @@ fn hits_of(
                 target_group_ordinal: contig.target_group_ordinal,
                 alignment_score: alignment.alignment_score.unwrap_or(0),
                 query_length: query_length as u32,
+                query_start: mapping.query_start.max(0) as u32,
+                query_end: mapping.query_end.max(0) as u32,
                 target_start: mapping.target_start.max(0) as u64,
                 target_end: mapping.target_end.max(0) as u64,
                 forward: matches!(mapping.strand, Strand::Forward),
+                supplementary: mapping.is_supplementary,
             })
         })
         .collect()
@@ -130,6 +137,7 @@ fn normalized_score(left: &AlignmentHit, right: &AlignmentHit) -> Ordering {
 struct EndEvidence {
     targets: BTreeSet<usize>,
     target_hits: BTreeMap<usize, Vec<AlignmentHit>>,
+    split_groups: BTreeSet<usize>,
     has_host: bool,
     host_confounded: bool,
 }
@@ -167,6 +175,18 @@ fn adjudicate_end(hits: &[AlignmentHit]) -> EndEvidence {
             .or_default()
             .push(hit.clone());
     }
+    for group in &result.targets {
+        let group_hits = hits
+            .iter()
+            .filter(|hit| {
+                hit.role == ReferenceRole::Target && hit.target_group_ordinal == Some(*group)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if has_split_geometry(&group_hits) {
+            result.split_groups.insert(*group);
+        }
+    }
     result
 }
 
@@ -174,12 +194,13 @@ pub fn adjudicate_fragment(r1: &[AlignmentHit], r2: &[AlignmentHit]) -> Fragment
     let left = adjudicate_end(r1);
     let right = adjudicate_end(r2);
     let mut target_intervals: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
-    let mut split_groups = BTreeSet::new();
+    let split_groups = left
+        .split_groups
+        .union(&right.split_groups)
+        .copied()
+        .collect();
     for end in [&left, &right] {
         for (group, hits) in &end.target_hits {
-            if hits.len() > 1 {
-                split_groups.insert(*group);
-            }
             target_intervals
                 .entry(*group)
                 .or_default()
@@ -236,6 +257,89 @@ pub fn adjudicate_fragment(r1: &[AlignmentHit], r2: &[AlignmentHit]) -> Fragment
     }
 }
 
+fn has_split_geometry(hits: &[AlignmentHit]) -> bool {
+    hits.iter().enumerate().any(|(index, left)| {
+        hits[index + 1..].iter().any(|right| {
+            (left.supplementary || right.supplementary)
+                && (left.query_end <= right.query_start || right.query_end <= left.query_start)
+        })
+    })
+}
+
+pub fn align_fragments_bounded<N, S>(
+    index_path: &Path,
+    contigs: &std::collections::HashMap<String, ReferenceContig>,
+    threads: usize,
+    mut next_fragment: N,
+    mut sink: S,
+) -> Result<(), String>
+where
+    N: FnMut() -> Result<Option<Fragment>, String>,
+    S: FnMut(FragmentAlignmentEvidence),
+{
+    let aligners = (0..threads)
+        .map(|_| CompetitiveAligner::open(index_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (task_sender, task_receiver) = sync_channel::<Fragment>(threads);
+    let task_receiver = Arc::new(Mutex::new(task_receiver));
+    let (result_sender, result_receiver) = sync_channel(threads);
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::new();
+        for aligner in aligners {
+            let task_receiver = Arc::clone(&task_receiver);
+            let result_sender = result_sender.clone();
+            handles.push(scope.spawn(move || loop {
+                let task = task_receiver.lock().expect("task receiver lock").recv();
+                let Ok(fragment) = task else { break };
+                let ordinal = fragment.ordinal;
+                let result = aligner.align_fragment_competitively(&fragment, contigs);
+                if result_sender.send((ordinal, result)).is_err() {
+                    break;
+                }
+            }));
+        }
+        drop(result_sender);
+        let processing = (|| -> Result<(), String> {
+            loop {
+                let mut submitted = 0;
+                while submitted < threads {
+                    let Some(fragment) = next_fragment()? else {
+                        break;
+                    };
+                    task_sender
+                        .send(fragment)
+                        .map_err(|_| "Alignment worker queue closed".to_string())?;
+                    submitted += 1;
+                }
+                if submitted == 0 {
+                    break;
+                }
+                let mut completed = Vec::with_capacity(submitted);
+                for _ in 0..submitted {
+                    completed.push(
+                        result_receiver
+                            .recv()
+                            .map_err(|_| "Alignment worker result queue closed".to_string())?,
+                    );
+                }
+                completed.sort_by_key(|(ordinal, _)| *ordinal);
+                for (_, result) in completed {
+                    sink(result?);
+                }
+            }
+            Ok(())
+        })();
+        drop(task_sender);
+        let mut join_error = None;
+        for handle in handles {
+            if handle.join().is_err() {
+                join_error = Some("Alignment worker panicked".to_string());
+            }
+        }
+        processing.and(join_error.map_or(Ok(()), Err))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,9 +350,12 @@ mod tests {
             target_group_ordinal: Some(group),
             alignment_score: score,
             query_length: 100,
+            query_start: 0,
+            query_end: 89,
             target_start: 1,
             target_end: 90,
             forward: true,
+            supplementary: false,
         }
     }
     fn host(score: i32) -> AlignmentHit {
@@ -257,9 +364,12 @@ mod tests {
             target_group_ordinal: None,
             alignment_score: score,
             query_length: 100,
+            query_start: 0,
+            query_end: 89,
             target_start: 1,
             target_end: 90,
             forward: true,
+            supplementary: false,
         }
     }
 
@@ -301,5 +411,32 @@ mod tests {
         let evidence = adjudicate_fragment(&[target(0, 90)], &[host(90)]);
         assert_eq!(evidence.adjudication, FragmentAdjudication::Supporting(0));
         assert_eq!(evidence.discordant_groups, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn split_requires_supplementary_flag_and_disjoint_query_geometry() {
+        let primary = AlignmentHit {
+            query_start: 0,
+            query_end: 40,
+            ..target(0, 90)
+        };
+        let supplementary = AlignmentHit {
+            alignment_score: 35,
+            query_start: 60,
+            query_end: 100,
+            supplementary: true,
+            ..target(0, 90)
+        };
+        let secondary = AlignmentHit {
+            supplementary: false,
+            ..supplementary.clone()
+        };
+        assert_eq!(
+            adjudicate_fragment(&[primary.clone(), supplementary], &[]).split_groups,
+            BTreeSet::from([0])
+        );
+        assert!(adjudicate_fragment(&[primary, secondary], &[])
+            .split_groups
+            .is_empty());
     }
 }

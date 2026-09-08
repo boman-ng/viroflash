@@ -77,6 +77,9 @@ impl PerformanceMonitor {
         let metrics = process_metrics();
         let (cpu, _, read, write) = metrics.unwrap_or_default();
         self.telemetry_available &= metrics.is_some();
+        let high_water_rss = high_water_rss_bytes();
+        self.telemetry_available &= high_water_rss.is_some();
+        self.peak_rss = self.peak_rss.max(high_water_rss.unwrap_or_default());
         PerformanceReport {
             schema_id: "viroflash.perf.v1",
             status,
@@ -102,6 +105,28 @@ impl PerformanceMonitor {
             sample_errors: errors,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn high_water_rss_bytes() -> Option<u64> {
+    parse_linux_high_water_rss(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn high_water_rss_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_high_water_rss(status: &str) -> Option<u64> {
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_ascii_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    value.checked_mul(1024)
 }
 
 fn process_metrics() -> Option<(u64, u64, u64, u64)> {
@@ -152,4 +177,17 @@ pub fn write_perf_json(path: &Path, report: &PerformanceReport) -> Result<(), St
 
 pub fn stage_start() -> Instant {
     Instant::now()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_linux_resident_set_high_water_mark() {
+        assert_eq!(
+            parse_linux_high_water_rss("Name:\tviroflash\nVmHWM:\t1234 kB\nVmRSS:\t1000 kB\n"),
+            Some(1_263_616)
+        );
+    }
 }

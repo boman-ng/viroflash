@@ -1,24 +1,34 @@
+use crate::analysis_profile::AnalysisProfile;
 use crate::fastq_input::InputCensus;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingDesign {
     pub selection_probability: f64,
+    pub minimum_relevant_fragments: u64,
 }
 
 pub fn derive_sampling_design(
     census: &InputCensus,
     target_family_size: usize,
-    delta: f64,
-    beta: f64,
+    profile: AnalysisProfile,
 ) -> Result<SamplingDesign, String> {
     if target_family_size == 0 {
         return Err("Reference index contains no target groups".into());
     }
-    let minimum_fragments = (delta * census.fragments as f64).ceil().max(1.0);
-    let group_miss = beta / target_family_size as f64;
-    let probability = -f64::exp_m1(group_miss.ln() / minimum_fragments).min(1.0);
+    let minimum_relevant_fragments = profile.minimum_relevant_fragments(census.fragments);
+    let group_miss = profile.familywise_miss_probability / target_family_size as f64;
+    let mut probability =
+        -f64::exp_m1(group_miss.ln() / minimum_relevant_fragments as f64).min(1.0);
+    while (1.0 - probability).powf(minimum_relevant_fragments as f64) > group_miss {
+        probability = probability.next_up();
+    }
+    assert!(
+        (1.0 - probability).powf(minimum_relevant_fragments as f64) <= group_miss,
+        "rounded sampling probability exceeds the frozen miss budget"
+    );
     Ok(SamplingDesign {
         selection_probability: probability,
+        minimum_relevant_fragments,
     })
 }
 
@@ -63,15 +73,23 @@ mod tests {
 
     #[test]
     fn probability_obeys_formula_and_boundaries() {
-        let design = derive_sampling_design(&census(1_000_000), 20, 1e-5, 0.05).unwrap();
+        let design =
+            derive_sampling_design(&census(1_000_000), 20, AnalysisProfile::FROZEN).unwrap();
         let expected = 1.0 - (0.05_f64 / 20.0).powf(1.0 / 10.0);
         assert!((design.selection_probability - expected).abs() < 1e-15);
-        assert_eq!(
-            derive_sampling_design(&census(1), 1, 1e-5, 0.05)
-                .unwrap()
-                .selection_probability,
-            0.95
-        );
+        let census_design = derive_sampling_design(&census(1), 1, AnalysisProfile::FROZEN).unwrap();
+        assert!(census_design.selection_probability >= 0.95);
+        assert!(1.0 - census_design.selection_probability <= 0.05);
+    }
+
+    #[test]
+    fn decimal_boundary_uses_exact_rational_ceiling_and_meets_miss_budget() {
+        let design =
+            derive_sampling_design(&census(10_000_000), 20, AnalysisProfile::FROZEN).unwrap();
+        assert_eq!(design.minimum_relevant_fragments, 100);
+        let group_miss = AnalysisProfile::FROZEN.familywise_miss_probability / 20.0;
+        let actual_miss = (1.0 - design.selection_probability).powi(100);
+        assert!(actual_miss <= group_miss, "{actual_miss} > {group_miss}");
     }
 
     #[test]

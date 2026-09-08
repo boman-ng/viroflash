@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::analysis_profile::AnalysisProfile;
-use crate::competitive_alignment::CompetitiveAligner;
+use crate::competitive_alignment::align_fragments_bounded;
 use crate::evidence::EvidenceAccumulator;
-use crate::fastq_input::{census_fastq, compute_input_digest, FragmentReader};
+use crate::fastq_input::{census_fastq, FragmentReader};
+use crate::kmer_gate::GateEvaluation;
 use crate::performance_report::{stage_start, write_perf_json, PerformanceMonitor, StageTimes};
 use crate::reference_index::load_index;
 use crate::report::{build_evidence_report, write_report_csv, write_report_html, ReportInputs};
@@ -43,6 +44,7 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
     }
     let mut stages = StageTimes::default();
     let mut counts = (0, 0, 0, 0);
+    let mut unevaluable_fragments = 0;
     let result = (|| {
         std::fs::create_dir(&staging)
             .map_err(|error| format!("Cannot create {}: {error}", staging.display()))?;
@@ -53,44 +55,52 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
         let census = census_fastq(&options.r1, options.r2.as_deref())?;
         stages.pass1_count = started.elapsed().as_millis() as u64;
         counts.0 = census.fragments;
-        let design = derive_sampling_design(
-            &census,
-            index.target_groups.len(),
-            profile.minimum_relevant_fraction,
-            profile.familywise_miss_probability,
-        )?;
+        let design = derive_sampling_design(&census, index.target_groups.len(), profile)?;
 
         let started = stage_start();
-        let aligner = CompetitiveAligner::open(&index.mmi_path)?;
         let mut fragments = FragmentReader::open(&options.r1, options.r2.as_deref())?;
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
         let mut pass2_fragments = 0;
-        while let Some(fragment) = fragments.next_fragment()? {
-            pass2_fragments += 1;
-            let key = fragment_selection_key(
-                &index.profile_digest,
-                &census.input_digest,
-                &fragment.id,
-                fragment.ordinal,
-            );
-            if !include_fragment(key, design.selection_probability) {
-                continue;
-            }
-            counts.1 += 1;
-            if !index
-                .bloom
-                .passes_target_kmer_gate(&fragment.r1, fragment.r2.as_deref())
-            {
-                continue;
-            }
-            counts.2 += 1;
-            let evidence = aligner.align_fragment_competitively(&fragment, &index.contigs)?;
-            accumulator.accumulate_group_evidence(evidence);
-        }
+        align_fragments_bounded(
+            &index.mmi_path,
+            &index.contigs,
+            options.threads,
+            || loop {
+                let Some(fragment) = fragments.next_fragment()? else {
+                    return Ok(None);
+                };
+                pass2_fragments += 1;
+                let key = fragment_selection_key(
+                    &index.profile_digest,
+                    &census.input_digest,
+                    &fragment.id,
+                    fragment.ordinal,
+                );
+                if !include_fragment(key, design.selection_probability) {
+                    continue;
+                }
+                counts.1 += 1;
+                match index
+                    .bloom
+                    .evaluate_fragment(&fragment.r1, fragment.r2.as_deref())
+                {
+                    GateEvaluation::Pass => {
+                        counts.2 += 1;
+                        return Ok(Some(fragment));
+                    }
+                    GateEvaluation::Negative => continue,
+                    GateEvaluation::NotEvaluable => {
+                        unevaluable_fragments += 1;
+                        continue;
+                    }
+                }
+            },
+            |evidence| accumulator.accumulate_group_evidence(evidence),
+        )?;
         if pass2_fragments != census.fragments {
             return Err(format!("FASTQ changed between passes: pass 1 counted {} fragments, pass 2 counted {pass2_fragments}", census.fragments));
         }
-        if compute_input_digest(&options.r1, options.r2.as_deref())? != census.input_digest {
+        if fragments.input_digest() != census.input_digest {
             return Err("FASTQ bytes changed between pass 1 and pass 2".into());
         }
         counts.3 = accumulator.aligned_fragments;
@@ -105,6 +115,7 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
                 prescreen_passed_fragments: counts.2,
                 profile,
                 index_digest: index.index_digest,
+                unevaluable_fragments,
             },
             accumulator,
         )?;

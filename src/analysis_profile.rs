@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROFILE_BYTES: &[u8] = include_bytes!("../evaluation/phase0/analysis-profile.json");
+pub const MINIMUM_RELEVANT_FRACTION_NUMERATOR: u64 = 1;
+pub const MINIMUM_RELEVANT_FRACTION_DENOMINATOR: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisProfile {
@@ -23,6 +25,12 @@ impl AnalysisProfile {
 
     pub fn digest(self) -> String {
         hex_sha256(PROFILE_BYTES)
+    }
+
+    pub fn minimum_relevant_fragments(self, input_fragments: u64) -> u64 {
+        input_fragments
+            .saturating_mul(MINIMUM_RELEVANT_FRACTION_NUMERATOR)
+            .div_ceil(MINIMUM_RELEVANT_FRACTION_DENOMINATOR)
     }
 }
 

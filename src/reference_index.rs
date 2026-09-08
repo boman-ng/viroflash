@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub enum ReferenceRole {
     Target,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceContig {
     pub name: String,
     pub role: ReferenceRole,
@@ -41,6 +41,7 @@ pub struct ReferenceContig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexManifest {
     contract_id: String,
     profile_digest: String,
@@ -53,7 +54,6 @@ struct IndexManifest {
     target_fasta_sha256: String,
     bloom: BloomSummary,
     contigs: Vec<ReferenceContig>,
-    target_groups: Vec<ReferenceGroup>,
 }
 
 pub struct ReferenceIndex {
@@ -174,7 +174,6 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
         target_fasta_sha256: target_digest,
         bloom: bloom.summary(),
         contigs,
-        target_groups: groups,
     };
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("Cannot serialize index manifest: {error}"))?;
@@ -206,20 +205,175 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     verify_digest(&directory.join(BLOOM), &manifest.bloom_digest)?;
     verify_digest(&directory.join(LEDGER), &manifest.ledger_digest)?;
     let bloom = TargetKmerBloom::read(&directory.join(BLOOM), profile.kmer_length)?;
-    let contigs = manifest
-        .contigs
-        .into_iter()
-        .map(|contig| (contig.name.clone(), contig))
-        .collect();
+    if bloom.summary() != manifest.bloom {
+        return Err("Bloom summary does not match bloom.bin".into());
+    }
+    let ledger_bytes = std::fs::read(directory.join(LEDGER))
+        .map_err(|error| format!("Cannot read ReferenceGroup ledger: {error}"))?;
+    let target_groups = parse_ledger(
+        &ledger_bytes,
+        &manifest.target_fasta_sha256,
+        &manifest.profile_digest,
+    )?;
+    let contigs = validate_contigs(manifest.contigs, target_groups.len())?;
+    let expected_reference_set_digest = reference_set_digest(
+        &manifest.host_fasta_sha256,
+        &manifest.target_fasta_sha256,
+        &manifest.ledger_digest,
+    )?;
+    if manifest.reference_set_digest != expected_reference_set_digest {
+        return Err("Index reference-set digest is inconsistent".into());
+    }
     Ok(ReferenceIndex {
         mmi_path: directory.join(MMI),
         bloom,
         bloom_summary: manifest.bloom,
         contigs,
-        target_groups: manifest.target_groups,
+        target_groups,
         profile_digest: manifest.profile_digest,
         index_digest: hex_sha256(&bytes),
     })
+}
+
+fn parse_ledger(
+    bytes: &[u8],
+    target_digest: &str,
+    profile_digest: &str,
+) -> Result<Vec<ReferenceGroup>, String> {
+    const HEADER: &str = "group_ordinal\ttarget_group_id\trepresentative_id\tmember_ordinal\tmember_id\trepresentative_length\ttarget_fasta_sha256\tprofile_digest\n";
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("ReferenceGroup ledger is not UTF-8: {error}"))?;
+    let rows = text.strip_prefix(HEADER).ok_or_else(|| {
+        "ReferenceGroup ledger header does not match the frozen contract".to_string()
+    })?;
+    if rows.is_empty() || !rows.ends_with('\n') {
+        return Err("ReferenceGroup ledger has no canonical data rows".into());
+    }
+    let mut groups: Vec<ReferenceGroup> = Vec::new();
+    let mut members = HashSet::new();
+    for row in rows.lines() {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 {
+            return Err("ReferenceGroup ledger row does not have eight fields".into());
+        }
+        let group_ordinal = parse_ledger_number(fields[0], "group_ordinal")?;
+        let member_ordinal = parse_ledger_number(fields[3], "member_ordinal")?;
+        let representative_length = fields[5]
+            .parse::<u64>()
+            .map_err(|_| "ReferenceGroup ledger representative_length is invalid".to_string())?;
+        if representative_length == 0
+            || fields[1]
+                .strip_prefix("sha256:")
+                .is_none_or(|digest| !is_sha256(digest))
+            || fields[2].is_empty()
+            || fields[4].is_empty()
+            || fields[6] != target_digest
+            || fields[7] != profile_digest
+        {
+            return Err("ReferenceGroup ledger row violates the frozen contract".into());
+        }
+        if !members.insert(fields[4].to_string()) {
+            return Err(format!(
+                "ReferenceGroup member appears more than once: {}",
+                fields[4]
+            ));
+        }
+        if group_ordinal == groups.len() {
+            if member_ordinal != 0
+                || groups
+                    .last()
+                    .is_some_and(|previous| previous.target_group_id.as_str() >= fields[1])
+            {
+                return Err("ReferenceGroup ledger group order is not dense and canonical".into());
+            }
+            groups.push(ReferenceGroup {
+                ordinal: group_ordinal,
+                target_group_id: fields[1].to_string(),
+                representative_id: fields[2].to_string(),
+                member_ids: vec![fields[4].to_string()],
+                representative_length,
+                contig_name: format!("target_{group_ordinal}"),
+            });
+        } else if group_ordinal + 1 == groups.len() {
+            let group = groups.last_mut().expect("current group exists");
+            if group.target_group_id != fields[1]
+                || group.representative_id != fields[2]
+                || group.representative_length != representative_length
+                || member_ordinal != group.member_ids.len()
+                || group
+                    .member_ids
+                    .last()
+                    .is_some_and(|previous| previous.as_str() >= fields[4])
+            {
+                return Err("ReferenceGroup ledger member rows are not canonical".into());
+            }
+            group.member_ids.push(fields[4].to_string());
+        } else {
+            return Err("ReferenceGroup ledger group ordinals are not dense".into());
+        }
+    }
+    if groups
+        .iter()
+        .any(|group| group.representative_id != group.member_ids[0])
+    {
+        return Err("ReferenceGroup representative is not the first canonical member".into());
+    }
+    Ok(groups)
+}
+
+fn parse_ledger_number(value: &str, field: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("ReferenceGroup ledger {field} is invalid"))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_contigs(
+    contigs: Vec<ReferenceContig>,
+    group_count: usize,
+) -> Result<HashMap<String, ReferenceContig>, String> {
+    let mut by_name = HashMap::new();
+    let mut target_ordinals = vec![false; group_count];
+    let mut host_ordinal = 0;
+    for contig in contigs {
+        match contig.role {
+            ReferenceRole::Host => {
+                if contig.target_group_ordinal.is_some()
+                    || contig.name != format!("host_{host_ordinal}")
+                {
+                    return Err("Index host contig mapping is not dense".into());
+                }
+                host_ordinal += 1;
+            }
+            ReferenceRole::Target => {
+                let ordinal = contig
+                    .target_group_ordinal
+                    .ok_or_else(|| "Index target contig has no group ordinal".to_string())?;
+                if ordinal >= group_count
+                    || target_ordinals[ordinal]
+                    || contig.name != format!("target_{ordinal}")
+                {
+                    return Err(
+                        "Index target contig/group mapping is not dense and one-to-one".into(),
+                    );
+                }
+                target_ordinals[ordinal] = true;
+            }
+        }
+        if by_name.insert(contig.name.clone(), contig).is_some() {
+            return Err("Index contains duplicate contig names".into());
+        }
+    }
+    if host_ordinal == 0 || target_ordinals.iter().any(|mapped| !mapped) {
+        return Err("Index does not contain complete HOST and TARGET mappings".into());
+    }
+    Ok(by_name)
 }
 
 fn write_fasta_record(writer: &mut impl Write, name: &str, sequence: &[u8]) -> Result<(), String> {
