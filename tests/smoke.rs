@@ -1,470 +1,282 @@
-//! End-to-end smoke tests using random host, target, decoy, and contaminant references plus
-//! synthetic read pairs. Covers reusable-index/autobuild equivalence, target reporting through the
-//! exact-rate and distribution gates, automatic decoys, k mismatch, and conflicting input modes.
-
+use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-use viroflash::index::{self, IndexOptions};
-use viroflash::{run_pipeline, Options};
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn parse_csv_record(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.chars().peekable();
-    let mut quoted = false;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(std::mem::take(&mut field));
-            }
-            _ => field.push(ch),
-        }
-    }
-    assert!(!quoted, "unterminated quoted CSV field: {line}");
-    fields.push(field);
-    fields
+fn workspace(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "viroflash-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
 }
 
-fn assert_only_perf_json(out_prefix: &std::path::Path) {
-    let parent = out_prefix.parent().unwrap();
-    let label = out_prefix.file_name().unwrap().to_string_lossy();
-    let mut reports: Vec<String> = std::fs::read_dir(parent)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(&format!("{label}.perf.")))
-        .collect();
-    reports.sort();
-    assert_eq!(reports, vec![format!("{label}.perf.json")]);
-}
-
-/// Deterministic xorshift64 random source.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn seq(&mut self, n: usize) -> Vec<u8> {
-        (0..n)
-            .map(|_| b"ACGT"[(self.next() % 4) as usize])
-            .collect()
-    }
-
-    /// Random sequence with exactly 50% GC, shuffled after generating equal AT and CG halves.
-    /// This keeps the target and every decoy in the same GC stratum.
-    fn half_gc_seq(&mut self, n: usize) -> Vec<u8> {
-        let mut half: Vec<u8> = (0..n)
-            .map(|i| {
-                if i % 2 == 0 {
-                    b"AT"[(self.next() % 2) as usize]
-                } else {
-                    b"CG"[(self.next() % 2) as usize]
-                }
-            })
-            .collect();
-        // Fisher-Yates shuffle using the same RNG.
-        for i in (1..half.len()).rev() {
-            let j = (self.next() % (i as u64 + 1)) as usize;
-            half.swap(i, j);
-        }
-        half
-    }
-}
-
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|&c| match c {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            other => other,
+fn sequence(seed: u64, length: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            b"ACGT"[(state & 3) as usize]
         })
         .collect()
 }
 
-fn write_fasta(path: &std::path::Path, records: &[(&str, &[u8])]) {
-    let mut w = BufWriter::new(File::create(path).unwrap());
-    for (header, seq) in records {
-        writeln!(w, ">{header}").unwrap();
-        w.write_all(seq).unwrap();
-        writeln!(w).unwrap();
+fn write_fasta(path: &Path, id: &str, sequence: &[u8]) {
+    let mut file = File::create(path).unwrap();
+    writeln!(file, ">{id}").unwrap();
+    for chunk in sequence.chunks(60) {
+        writeln!(file, "{}", String::from_utf8_lossy(chunk)).unwrap();
     }
 }
 
-fn write_fastq_gz(path: &std::path::Path, records: &[(&str, &[u8])]) {
+fn write_fastq(path: &Path, target: &[u8], mate: Option<u8>) {
     let file = File::create(path).unwrap();
-    let mut w = GzEncoder::new(file, Compression::default());
-    for (id, seq) in records {
-        writeln!(w, "@{id}").unwrap();
-        w.write_all(seq).unwrap();
-        writeln!(w, "\n+").unwrap();
-        w.write_all(&vec![b'I'; seq.len()]).unwrap();
-        writeln!(w).unwrap();
+    let mut writer = GzEncoder::new(file, Compression::fast());
+    for index in 0..20 {
+        let start = index % 30;
+        let read = &target[start..start + 120];
+        let suffix = mate.map_or(String::new(), |mate| format!("/{mate}"));
+        writeln!(
+            writer,
+            "@fragment-{index}{suffix}\n{}\n+\n{}",
+            String::from_utf8_lossy(read),
+            "I".repeat(read.len())
+        )
+        .unwrap();
     }
-    w.finish().unwrap();
+    writer.finish().unwrap();
 }
 
-fn synthetic_workspace(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("viroflash_smoke_{tag}_{}", std::process::id()));
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn command(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_viroflash"))
+        .args(args)
+        .output()
+        .unwrap()
 }
 
-/// Write all four reference roles and synthetic read pairs, returning the work directory.
-fn setup_synthetic(tag: &str) -> PathBuf {
-    let dir = synthetic_workspace(tag);
-    let mut rng = Rng(0x9e3779b97f4a7c15);
-
-    let host = rng.seq(5000);
-    let target = rng.half_gc_seq(1000);
-    let decoys: Vec<Vec<u8>> = (0..20).map(|_| rng.half_gc_seq(1000)).collect();
-    let contam = rng.seq(1000);
-
-    write_fasta(&dir.join("host.fa"), &[("chrH", &host)]);
-    write_fasta(&dir.join("target.fa"), &[("TESTVIR", &target)]);
-    let decoy_records: Vec<(String, Vec<u8>)> = decoys
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (format!("dec{i}"), d.clone()))
-        .collect();
-    write_fasta(
-        &dir.join("decoy.fa"),
-        &decoy_records
-            .iter()
-            .map(|(h, s)| (h.as_str(), s.as_slice()))
-            .collect::<Vec<_>>(),
+fn build_fixture(tag: &str) -> (PathBuf, Vec<u8>) {
+    let root = workspace(tag);
+    let host = sequence(17, 600);
+    let target = sequence(91, 600);
+    write_fasta(&root.join("host.fa"), "host", &host);
+    write_fasta(&root.join("target.fa"), "target", &target);
+    let output = command(&[
+        "index",
+        "--host-fa",
+        root.join("host.fa").to_str().unwrap(),
+        "--target-fa",
+        root.join("target.fa").to_str().unwrap(),
+        "--out",
+        root.join("index").to_str().unwrap(),
+        "--threads",
+        "2",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    write_fasta(&dir.join("contam.fa"), &[("mycoplasma", &contam)]);
-
-    // Thirty target pairs across three distributed regions plus thirty host pairs exercise the
-    // distributed-window PASS path without relying on split evidence.
-    let mut r1: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut r2: Vec<(String, Vec<u8>)> = Vec::new();
-    for i in 0..30 {
-        r1.push((format!("t{i}/1"), target[100..250].to_vec()));
-        let r2_start = if i % 2 == 0 { 400 } else { 700 };
-        r2.push((
-            format!("t{i}/2"),
-            reverse_complement(&target[r2_start..r2_start + 150]),
-        ));
-    }
-    for i in 0..30 {
-        let off = i * 10;
-        r1.push((format!("h{i}/1"), host[off..off + 150].to_vec()));
-        r2.push((
-            format!("h{i}/2"),
-            reverse_complement(&host[1000 + off..1000 + off + 150]),
-        ));
-    }
-    write_fastq_gz(
-        &dir.join("reads_R1.fq.gz"),
-        &r1.iter()
-            .map(|(h, s)| (h.as_str(), s.as_slice()))
-            .collect::<Vec<_>>(),
-    );
-    write_fastq_gz(
-        &dir.join("reads_R2.fq.gz"),
-        &r2.iter()
-            .map(|(h, s)| (h.as_str(), s.as_slice()))
-            .collect::<Vec<_>>(),
-    );
-    dir
+    (root, target)
 }
 
-/// Assert target reporting, controlled background, and generated output files.
-fn assert_detected(summary: &viroflash::RunSummary) {
-    assert_eq!(summary.input_pairs, 60);
-    assert!(
-        summary.prescreen_pairs >= 30,
-        "prescreen must retain at least all target pairs: {}",
-        summary.prescreen_pairs
-    );
+fn output_names(path: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
 
-    let cand = summary
-        .candidates
-        .iter()
-        .find(|c| c.contig == "target_0")
-        .expect("target_0 candidate should be reported");
-    assert_eq!(summary.test_family_size, 1);
-    assert!(
-        cand.covered_frac >= 0.2,
-        "breadth is too low: {:.3}",
-        cand.covered_frac
-    );
-    assert!(
-        cand.q_value <= 0.2,
-        "model adjusted p-value should pass the exploratory threshold with no same-stratum decoy coverage: {:.4}",
-        cand.q_value
-    );
-    assert_eq!(cand.decision, "PASS");
-    assert!(cand.distinct_windows >= 3);
-    assert_eq!(cand.confidence(), "UNVALIDATED");
-    assert_eq!(
-        cand.n_plain, cand.reads,
-        "split evidence must not change general detection counts"
-    );
-    assert_eq!(
-        cand.background_status, "SYNTHETIC_DECOY_UNVALIDATED",
-        "the report must disclose that the synthetic-decoy null is uncalibrated"
-    );
-    // Synthetic reads are not chimeric and should have no split or discordant evidence.
-    assert_eq!(cand.split_events, 0);
-    assert_eq!(cand.discordant, 0);
-    assert_eq!(cand.integration_evidence, "NONE");
-
-    assert!(summary.result_json.exists());
-    assert!(summary.result_tsv.exists());
-    assert!(summary.result_html.exists());
-    assert!(summary.result_csv.exists());
-    let result_json = std::fs::read_to_string(&summary.result_json).unwrap();
-    let result_tsv = std::fs::read_to_string(&summary.result_tsv).unwrap();
-    assert!(result_json.contains("\"schema\": \"viroflash.result.v1\""));
-    assert!(result_json.contains("\"sample_conclusion\": \"not_computed\""));
-    assert!(result_json.contains("\"fdr_control_validated\": false"));
-    assert!(result_json.contains("\"test\": \"exact_conditional_two_poisson_rates\""));
-    assert!(result_tsv.contains("row_type=candidate;"));
-    assert!(result_tsv.contains("result_schema=viroflash.result.v1"));
-    assert!(result_tsv.contains("\treference_group\t"));
-    assert!(result_tsv.contains("qc_status=NOT_EVALUATED"));
-    assert!(result_tsv.contains("member_attribution=not_resolved"));
-    let result_html = std::fs::read_to_string(&summary.result_html).unwrap();
-    let result_csv = std::fs::read_to_string(&summary.result_csv).unwrap();
-    assert!(result_html.contains("viroflash evidence report"));
-    assert!(result_html.contains("Interpretation boundary"));
-    assert!(result_html.contains("FDR not validated"));
-    assert!(result_html.contains("data-decision=\"PASS\""));
-    assert!(result_html.contains("Download core CSV"));
-    assert!(result_csv
-        .starts_with("csv_schema,result_schema,sample_id,sample_conclusion,qc_status,qc_issues"));
-    assert!(result_csv.contains("viroflash.candidates.csv.v1"));
-    assert!(result_csv.contains("not_computed,NOT_EVALUATED"));
-    assert!(result_csv.contains("model_adjusted_p_max"));
-    assert!(result_csv.contains("coverage_min"));
-    assert!(result_csv.contains("min_distributed_windows"));
-    assert!(result_csv.contains("manifest_blake3"));
-    let json: serde_json::Value = serde_json::from_str(&result_json).unwrap();
-    let mut csv_lines = result_csv.lines();
-    let csv_header = parse_csv_record(csv_lines.next().unwrap());
-    let csv_record = parse_csv_record(csv_lines.next().unwrap());
-    assert_eq!(csv_header.len(), csv_record.len());
-    assert!(csv_lines.next().is_none());
-    let csv: std::collections::HashMap<_, _> = csv_header
-        .iter()
-        .zip(csv_record.iter())
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    let json_candidate = &json["candidates"][0];
-    assert_eq!(csv["member_attribution"], "not_resolved");
-    assert_eq!(csv["sample_id"], json["run"]["sample"].as_str().unwrap());
-    assert_eq!(csv["qc_status"], json["quality_control"]["status"]);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(csv["qc_issues"]).unwrap(),
-        json["quality_control"]["issues"]
-    );
-    assert_eq!(
-        csv["input_pairs"].parse::<u64>().unwrap(),
-        json["run"]["input_pairs"].as_u64().unwrap()
-    );
-    assert_eq!(csv["candidate_id"], json_candidate["contig"]);
-    assert_eq!(csv["decision"], json_candidate["decision"]);
-    assert_eq!(
-        csv["validation_read_ends"].parse::<u64>().unwrap(),
-        json_candidate["evidence"]["reads"].as_u64().unwrap()
-    );
-    assert_eq!(
-        csv["coverage_breadth"].parse::<f64>().unwrap(),
-        json_candidate["evidence"]["covered_frac"].as_f64().unwrap()
-    );
-    assert_eq!(
-        csv["manifest_blake3"],
-        json["index"]["manifest_blake3"].as_str().unwrap()
-    );
-    for line in result_tsv.lines() {
-        assert_eq!(
-            line.split('\t').count(),
-            22,
-            "fixed 22-column TSV contract: {line}"
+#[test]
+fn cli_index_and_se_run_produce_three_source_consistent_files() {
+    let (root, target) = build_fixture("se");
+    write_fastq(&root.join("sample.fastq.gz"), &target, None);
+    for (threads, output_name) in [(1, "out-one"), (4, "out-four")] {
+        let output = command(&[
+            "run",
+            "--r1",
+            root.join("sample.fastq.gz").to_str().unwrap(),
+            "--index",
+            root.join("index").to_str().unwrap(),
+            "--out",
+            root.join(output_name).to_str().unwrap(),
+            "--threads",
+            &threads.to_string(),
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        assert_eq!(
+            output_names(&root.join(output_name)),
+            BTreeSet::from([
+                "perf.json".into(),
+                "report.csv".into(),
+                "report.html".into()
+            ])
+        );
+        let perf: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(output_name).join("perf.json")).unwrap(),
+        )
+        .unwrap();
+        let actual_fields = perf
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let output_fields = std::fs::read_to_string("evaluation/phase0/output-fields.tsv").unwrap();
+        let expected_fields = output_fields
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let columns = line.split('\t').collect::<Vec<_>>();
+                (columns[0] == "perf.json").then(|| columns[2].to_string())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_fields, expected_fields);
     }
-    let perf_json = summary.result_json.with_extension("perf.json");
-    assert!(perf_json.exists());
-    assert_only_perf_json(&summary.result_json.with_extension(""));
-    let perf = std::fs::read_to_string(perf_json).unwrap();
-    assert!(perf.contains("\"schema\": \"viroflash.perf.v1\""));
-    assert!(perf.contains("\"status\": \"success\""));
-    assert!(
-        !perf.contains("reads_R1.fq.gz"),
-        "performance reports must not expose input paths"
-    );
-}
-
-#[test]
-fn e2e_index_and_autobuild_paths_agree() {
-    let dir = setup_synthetic("equiv");
-
-    // Path A: build an index directory, then load it with --index.
-    let index_opts = IndexOptions {
-        host_fa: dir.join("host.fa"),
-        target_fa: dir.join("target.fa"),
-        contam_fa: Some(dir.join("contam.fa")),
-        decoy_fa: Some(dir.join("decoy.fa")),
-        out_dir: dir.join("idx"),
-        k: 21,
-        threads: 4,
-        ..IndexOptions::default()
-    };
-    let built = index::build_index(&index_opts).unwrap();
-    assert!(dir.join("idx.perf.json").is_file());
-    assert_only_perf_json(&dir.join("idx"));
+    let csv = std::fs::read(root.join("out-one/report.csv")).unwrap();
     assert_eq!(
-        built
-            .contigs
+        csv,
+        std::fs::read(root.join("out-four/report.csv")).unwrap()
+    );
+    let text = String::from_utf8(csv).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines
             .iter()
-            .filter(|c| c.role == viroflash::reference::Role::Decoy)
+            .filter(|line| line.contains("TARGET_SIGNAL"))
             .count(),
-        20
+        1
     );
-    let summary_loaded = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        r2: Some(dir.join("reads_R2.fq.gz")),
-        index: Some(dir.join("idx")),
-        threads: 4,
-        out: dir.join("out_idx"),
-        k: 21,
-        ..Options::default()
-    })
-    .unwrap();
-
-    // Path B: pass FASTA files directly for automatic construction through the shared builder.
-    let summary_built = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        r2: Some(dir.join("reads_R2.fq.gz")),
-        host_fa: Some(dir.join("host.fa")),
-        target_fa: Some(dir.join("target.fa")),
-        decoy_fa: Some(dir.join("decoy.fa")),
-        contam_fa: Some(dir.join("contam.fa")),
-        threads: 4,
-        out: dir.join("out_fa"),
-        k: 21,
-        ..Options::default()
-    })
-    .unwrap();
-
-    assert_detected(&summary_loaded);
-    assert_detected(&summary_built);
-    assert_eq!(summary_loaded.candidates, summary_built.candidates);
-    // Automatic construction writes the index under <out>.work/index/.
-    assert!(dir
-        .join("out_fa.work")
-        .join("index")
-        .join("manifest.json")
-        .is_file());
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn e2e_auto_decoy_when_decoy_fa_absent() {
-    let dir = setup_synthetic("autodecoy");
-
-    // Without --decoy-fa, index construction generates decoys with default ANI and seed.
-    let summary = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        r2: Some(dir.join("reads_R2.fq.gz")),
-        host_fa: Some(dir.join("host.fa")),
-        target_fa: Some(dir.join("target.fa")),
-        threads: 4,
-        out: dir.join("out"),
-        k: 21,
-        ..Options::default()
-    })
-    .unwrap();
-    assert_detected(&summary);
-
-    // Generated decoy artifacts and their manifest provenance.
-    let idx = dir.join("out.work").join("index");
-    assert!(idx.join("decoys.fa").is_file());
-    assert!(idx.join("decoys.tsv").is_file());
-    let manifest = std::fs::read_to_string(idx.join("manifest.json")).unwrap();
-    assert!(
-        manifest.contains("\"generated\""),
-        "manifest should record generated decoys: {manifest}"
-    );
-    assert!(
-        manifest.contains("\"anis\""),
-        "manifest should record ANI layers"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn e2e_rejects_k_mismatch_and_index_fasta_conflict() {
-    let dir = setup_synthetic("errors");
-
-    let index_opts = IndexOptions {
-        host_fa: dir.join("host.fa"),
-        target_fa: dir.join("target.fa"),
-        decoy_fa: Some(dir.join("decoy.fa")),
-        out_dir: dir.join("idx"),
-        k: 21,
-        threads: 4,
-        ..IndexOptions::default()
+    let header = lines[0].split(',').collect::<Vec<_>>();
+    let values = lines[2].split(',').collect::<Vec<_>>();
+    let value = |field: &str| {
+        values[header
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap()]
     };
-    index::build_index(&index_opts).unwrap();
+    let html = std::fs::read_to_string(root.join("out-one/report.html")).unwrap();
+    assert!(html.contains(&format!(
+        "data-fraction=\"{}\"",
+        value("attributed_fragment_fraction")
+    )));
+    assert!(html.contains(&format!("data-lower=\"{}\"", value("interval_lower"))));
+    assert!(html.contains(&format!("data-upper=\"{}\"", value("interval_upper"))));
 
-    // Loading must reject a k mismatch because both Bloom and MMI are built for one k.
-    let err = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        index: Some(dir.join("idx")),
-        out: dir.join("k_mismatch"),
-        k: 6,
-        ..Options::default()
-    })
-    .unwrap_err();
-    assert!(err.contains("does not match"), "err={err}");
+    let output_fields = std::fs::read_to_string("evaluation/phase0/output-fields.tsv").unwrap();
+    let expected = output_fields
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            (columns[0] == "report.csv").then(|| columns[2].to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        header
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
 
-    // --index and FASTA inputs are mutually exclusive at both library and CLI boundaries.
-    let err = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        index: Some(dir.join("idx")),
-        host_fa: Some(dir.join("host.fa")),
-        out: dir.join("index_fasta_conflict"),
-        ..Options::default()
-    })
-    .unwrap_err();
-    assert!(err.contains("cannot be combined"), "err={err}");
+#[test]
+fn cli_pe_run_counts_fragments_once() {
+    let (root, target) = build_fixture("pe");
+    write_fastq(&root.join("sample_R1.fastq.gz"), &target, Some(1));
+    write_fastq(&root.join("sample_R2.fastq.gz"), &target, Some(2));
+    let output = command(&[
+        "run",
+        "--r1",
+        root.join("sample_R1.fastq.gz").to_str().unwrap(),
+        "--r2",
+        root.join("sample_R2.fastq.gz").to_str().unwrap(),
+        "--index",
+        root.join("index").to_str().unwrap(),
+        "--out",
+        root.join("out").to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let csv = std::fs::read_to_string(root.join("out/report.csv")).unwrap();
+    let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+    let run = csv.lines().nth(1).unwrap().split(',').collect::<Vec<_>>();
+    let value = |field: &str| {
+        run[header
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap()]
+    };
+    assert_eq!(value("input_mode"), "PE");
+    assert_eq!(value("input_fragments"), "20");
+    assert_eq!(value("read_ends_per_fragment"), "2");
+    let _ = std::fs::remove_dir_all(root);
+}
 
-    // Automatic construction rejects missing required references.
-    let err = run_pipeline(&Options {
-        r1: dir.join("reads_R1.fq.gz"),
-        target_fa: Some(dir.join("target.fa")),
-        out: dir.join("missing_host"),
-        ..Options::default()
-    })
-    .unwrap_err();
-    assert!(err.contains("--host-fa"), "err={err}");
+#[test]
+fn failed_run_leaves_only_error_perf_json() {
+    let (root, _) = build_fixture("failure");
+    std::fs::write(root.join("broken.fastq"), b"@broken\nACGT\n+\n").unwrap();
+    let output = command(&[
+        "run",
+        "--r1",
+        root.join("broken.fastq").to_str().unwrap(),
+        "--index",
+        root.join("index").to_str().unwrap(),
+        "--out",
+        root.join("out").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(
+        output_names(&root.join("out")),
+        BTreeSet::from(["perf.json".into()])
+    );
+    let perf: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("out/perf.json")).unwrap()).unwrap();
+    assert_eq!(perf["status"], "ERROR");
+    let _ = std::fs::remove_dir_all(root);
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+fn run_requires_current_reusable_index() {
+    let root = workspace("invalid-index");
+    std::fs::create_dir(root.join("index")).unwrap();
+    std::fs::write(root.join("index/manifest.json"), b"{}\n").unwrap();
+    std::fs::write(root.join("sample.fastq"), b"@x\nACGT\n+\nIIII\n").unwrap();
+    let output = command(&[
+        "run",
+        "--r1",
+        root.join("sample.fastq").to_str().unwrap(),
+        "--index",
+        root.join("index").to_str().unwrap(),
+        "--out",
+        root.join("out").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rebuild"));
+    assert!(
+        !command(&["run", "--r1", "r", "--unexpected", "x", "--out", "o"])
+            .status
+            .success()
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
