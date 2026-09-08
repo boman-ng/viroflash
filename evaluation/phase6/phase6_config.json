@@ -38,6 +38,7 @@
   ],
   "reproducibility_threads": [1, 2, 4, 8],
   "reproducibility_repetitions": 2,
+  "reproducibility_jobs": 8,
   "gzip_equivalence_run_id": "SRR11517681",
   "historical": {
     "internal_results": "/home/wubw/data/viroflash/dna_virus_68_20260827/results",

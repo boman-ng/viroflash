@@ -119,6 +119,7 @@ def load_contract():
     }
     require(set().union(*(set(item["covers"]) for item in config["reproducibility_runs"])) == required_coverage, "reproducibility coverage differs from frozen contract")
     require(config["reproducibility_threads"] == [1, 2, 4, 8] and config["reproducibility_repetitions"] == 2, "reproducibility matrix differs from frozen contract")
+    require(config["reproducibility_jobs"] == 8, "reproducibility job budget differs from frozen contract")
     require(sha256_file(PROFILE_PATH) == manifest["profile_digest"], "profile file digest differs from manifest")
     require(all(run["profile_digest"] == manifest["profile_digest"] for run in manifest["runs"]), "run profile digest differs from manifest")
     return manifest, config

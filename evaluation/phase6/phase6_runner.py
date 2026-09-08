@@ -242,6 +242,32 @@ def gzip_variants(campaign_dir, run):
     return plain, multi
 
 
+def run_repro_one(campaign_dir, run, threads, repetition, config, digest_ledger, ledger_path, root):
+    canonical = output_dir(campaign_dir, run) / "report.csv"
+    require(canonical.is_file(), f"canonical campaign report missing: {run['run_id']}")
+    repro_run = dict(run)
+    repro_run["planned_threads"] = threads
+    destination = root / run["run_id"] / f"threads-{threads}" / f"run-{repetition}"
+    repro_run["_output"] = destination
+    index_id = index_id_for(run, config)
+    index = digest_ledger["indexes"][index_id]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [BINARY_PATH, "run", "--r1", run["r1"]["path"]]
+    if run.get("r2"):
+        command.extend(["--r2", run["r2"]["path"]])
+    command.extend(["--index", index["path"], "--out", destination, "--threads", str(threads)])
+    identity = {"run_id": run["run_id"], "threads": threads, "repetition": repetition}
+    append_event(ledger_path, {**identity, "event": "STARTED", "at": now(), "command": [str(value) for value in command]})
+    log = destination.parent / f"run-{repetition}"
+    returncode, timing = run_timed(command, Path(str(log) + ".stdout"), Path(str(log) + ".stderr"), Path(str(log) + ".time"))
+    require(returncode == 0, f"reproducibility run failed: {identity}")
+    validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"])
+    identical = canonical.read_bytes() == (destination / "report.csv").read_bytes()
+    append_event(ledger_path, {**identity, "event": "TERMINAL", "at": now(), "status": "SUCCESS", "report_csv_byte_identical": identical, "time": timing})
+    require(identical, f"report.csv reproducibility failure: {identity}")
+    print(f"repro {run['run_id']} t={threads} n={repetition} byte-identical", flush=True)
+
+
 def execute_repro(campaign_dir):
     manifest, config = load_contract()
     campaign_dir = Path(campaign_dir).resolve()
@@ -253,32 +279,22 @@ def execute_repro(campaign_dir):
     root = campaign_dir / "reproducibility/runs"
     require(not root.exists(), "reproducibility output root already exists")
     root.mkdir(parents=True)
-    for run in selected:
-        canonical = output_dir(campaign_dir, run) / "report.csv"
-        require(canonical.is_file(), f"canonical campaign report missing: {run['run_id']}")
-        for threads in config["reproducibility_threads"]:
-            for repetition in range(1, config["reproducibility_repetitions"] + 1):
-                repro_run = dict(run)
-                repro_run["planned_threads"] = threads
-                destination = root / run["run_id"] / f"threads-{threads}" / f"run-{repetition}"
-                repro_run["_output"] = destination
-                index_id = index_id_for(run, config)
-                index = digest_ledger["indexes"][index_id]
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                command = [BINARY_PATH, "run", "--r1", run["r1"]["path"]]
-                if run.get("r2"):
-                    command.extend(["--r2", run["r2"]["path"]])
-                command.extend(["--index", index["path"], "--out", destination, "--threads", str(threads)])
-                identity = {"run_id": run["run_id"], "threads": threads, "repetition": repetition}
-                append_event(ledger_path, {**identity, "event": "STARTED", "at": now(), "command": [str(value) for value in command]})
-                log = destination.parent / f"run-{repetition}"
-                returncode, timing = run_timed(command, Path(str(log) + ".stdout"), Path(str(log) + ".stderr"), Path(str(log) + ".time"))
-                require(returncode == 0, f"reproducibility run failed: {identity}")
-                validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"])
-                identical = canonical.read_bytes() == (destination / "report.csv").read_bytes()
-                append_event(ledger_path, {**identity, "event": "TERMINAL", "at": now(), "status": "SUCCESS", "report_csv_byte_identical": identical, "time": timing})
-                require(identical, f"report.csv reproducibility failure: {identity}")
-                print(f"repro {run['run_id']} t={threads} n={repetition} byte-identical", flush=True)
+    tasks = [
+        (run, threads, repetition)
+        for run in selected
+        for threads in config["reproducibility_threads"]
+        for repetition in range(1, config["reproducibility_repetitions"] + 1)
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config["reproducibility_jobs"]) as executor:
+        futures = [
+            executor.submit(
+                run_repro_one, campaign_dir, run, threads, repetition, config,
+                digest_ledger, ledger_path, root,
+            )
+            for run, threads, repetition in tasks
+        ]
+        for future in futures:
+            future.result()
     variant_run = by_id[config["gzip_equivalence_run_id"]]
     plain, multi = gzip_variants(campaign_dir, variant_run)
     canonical = output_dir(campaign_dir, variant_run) / "report.csv"
