@@ -43,7 +43,7 @@ impl AlignmentRetention {
 }
 
 struct CompletedAlignment {
-    ordinal: u64,
+    worker_index: usize,
     #[cfg(test)]
     fragment_bytes: usize,
     result: Result<FragmentAlignmentEvidence, String>,
@@ -350,7 +350,7 @@ where
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
         let mut task_senders = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        for worker_index in 0..threads {
             let (task_sender, task_receiver) =
                 sync_channel::<Fragment>(ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD);
             task_senders.push(task_sender);
@@ -359,15 +359,18 @@ where
             handles.push(scope.spawn(move || loop {
                 let task = task_receiver.recv();
                 let Ok(fragment) = task else { break };
-                let ordinal = fragment.ordinal;
                 #[cfg(test)]
                 let fragment_bytes =
                     fragment.r1.len() + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
-                let result = aligner.align_fragment_competitively(&fragment, contigs);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    aligner.align_fragment_competitively(&fragment, contigs)
+                }));
                 drop(fragment);
+                let panicked = result.is_err();
+                let result = result.unwrap_or_else(|_| Err("Alignment worker panicked".into()));
                 if result_sender
                     .send(CompletedAlignment {
-                        ordinal,
+                        worker_index,
                         #[cfg(test)]
                         fragment_bytes,
                         result,
@@ -376,18 +379,44 @@ where
                 {
                     break;
                 }
+                if panicked {
+                    break;
+                }
             }));
         }
         drop(result_sender);
         let processing = (|| -> Result<(), String> {
             #[cfg(test)]
             let mut retention = AlignmentRetention::default();
-            loop {
-                let mut submitted = 0;
-                while submitted < threads {
-                    let Some(fragment) = next_fragment()? else {
-                        break;
-                    };
+            let mut active = 0;
+            for sender in &task_senders {
+                let Some(fragment) = next_fragment()? else {
+                    break;
+                };
+                #[cfg(test)]
+                {
+                    let fragment_bytes = fragment.r1.len()
+                        + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
+                    retention.claim(fragment_bytes, threads);
+                    observe_retention(retention);
+                }
+                sender
+                    .send(fragment)
+                    .map_err(|_| "Alignment worker queue closed".to_string())?;
+                active += 1;
+            }
+            while active > 0 {
+                let completed = result_receiver
+                    .recv()
+                    .map_err(|_| "Alignment worker result queue closed".to_string())?;
+                active -= 1;
+                #[cfg(test)]
+                {
+                    retention.release(completed.fragment_bytes);
+                    observe_retention(retention);
+                }
+                sink(completed.result?);
+                if let Some(fragment) = next_fragment()? {
                     #[cfg(test)]
                     {
                         let fragment_bytes = fragment.r1.len()
@@ -395,29 +424,10 @@ where
                         retention.claim(fragment_bytes, threads);
                         observe_retention(retention);
                     }
-                    task_senders[submitted]
+                    task_senders[completed.worker_index]
                         .send(fragment)
                         .map_err(|_| "Alignment worker queue closed".to_string())?;
-                    submitted += 1;
-                }
-                if submitted == 0 {
-                    break;
-                }
-                let mut completed = Vec::with_capacity(submitted);
-                for _ in 0..submitted {
-                    let completed_fragment = result_receiver
-                        .recv()
-                        .map_err(|_| "Alignment worker result queue closed".to_string())?;
-                    #[cfg(test)]
-                    {
-                        retention.release(completed_fragment.fragment_bytes);
-                        observe_retention(retention);
-                    }
-                    completed.push(completed_fragment);
-                }
-                completed.sort_by_key(|alignment| alignment.ordinal);
-                for alignment in completed {
-                    sink(alignment.result?);
+                    active += 1;
                 }
             }
             #[cfg(test)]
@@ -503,6 +513,35 @@ mod tests {
         })
         .unwrap();
         (root, index)
+    }
+
+    #[test]
+    fn completed_worker_is_refilled_before_batch_drains() {
+        let (root, index) = fixture();
+        let mut fragments = (0..6)
+            .map(|ordinal| Fragment {
+                ordinal,
+                id: format!("fragment-{ordinal}"),
+                r1: vec![b'G'; 120],
+                r2: Some(vec![b'T'; 120]),
+            })
+            .collect::<VecDeque<_>>();
+        let trace = RefCell::new(Vec::new());
+        align_fragments_bounded_inner(
+            &index.mmi_path,
+            &index.contigs,
+            2,
+            &mut || Ok(fragments.pop_front()),
+            &mut |_| {},
+            |retention| trace.borrow_mut().push(retention.pending_fragments),
+        )
+        .unwrap();
+
+        assert!(trace
+            .into_inner()
+            .windows(3)
+            .any(|window| window == [2, 1, 2]));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
