@@ -146,6 +146,9 @@ impl EvidenceAccumulator {
         if evidence.aligned {
             self.aligned_fragments += 1;
         }
+        for group in &evidence.split_groups {
+            self.groups[*group].split_events += 1;
+        }
         match &evidence.adjudication {
             FragmentAdjudication::Supporting(group) => {
                 let target = &mut self.groups[*group];
@@ -155,7 +158,6 @@ impl EvidenceAccumulator {
                         .intervals
                         .insert(start, end.min(target.group.representative_length));
                 }
-                target.split_events += u64::from(evidence.split_groups.contains(group));
                 target.discordant_fragments +=
                     u64::from(evidence.discordant_groups.contains(group));
             }
@@ -309,6 +311,17 @@ impl IntervalUnion {
 mod tests {
     use super::*;
 
+    fn group() -> ReferenceGroup {
+        ReferenceGroup {
+            ordinal: 0,
+            target_group_id: "sha256:group".into(),
+            representative_id: "target".into(),
+            member_ids: vec!["target".into()],
+            representative_length: 100,
+            contig_name: "target_0".into(),
+        }
+    }
+
     #[test]
     fn exact_interval_matches_small_population_enumeration() {
         let interval = finite_population_interval(50, 10, 3, 0.05).unwrap();
@@ -380,5 +393,23 @@ mod tests {
         }
         assert_eq!(intervals.segments.len(), 1);
         assert_eq!(intervals.covered_bases(), 149);
+    }
+
+    #[test]
+    fn host_confounded_fragment_retains_host_target_split_diagnostic_once() {
+        let mut accumulator = EvidenceAccumulator::new(&[group()]);
+        accumulator.accumulate_group_evidence(FragmentAlignmentEvidence {
+            adjudication: FragmentAdjudication::Confounded(BTreeSet::from([0])),
+            aligned: true,
+            target_intervals: BTreeMap::new(),
+            split_groups: BTreeSet::from([0]),
+            discordant_groups: BTreeSet::new(),
+        });
+        assert_eq!(accumulator.groups[0].host_confounded_fragments, 1);
+        assert_eq!(accumulator.groups[0].split_events, 1);
+        assert_eq!(
+            accumulator.groups[0].integration_status(),
+            IntegrationStatus::DiagnosticEvidenceObserved
+        );
     }
 }

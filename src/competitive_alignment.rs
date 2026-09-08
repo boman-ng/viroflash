@@ -175,18 +175,7 @@ fn adjudicate_end(hits: &[AlignmentHit]) -> EndEvidence {
             .or_default()
             .push(hit.clone());
     }
-    for group in &result.targets {
-        let group_hits = hits
-            .iter()
-            .filter(|hit| {
-                hit.role == ReferenceRole::Target && hit.target_group_ordinal == Some(*group)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if has_split_geometry(&group_hits) {
-            result.split_groups.insert(*group);
-        }
-    }
+    result.split_groups = host_target_split_groups(hits, &result.targets);
     result
 }
 
@@ -257,13 +246,27 @@ pub fn adjudicate_fragment(r1: &[AlignmentHit], r2: &[AlignmentHit]) -> Fragment
     }
 }
 
-fn has_split_geometry(hits: &[AlignmentHit]) -> bool {
-    hits.iter().enumerate().any(|(index, left)| {
-        hits[index + 1..].iter().any(|right| {
-            (left.supplementary || right.supplementary)
-                && (left.query_end <= right.query_start || right.query_end <= left.query_start)
-        })
-    })
+fn host_target_split_groups(
+    hits: &[AlignmentHit],
+    target_groups: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let mut split_groups = BTreeSet::new();
+    for target in hits.iter().filter(|hit| hit.role == ReferenceRole::Target) {
+        let Some(group) = target.target_group_ordinal else {
+            continue;
+        };
+        if !target_groups.contains(&group) {
+            continue;
+        }
+        if hits.iter().any(|host| {
+            host.role == ReferenceRole::Host
+                && (target.supplementary || host.supplementary)
+                && (target.query_end <= host.query_start || host.query_end <= target.query_start)
+        }) {
+            split_groups.insert(group);
+        }
+    }
+    split_groups
 }
 
 pub fn align_fragments_bounded<N, S>(
@@ -414,29 +417,54 @@ mod tests {
     }
 
     #[test]
-    fn split_requires_supplementary_flag_and_disjoint_query_geometry() {
+    fn split_requires_host_target_supplementary_disjoint_geometry() {
         let primary = AlignmentHit {
             query_start: 0,
             query_end: 40,
             ..target(0, 90)
         };
-        let supplementary = AlignmentHit {
+        let target_supplementary = AlignmentHit {
             alignment_score: 35,
             query_start: 60,
             query_end: 100,
             supplementary: true,
             ..target(0, 90)
         };
-        let secondary = AlignmentHit {
-            supplementary: false,
-            ..supplementary.clone()
+        let host_supplementary = AlignmentHit {
+            query_start: 60,
+            query_end: 100,
+            supplementary: true,
+            ..host(35)
         };
+        assert!(
+            adjudicate_fragment(&[primary.clone(), target_supplementary], &[])
+                .split_groups
+                .is_empty()
+        );
         assert_eq!(
-            adjudicate_fragment(&[primary.clone(), supplementary], &[]).split_groups,
+            adjudicate_fragment(&[primary, host_supplementary], &[]).split_groups,
             BTreeSet::from([0])
         );
-        assert!(adjudicate_fragment(&[primary, secondary], &[])
-            .split_groups
-            .is_empty());
+    }
+
+    #[test]
+    fn host_target_alternatives_without_supplementary_geometry_are_not_split() {
+        let target_hit = target(0, 90);
+        let overlapping_host = host(35);
+        let disjoint_secondary_host = AlignmentHit {
+            query_start: 90,
+            query_end: 100,
+            ..host(35)
+        };
+        assert!(
+            adjudicate_fragment(&[target_hit.clone(), overlapping_host], &[])
+                .split_groups
+                .is_empty()
+        );
+        assert!(
+            adjudicate_fragment(&[target_hit, disjoint_secondary_host], &[])
+                .split_groups
+                .is_empty()
+        );
     }
 }

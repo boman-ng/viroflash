@@ -68,7 +68,7 @@ M_min = ceil(δN)
 π = min(1, 1 - (β/m)^(1/M_min))
 ```
 
-PE ends share one selection key and one attribution. A fragment contributes at most once to one group. Host ties or advantages are confounded; cross-group ties remain unresolved; multiple exact-equivalent members within one group retain group-level support.
+PE ends share one selection key and one attribution. A fragment contributes at most once to one group. Host ties or advantages are confounded; cross-group ties remain unresolved; multiple exact-equivalent members within one group retain group-level support. A split diagnostic requires disjoint HOST and TARGET chains on one read end with a supplementary alignment; TARGET alternatives alone are not split evidence.
 
 Selected fragments shorter than 21 bases or without an encodable 21-mer are counted explicitly and produce `CONFORMANT_WITH_LIMITATIONS`; they are not silently treated as target-negative.
 
