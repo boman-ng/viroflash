@@ -1,0 +1,9 @@
+field	type	cardinality	contract
+ledger_digest	sha256	one per index manifest	Digest of the canonical ledger bytes; not a ledger column and therefore not self-referential.
+group_ordinal	non-negative integer	one per group	Dense zero-based order determined at index build; runtime FASTQ cannot change it.
+target_group_id	sha256-prefixed string	one per group	sha256: plus the digest of min(uppercase full sequence bytes, reverse complement bytes); unique and alias-free.
+representative_id	non-empty FASTA identifier	one per group	Representative target member used for coordinates and length.
+member_ids	ordered non-empty string list	one per group	All and only target members in the group; representative included; OR semantics only.
+representative_length	positive integer	one per group	Length used for coverage diagnostics.
+target_fasta_sha256	sha256	one per ledger	Digest of the target FASTA from which every group is built.
+profile_digest	sha256	one per ledger	Frozen analysis profile identity used to build the index.

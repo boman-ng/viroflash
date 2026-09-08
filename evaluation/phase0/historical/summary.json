@@ -1,0 +1,48 @@
+{
+  "contract_id": "viroflash.phase0.historical-baseline",
+  "interpretation": "Historical observations only; not v0.5 acceptance truth.",
+  "internal_68": {
+    "completed_runs": 68,
+    "expected_target_detected": 22,
+    "expected_target_total": 24,
+    "negative_without_pass": 44,
+    "negative_total": 44,
+    "batch_wall_minutes": 28.9,
+    "sample_wall_seconds": {
+      "median": 147.3,
+      "p95": 437.7,
+      "max": 685.9
+    },
+    "peak_rss_gib": {
+      "median": 25.26,
+      "p95": 25.83,
+      "max": 26.14
+    },
+    "index_build": {
+      "wall_seconds": 1507.0,
+      "peak_rss_gib": 45.53
+    },
+    "binary_sha256": "b390889619ec85e64e3660794a8a22a5987988abdd470510692fc98561696039",
+    "legacy_index_manifest_sha256": "af80dd4fca076c75e2d0187c36bae8f83c6e107a40317fbd2bb6aa4a1d04f02c",
+    "source_path": "/home/wubw/data/viroflash/dna_virus_68_20260827/detection_by_sample.tsv",
+    "source_sha256": "e69eafddd0dd896cf2e24ced410c491b75a23af47d08888955267176afefcb70"
+  },
+  "external_59": {
+    "completed_runs": 59,
+    "pass": 36,
+    "below_threshold": 17,
+    "without_candidate": 6,
+    "sample_wall_seconds": {
+      "median": 34.7,
+      "p95": 53.7,
+      "max": 106.7
+    },
+    "peak_rss_gib": {
+      "median": 10.68,
+      "max": 10.78
+    },
+    "binary_sha256": "b390889619ec85e64e3660794a8a22a5987988abdd470510692fc98561696039",
+    "source_path": "/home/wubw/data/viroflash-benchmarks/results_20260827/label_comparison.tsv",
+    "source_sha256": "76b6b1581dbdc1f0334f768edac6a83be0e8868891cb43d8227fd76f9446b28c"
+  }
+}
