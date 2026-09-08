@@ -27,7 +27,7 @@ From: ubuntu:22.04
 
 %labels
     org.opencontainers.image.title viroflash
-    org.opencontainers.image.description "Reference-group fragment evidence command-line tool"
+    org.opencontainers.image.description Reference-group fragment evidence command-line tool
     org.opencontainers.image.source https://github.com/boman-ng/viroflash
     org.opencontainers.image.version {{ VERSION }}
     org.opencontainers.image.revision {{ REVISION }}
