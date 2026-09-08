@@ -3,7 +3,7 @@
   "frozen_on": "2026-09-08",
   "freeze_state": "PRE_EXECUTION_FROZEN",
   "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-  "frozen_evaluation_digest": "dc7848461a906d367ad3a9a482b0c2f39001ddfe039758232fb32d0fcc6dc83c",
+  "frozen_evaluation_digest": "ff0c9031432dbf088595220c8e077fbe03c2d2d361f9a090348392791fcdf80e",
   "checksum_provenance": {
     "PHASE0_FROZEN_COMPRESSED_SHA256": {
       "frozen_on": "2026-09-08",
@@ -53,7 +53,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -96,7 +96,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -139,7 +139,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -184,7 +184,7 @@
         "Historical baseline reports EBV rather than the source label; retain the source label for adjudication."
       ],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -227,7 +227,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -270,7 +270,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -313,7 +313,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -356,7 +356,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -399,7 +399,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -442,7 +442,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -485,7 +485,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -528,7 +528,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -571,7 +571,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -614,7 +614,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -657,7 +657,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -700,7 +700,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -743,7 +743,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -786,7 +786,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -829,7 +829,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -872,7 +872,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -915,7 +915,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -958,7 +958,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1001,7 +1001,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1044,7 +1044,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1087,7 +1087,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1130,7 +1130,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1173,7 +1173,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1216,7 +1216,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1259,7 +1259,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1302,7 +1302,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1345,7 +1345,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1388,7 +1388,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1431,7 +1431,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1474,7 +1474,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1519,7 +1519,7 @@
         "Historical baseline reports EBV rather than the source label; retain the source label for adjudication."
       ],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1562,7 +1562,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1605,7 +1605,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1648,7 +1648,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1691,7 +1691,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1734,7 +1734,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1777,7 +1777,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1820,7 +1820,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1863,7 +1863,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1906,7 +1906,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1949,7 +1949,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -1992,7 +1992,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2035,7 +2035,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2078,7 +2078,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2121,7 +2121,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2164,7 +2164,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2207,7 +2207,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2250,7 +2250,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2293,7 +2293,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2336,7 +2336,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2379,7 +2379,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2422,7 +2422,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2465,7 +2465,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2508,7 +2508,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2551,7 +2551,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2594,7 +2594,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2637,7 +2637,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2680,7 +2680,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2723,7 +2723,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2766,7 +2766,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2809,7 +2809,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2852,7 +2852,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2895,7 +2895,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {
@@ -2938,7 +2938,7 @@
       "evaluability_status": "EVALUABLE",
       "ambiguity_notes": [],
       "profile_digest": "7974800cbdb062b3b7c331bcdd5222cbea968f6842c63c27161be26686f01821",
-      "planned_threads": 8,
+      "planned_threads": 16,
       "planned_jobs": 8
     },
     {

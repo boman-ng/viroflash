@@ -305,6 +305,7 @@ def validate_manifest(profile_digest):
     run_ids = [run.get("run_id") for run in runs]
     require(len(run_ids) == len(set(run_ids)), "run IDs are not unique")
     require(Counter((run["dataset_id"], run["cohort"], run["input_mode"]) for run in runs) == Counter({("internal-68", "internal_dna_virus_68", "PE"): 68, ("external-59", "gse147507_rsv", "SE"): 6, ("external-59", "gse147507_sars", "SE"): 6, ("external-59", "gse91065_hpv", "SE"): 24, ("external-59", "gse91065_hpv", "PE"): 23}), "cohort/input-mode matrix changed")
+    require(Counter((run["dataset_id"], run["planned_jobs"], run["planned_threads"]) for run in runs) == Counter({("internal-68", 8, 16): 68, ("external-59", 4, 16): 59}), "planned resource matrix changed")
 
     authoritative = read_checksum_list(EXTERNAL_FASTQ_SUMS) | read_checksum_list(EXTERNAL_REFERENCE_SUMS)
     result_sums = read_checksum_list(EXTERNAL_RESULT_SUMS)
