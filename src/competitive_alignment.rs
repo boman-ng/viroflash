@@ -344,16 +344,15 @@ where
     N: FnMut() -> Result<Option<Fragment>, String>,
     S: FnMut(FragmentAlignmentEvidence),
 {
-    let aligners = (0..threads)
-        .map(|_| CompetitiveAligner::open(index_path))
-        .collect::<Result<Vec<_>, _>>()?;
+    let aligner = Arc::new(CompetitiveAligner::open(index_path)?);
     let queue_capacity = threads * ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD;
     let (task_sender, task_receiver) = sync_channel::<Fragment>(queue_capacity);
     let task_receiver = Arc::new(Mutex::new(task_receiver));
     let (result_sender, result_receiver) = sync_channel(queue_capacity);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
-        for aligner in aligners {
+        for _ in 0..threads {
+            let aligner = Arc::clone(&aligner);
             let task_receiver = Arc::clone(&task_receiver);
             let result_sender = result_sender.clone();
             handles.push(scope.spawn(move || loop {
