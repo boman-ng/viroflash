@@ -4,7 +4,7 @@ use crate::analysis_profile::AnalysisProfile;
 use crate::competitive_alignment::align_fragments_bounded;
 use crate::evidence::EvidenceAccumulator;
 use crate::fastq_input::{census_fastq, FragmentReader};
-use crate::kmer_gate::GateEvaluation;
+use crate::kmer_gate::{GateEvaluation, GateScratch};
 use crate::performance_report::{stage_start, write_perf_json, PerformanceMonitor, StageTimes};
 use crate::reference_index::load_index;
 use crate::report::{build_evidence_report, write_report_csv, write_report_html, ReportInputs};
@@ -60,6 +60,7 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
         let started = stage_start();
         let mut fragments = FragmentReader::open(&options.r1, options.r2.as_deref())?;
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
+        let mut gate_scratch = GateScratch::default();
         let mut pass2_fragments = 0;
         align_fragments_bounded(
             &index.mmi_path,
@@ -80,10 +81,11 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
                     continue;
                 }
                 counts.1 += 1;
-                match index
-                    .bloom
-                    .evaluate_fragment(&fragment.r1, fragment.r2.as_deref())
-                {
+                match index.bloom.evaluate_fragment(
+                    &fragment.r1,
+                    fragment.r2.as_deref(),
+                    &mut gate_scratch,
+                ) {
                     GateEvaluation::Pass => {
                         counts.2 += 1;
                         return Ok(Some(fragment));
@@ -251,10 +253,14 @@ mod tests {
         let aligner = CompetitiveAligner::open(&index.mmi_path).unwrap();
         let mut reader = FragmentReader::open(fastq, None).unwrap();
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
+        let mut gate_scratch = GateScratch::default();
         let mut submitted = 0;
         while let Some(fragment) = reader.next_fragment().unwrap() {
             if !exhaustive
-                && index.bloom.evaluate_fragment(&fragment.r1, None) != GateEvaluation::Pass
+                && index
+                    .bloom
+                    .evaluate_fragment(&fragment.r1, None, &mut gate_scratch)
+                    != GateEvaluation::Pass
             {
                 continue;
             }

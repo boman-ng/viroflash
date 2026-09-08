@@ -19,6 +19,10 @@
     "sequence_normalization": "remove ASCII whitespace between FASTA headers, then uppercase",
     "iupac_dna_alphabet": "ACGTMRWSYKVHDBN",
     "invalid_sequence_symbol": "reject the reference file without dropping or replacing the symbol",
+    "canonical_kmer_encoding": "rolling 4-bit ACGTMRWSYKVHDBN code, minimum of forward and reverse-complement codes",
+    "low_complexity_masking": "minimap2 symmetric DUST (sdust.c)",
+    "sdust_window": 64,
+    "sdust_threshold": 20,
     "alignment_acceptance": "all emitted chains with CIGAR and positive query length",
     "alignment_role_margin": 0,
     "occupied_window_bins": 10
