@@ -94,7 +94,21 @@ class Phase6Tests(unittest.TestCase):
         )
         self.assertEqual(decision["classification"], "LABEL_DISCORDANT_WITH_SEQUENCE_EVIDENCE")
         self.assertEqual(decision["observed_signal_count"], 1)
+        self.assertEqual(decision["label_scope_observed_signal_count"], 1)
         self.assertFalse(decision["wrong_group_resolved"])
+
+    def test_internal_mock_ignores_off_scope_signal_for_label_adjudication(self):
+        run = {
+            "expectation_kind": "MOCK", "expected_group_key": None,
+            "dataset_id": "internal-68", "evaluability_status": "EVALUABLE",
+        }
+        off_scope = self.target("off-panel-virus", "REFERENCE_SIGNAL_OBSERVED")
+        decision = adjudicate(run, {"targets": [off_scope]}, {"ebv": "EBV"})
+        self.assertEqual(decision["classification"], "LABEL_CONCORDANT_NO_SIGNAL")
+        self.assertEqual(decision["observed_signal_count"], 1)
+        self.assertEqual(decision["label_scope_observed_signal_count"], 0)
+        self.assertFalse(decision["wrong_group_resolved"])
+        self.assertEqual(len(decision["evidence_summary"]), 1)
 
     def test_performance_false_conditions_surface_in_hard_gates(self):
         performance = {
