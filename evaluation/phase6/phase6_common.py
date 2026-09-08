@@ -82,6 +82,12 @@ SCORER_CORRECTIONS = (
         "discovery": "Phase 6 reviewer integrity review",
         "correction": "Internal taxon matching starts at the FASTA description and excludes non-human Heron hepatitis B virus; independent public report semantic validation and scoring provenance binding were added.",
     },
+    {
+        "commit": "5fc4efb",
+        "timing": "POST_RUN_POST_REVIEW_RESCORING_PRE_SECOND_REVIEW_RESCORING",
+        "discovery": "second Phase 6 reviewer integrity review",
+        "correction": "A bounded metadata-aware species matcher restores legitimate scoped human-virus labels while excluding Heron HBV and HPV numeric lookalikes; exact enum/status validation and independent cached hypergeometric inversion expose invalid report intervals without suppressing evidence.",
+    },
 )
 RETROSPECTIVE_PROVENANCE_LIMIT = (
     "The completed current campaign did not bind scorer/config/manifest inputs before execution. "
