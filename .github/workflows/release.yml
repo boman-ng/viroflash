@@ -79,7 +79,7 @@ jobs:
         run: |
           binary=target/x86_64-unknown-linux-musl/release/viroflash
           cargo build --release --locked --target x86_64-unknown-linux-musl
-          "${binary}" version
+          "${binary}" --help
           file "${binary}" | grep -q 'x86-64'
           if readelf --program-headers "${binary}" | grep -q INTERP; then
             echo "Release binary requires a runtime loader" >&2
@@ -111,23 +111,24 @@ jobs:
           data="${RUNNER_TEMP}/viroflash-release-test"
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${package}.tar.gz" --directory "${unpacked}"
-          "${unpacked}/${package}/viroflash" version
-          python3 scripts/make_virtual_data.py "${data}" --scenario positive
+          "${unpacked}/${package}/viroflash" --help
+          python3 .github/scripts/create-smoke-fixture.py "${data}"
+          "${unpacked}/${package}/viroflash" index \
+            --host-fa "${data}/host.fa" \
+            --target-fa "${data}/target.fa" \
+            --threads 2 \
+            --out "${data}/index"
           "${unpacked}/${package}/viroflash" run \
-            --r1 "${data}/positive/reads_R1.fq.gz" \
-            --r2 "${data}/positive/reads_R2.fq.gz" \
-            --host-fa "${data}/positive/host.fa" \
-            --target-fa "${data}/positive/target.fa" \
-            --decoy-fa "${data}/positive/decoy.fa" \
-            --contam-fa "${data}/positive/contam.fa" \
+            --r1 "${data}/sample.fastq" \
+            --index "${data}/index" \
             --threads 2 \
             --out "${data}/result"
-          test -s "${data}/result.html"
-          test -s "${data}/result.csv"
-          test -s "${data}/result.json"
-          test -s "${data}/result.tsv"
-          test -s "${data}/result.perf.json"
-          test "$(find "${data}" -maxdepth 1 -type f -name 'result.perf.*' | wc -l)" -eq 1
+          expected="$(printf '%s\n' perf.json report.csv report.html)"
+          actual="$(find "${data}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          test "${actual}" = "${expected}"
+          test -s "${data}/result/report.csv"
+          test -s "${data}/result/report.html"
+          test -s "${data}/result/perf.json"
 
       - name: Upload binary archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -179,7 +180,25 @@ jobs:
             --build-arg "VERSION=${VERSION}" \
             --build-arg "REVISION=${REVISION}" \
             "dist/${image}" Apptainer.def
-          apptainer run "dist/${image}" version
+          apptainer run "dist/${image}" --help
+          data="${RUNNER_TEMP}/viroflash-sif-test"
+          python3 .github/scripts/create-smoke-fixture.py "${data}"
+          apptainer run --bind "${data}:/work" --pwd /work "dist/${image}" index \
+            --host-fa /work/host.fa \
+            --target-fa /work/target.fa \
+            --threads 2 \
+            --out /work/index
+          apptainer run --bind "${data}:/work" --pwd /work "dist/${image}" run \
+            --r1 /work/sample.fastq \
+            --index /work/index \
+            --threads 2 \
+            --out /work/result
+          expected="$(printf '%s\n' perf.json report.csv report.html)"
+          actual="$(find "${data}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          test "${actual}" = "${expected}"
+          test -s "${data}/result/report.csv"
+          test -s "${data}/result/report.html"
+          test -s "${data}/result/perf.json"
           cd dist
           sha256sum "${image}" > "${image}.sha256"
 

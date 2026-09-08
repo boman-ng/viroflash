@@ -8,6 +8,7 @@ WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY evaluation/phase0/analysis-profile.json ./evaluation/phase0/analysis-profile.json
 
 RUN cargo build --release --locked
 
@@ -16,7 +17,7 @@ FROM debian:${DEBIAN_RELEASE} AS runtime
 ARG VERSION=dev
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="viroflash" \
-      org.opencontainers.image.description="Viral candidate detection command-line tool" \
+      org.opencontainers.image.description="Reference-group fragment evidence command-line tool" \
       org.opencontainers.image.source="https://github.com/boman-ng/viroflash" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}"

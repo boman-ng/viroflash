@@ -62,7 +62,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           binary=target/x86_64-unknown-linux-musl/release/viroflash
           cargo build --release --locked --target x86_64-unknown-linux-musl
-          "${binary}" version
+          "${binary}" --help
           if readelf --program-headers "${binary}" | grep -q INTERP; then
             echo "Release binary requires a runtime loader" >&2
             exit 1
@@ -84,23 +84,30 @@ jobs:
 
       - name: Smoke-test image
         run: |
-          docker run --rm viroflash:ci version
+          docker run --rm viroflash:ci --help
           test_dir="${RUNNER_TEMP}/viroflash-docker-test"
-          python3 scripts/make_virtual_data.py "${test_dir}" --scenario positive
+          python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
           chmod -R a+rwX "${test_dir}"
           docker run --rm \
             --volume "${test_dir}:/work" \
+            viroflash:ci index \
+            --host-fa /work/host.fa \
+            --target-fa /work/target.fa \
+            --threads 2 \
+            --out /work/index
+          docker run --rm \
+            --volume "${test_dir}:/work" \
             viroflash:ci run \
-            --r1 /work/positive/reads_R1.fq.gz \
-            --r2 /work/positive/reads_R2.fq.gz \
-            --host-fa /work/positive/host.fa \
-            --target-fa /work/positive/target.fa \
-            --decoy-fa /work/positive/decoy.fa \
-            --contam-fa /work/positive/contam.fa \
+            --r1 /work/sample.fastq \
+            --index /work/index \
             --threads 2 \
             --out /work/result
-          test -s "${test_dir}/result.json"
-          test -s "${test_dir}/result.tsv"
+          expected="$(printf '%s\n' perf.json report.csv report.html)"
+          actual="$(find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          test "${actual}" = "${expected}"
+          test -s "${test_dir}/result/report.csv"
+          test -s "${test_dir}/result/report.html"
+          test -s "${test_dir}/result/perf.json"
 
   apptainer:
     name: Apptainer image
@@ -131,17 +138,22 @@ jobs:
 
       - name: Smoke-test image
         run: |
-          apptainer run viroflash.sif version
+          apptainer run viroflash.sif --help
           test_dir="${RUNNER_TEMP}/viroflash-apptainer-test"
-          python3 scripts/make_virtual_data.py "${test_dir}" --scenario positive
+          python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
+          apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif index \
+            --host-fa /work/host.fa \
+            --target-fa /work/target.fa \
+            --threads 2 \
+            --out /work/index
           apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif run \
-            --r1 /work/positive/reads_R1.fq.gz \
-            --r2 /work/positive/reads_R2.fq.gz \
-            --host-fa /work/positive/host.fa \
-            --target-fa /work/positive/target.fa \
-            --decoy-fa /work/positive/decoy.fa \
-            --contam-fa /work/positive/contam.fa \
+            --r1 /work/sample.fastq \
+            --index /work/index \
             --threads 2 \
             --out /work/result
-          test -s "${test_dir}/result.json"
-          test -s "${test_dir}/result.tsv"
+          expected="$(printf '%s\n' perf.json report.csv report.html)"
+          actual="$(find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          test "${actual}" = "${expected}"
+          test -s "${test_dir}/result/report.csv"
+          test -s "${test_dir}/result/report.html"
+          test -s "${test_dir}/result/perf.json"
