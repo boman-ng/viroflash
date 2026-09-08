@@ -10,6 +10,7 @@ use crate::reference_index::{ReferenceContig, ReferenceRole};
 
 const ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD: usize = 1;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 struct AlignmentRetention {
     pending_fragments: usize,
@@ -20,6 +21,7 @@ struct AlignmentRetention {
     total_sequence_bytes: usize,
 }
 
+#[cfg(test)]
 impl AlignmentRetention {
     fn claim(&mut self, fragment_bytes: usize, threads: usize) {
         self.pending_fragments += 1;
@@ -38,6 +40,13 @@ impl AlignmentRetention {
         self.pending_fragments -= 1;
         self.pending_sequence_bytes -= fragment_bytes;
     }
+}
+
+struct CompletedAlignment {
+    ordinal: u64,
+    #[cfg(test)]
+    fragment_bytes: usize,
+    result: Result<FragmentAlignmentEvidence, String>,
 }
 
 pub struct CompetitiveAligner {
@@ -318,22 +327,22 @@ where
         threads,
         &mut next_fragment,
         &mut sink,
+        #[cfg(test)]
         |_| {},
     )
 }
 
-fn align_fragments_bounded_inner<N, S, O>(
+fn align_fragments_bounded_inner<N, S>(
     index_path: &Path,
     contigs: &std::collections::HashMap<String, ReferenceContig>,
     threads: usize,
     next_fragment: &mut N,
     sink: &mut S,
-    mut observe_batch: O,
+    #[cfg(test)] mut observe_retention: impl FnMut(AlignmentRetention),
 ) -> Result<(), String>
 where
     N: FnMut() -> Result<Option<Fragment>, String>,
     S: FnMut(FragmentAlignmentEvidence),
-    O: FnMut(AlignmentRetention),
 {
     let aligners = (0..threads)
         .map(|_| CompetitiveAligner::open(index_path))
@@ -351,12 +360,18 @@ where
                 let task = task_receiver.lock().expect("task receiver lock").recv();
                 let Ok(fragment) = task else { break };
                 let ordinal = fragment.ordinal;
+                #[cfg(test)]
                 let fragment_bytes =
                     fragment.r1.len() + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
                 let result = aligner.align_fragment_competitively(&fragment, contigs);
                 drop(fragment);
                 if result_sender
-                    .send((ordinal, fragment_bytes, result))
+                    .send(CompletedAlignment {
+                        ordinal,
+                        #[cfg(test)]
+                        fragment_bytes,
+                        result,
+                    })
                     .is_err()
                 {
                     break;
@@ -365,6 +380,7 @@ where
         }
         drop(result_sender);
         let processing = (|| -> Result<(), String> {
+            #[cfg(test)]
             let mut retention = AlignmentRetention::default();
             loop {
                 let mut submitted = 0;
@@ -372,10 +388,13 @@ where
                     let Some(fragment) = next_fragment()? else {
                         break;
                     };
-                    let fragment_bytes = fragment.r1.len()
-                        + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
-                    retention.claim(fragment_bytes, threads);
-                    observe_batch(retention);
+                    #[cfg(test)]
+                    {
+                        let fragment_bytes = fragment.r1.len()
+                            + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
+                        retention.claim(fragment_bytes, threads);
+                        observe_retention(retention);
+                    }
                     task_sender
                         .send(fragment)
                         .map_err(|_| "Alignment worker queue closed".to_string())?;
@@ -389,17 +408,23 @@ where
                     let completed_fragment = result_receiver
                         .recv()
                         .map_err(|_| "Alignment worker result queue closed".to_string())?;
-                    retention.release(completed_fragment.1);
-                    observe_batch(retention);
+                    #[cfg(test)]
+                    {
+                        retention.release(completed_fragment.fragment_bytes);
+                        observe_retention(retention);
+                    }
                     completed.push(completed_fragment);
                 }
-                completed.sort_by_key(|(ordinal, _, _)| *ordinal);
-                for (_, _, result) in completed {
-                    sink(result?);
+                completed.sort_by_key(|alignment| alignment.ordinal);
+                for alignment in completed {
+                    sink(alignment.result?);
                 }
             }
-            assert_eq!(retention.pending_fragments, 0);
-            assert_eq!(retention.pending_sequence_bytes, 0);
+            #[cfg(test)]
+            {
+                assert_eq!(retention.pending_fragments, 0);
+                assert_eq!(retention.pending_sequence_bytes, 0);
+            }
             Ok(())
         })();
         drop(task_sender);
