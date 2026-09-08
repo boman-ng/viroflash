@@ -25,7 +25,6 @@ report.csv	TARGET_SIGNAL	representative_id	exactly one	Ledger representative ide
 report.csv	TARGET_SIGNAL	member_ids	exactly one	Ordered ledger member list.
 report.csv	TARGET_SIGNAL	evidence_status	exactly one	Evidence axis.
 report.csv	TARGET_SIGNAL	attribution_status	exactly one	Attribution axis.
-report.csv	TARGET_SIGNAL	quantitation_status	exactly one	Quantitation axis.
 report.csv	TARGET_SIGNAL	supporting_selected_fragments	exactly one	Selected fragments supporting the group.
 report.csv	TARGET_SIGNAL	selected_fragment_denominator	exactly one	Selected fragment denominator.
 report.csv	TARGET_SIGNAL	attributed_fragment_fraction	exactly one	Profile-attributed fragment fraction.

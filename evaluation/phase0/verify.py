@@ -35,7 +35,15 @@ PROFILE_PARAMETERS = {
     "minimum_relevant_fraction": {"symbol": "δ", "value": 0.00001},
     "familywise_interval_error": {"symbol": "α", "value": 0.05},
     "familywise_miss_probability": {"symbol": "β", "value": 0.05},
-    "maximum_interval_width": {"symbol": "w", "value": 0.00001},
+}
+DECISION_AUTHORITY = {
+    "actor": "user",
+    "authorized_on": "2026-09-08",
+    "authorized_parameters": [
+        "minimum_relevant_fraction",
+        "familywise_miss_probability",
+        "familywise_interval_error",
+    ],
 }
 INDEX_AND_ALIGNMENT = {
     "kmer_length": 21,
@@ -61,7 +69,7 @@ OUTPUT_FIELDS = {
     },
     ("report.csv", "TARGET_SIGNAL"): {
         "record_type", "target_group_id", "representative_id", "member_ids",
-        "evidence_status", "attribution_status", "quantitation_status",
+        "evidence_status", "attribution_status",
         "supporting_selected_fragments", "selected_fragment_denominator",
         "attributed_fragment_fraction", "interval_lower", "interval_upper", "interval_level",
         "interval_method", "estimated_input_supporting_fragments", "covered_bases",
@@ -127,8 +135,9 @@ def read_checksum_list(path):
 def validate_profile():
     profile_path = PHASE0 / "analysis-profile.json"
     profile = json.loads(profile_path.read_text())
-    require(set(profile) == {"contract_id", "decision_status", "frozen_on", "index_and_alignment", "parameters"}, "profile fields changed")
-    require(profile["decision_status"] == "PENDING_PRODUCT_DECISION", "profile decision status changed")
+    require(set(profile) == {"contract_id", "decision_status", "frozen_on", "decision_authority", "index_and_alignment", "parameters"}, "profile fields changed")
+    require(profile["decision_status"] == "FROZEN", "profile decision status changed")
+    require(profile["decision_authority"] == DECISION_AUTHORITY, "profile decision authority changed")
     require(profile["parameters"] == PROFILE_PARAMETERS, "profile parameter contract changed")
     require(profile["index_and_alignment"] == INDEX_AND_ALIGNMENT, "index/alignment profile changed")
     require(ALPHABET == frozenset(b"ACGTMRWSYKVHDBN"), "parser IUPAC alphabet changed")
@@ -348,7 +357,7 @@ def main():
     profile_digest = validate_profile()
     validate_manifest(profile_digest)
     validate_contract_files()
-    print("Phase 0 checksum metadata consistency passed; FASTQ bytes were not read; analysis profile remains pending product decision")
+    print("Phase 0 checksum metadata consistency passed; FASTQ bytes were not read; three-parameter analysis profile is frozen")
 
 
 if __name__ == "__main__":

@@ -1,21 +1,22 @@
 # Phase 0 analysis contract
 
-This document freezes Phase 0 evidence and proposed decisions for review. It does not alter the production path, change a production schema, authorize the proposed scientific values, or authorize inspecting a v0.5 result.
+This document freezes Phase 0 evidence and the explicitly authorized scientific decisions. It does not alter the production path, change a production schema, or authorize inspecting a v0.5 result.
 
 ## Frozen AnalysisProfile
 
-`evaluation/phase0/analysis-profile.json` has decision status `PENDING_PRODUCT_DECISION`. Its concrete values are proposals only and must not be used by an implementation or to produce results. The user must explicitly confirm the scientific choices before the status can become `FROZEN`. The 68 internal and 59 external runs must not be used to select or revise them.
+The user explicitly authorized δ=1e-5, β=.05, and α=.05 on 2026-09-08. `evaluation/phase0/analysis-profile.json` records the actor as `user`, the date, and exactly those three parameters with decision status `FROZEN`; no person or approval system is invented. The 68 internal and 59 external runs were not used to select or revise them.
 
 | Field | Symbol | Value | Product decision |
 |---|---:|---:|---|
 | `minimum_relevant_fraction` | δ | 0.00001 | Design for a group at 10 fragments per million input fragments; not a clinical LoD. |
 | `familywise_interval_error` | α | 0.05 | Require 95% simultaneous target-family interval coverage. |
 | `familywise_miss_probability` | β | 0.05 | Permit at most 5% planned familywise probability of sampling no fragment at δ. |
-| `maximum_interval_width` | w | 0.00001 | Call precision met only at interval width no greater than 10 fragments per million. |
 
 There is no minimum-read, MAPQ, edit-distance, alignment-margin, coverage, window, p/q, or PASS cutoff. `k=21`, minimap2 `sr`, all-chain enumeration, and ten equal-width diagnostic windows are profile inputs, not CLI choices. Changing any profile byte creates a new profile digest, requires new indexes, and restarts all 127 evaluations.
 
-The four values are not authorized, estimated, or calibrated from these datasets. Horvitz and Thompson support explicit inclusion-probability accounting; exact hypergeometric bounds support finite-population intervals; Dunn supports Bonferroni simultaneous coverage. These references justify candidate methods, not δ/w=1e-5 or α/β=.05: <https://doi.org/10.1080/01621459.1952.10483446>, <https://doi.org/10.1007/978-1-4612-3140-0>, <https://doi.org/10.1080/01621459.1961.10482090>.
+The values are authorized product/scientific choices, not estimates or calibration results from these datasets. α is the familywise error for simultaneous target-family intervals. Horvitz and Thompson support explicit inclusion-probability accounting; exact hypergeometric bounds support finite-population intervals; Dunn supports Bonferroni simultaneous coverage. These references support the methods, not empirical calibration of δ, β, or α: <https://doi.org/10.1080/01621459.1952.10483446>, <https://doi.org/10.1007/978-1-4612-3140-0>, <https://doi.org/10.1080/01621459.1961.10482090>.
+
+The point estimate and `interval_lower`, `interval_upper`, `interval_level`, and `interval_method` are reported continuously and unchanged. The interval is the only precision expression. No interval width produces a binary category, and there is no “trusted”, “gray-zone”, or precision-met mapping.
 
 ## Digest and analysis identity
 
@@ -78,12 +79,12 @@ There is no automatic index build, scientific parameter option, legacy alias, co
 
 The external 82 FASTQ digests correspond exactly to `metadata/FASTQ_SHA256SUMS`; external reference digests correspond to `refs/SHA256SUMS`. Internal truth and target-reference digests correspond to the existing `run_config.json`. The 136 internal FASTQ digests were computed on 2026-09-08 by parallel streaming SHA-256 over the existing gzip bytes without decompression and are independently frozen in `internal-fastq-sha256.tsv` with status `PHASE0_FROZEN_COMPRESSED_SHA256`; this is explicit Phase 0 provenance, not an upstream authoritative source. The internal host digest remains `PHASE0_COMPUTED` metadata.
 
-`PRE_EXECUTION_FROZEN` means sample, truth, checksum, ledger, and the bytes of the pending profile proposal are fixed for review. It does not mean the proposal is approved or that any binary/index artifact is bound. Phase 6 owns artifact validation: the final E2E runner must stream SHA-256 from the actual binary and cohort-index paths under the then-current concrete artifact contract before running results. Git review, not this verifier, controls any attempted rebinding. No Phase 0 artifact gate, registry, migration, alternate schema, or binding claim exists.
+`PRE_EXECUTION_FROZEN` means sample, truth, checksum, ledger, and the authorized profile bytes are fixed before execution. It does not mean any binary/index artifact is bound. Phase 6 owns artifact validation: the final E2E runner must stream SHA-256 from the actual binary and cohort-index paths under the then-current concrete artifact contract before running results. Git review, not this verifier, controls any attempted rebinding. No Phase 0 artifact gate, registry, migration, alternate schema, or binding claim exists.
 
-`evaluation/phase0/historical/` is an immutable snapshot of old-system observations. It is comparison evidence only: not v0.5 acceptance truth, not a pristine holdout, not a scorer input, and not permission to tune δ/α/β/w.
+`evaluation/phase0/historical/` is an immutable snapshot of old-system observations. It is comparison evidence only: not v0.5 acceptance truth, not a pristine holdout, not a scorer input, and not permission to tune δ/α/β.
 
 ## Verification
 
-Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, exact pending profile fields, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`. Its success means checksum metadata consistency; it does not read or recompute FASTQ bytes and does not authorize implementation or E2E.
+Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, the exact frozen three-parameter profile, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`. Its success means checksum metadata consistency; it does not read or recompute FASTQ bytes or validate future execution artifacts.
 
 Phase 6 Input Pass 1 owns streaming recomputation of the 136 internal FASTQ digests while reading the exact compressed inputs. Any mismatch must stop that run before analysis. No separate default Phase 0 byte scan is implied.

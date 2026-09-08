@@ -1,7 +1,16 @@
 {
   "contract_id": "viroflash.analysis-profile.phase0",
-  "decision_status": "PENDING_PRODUCT_DECISION",
+  "decision_status": "FROZEN",
   "frozen_on": "2026-09-08",
+  "decision_authority": {
+    "actor": "user",
+    "authorized_on": "2026-09-08",
+    "authorized_parameters": [
+      "minimum_relevant_fraction",
+      "familywise_miss_probability",
+      "familywise_interval_error"
+    ]
+  },
   "index_and_alignment": {
     "kmer_length": 21,
     "minimap2_preset": "sr",
@@ -26,10 +35,6 @@
     "familywise_miss_probability": {
       "symbol": "β",
       "value": 0.05
-    },
-    "maximum_interval_width": {
-      "symbol": "w",
-      "value": 0.00001
     }
   }
 }
