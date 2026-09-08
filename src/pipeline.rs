@@ -205,3 +205,132 @@ fn sample_id(path: &Path) -> String {
     }
     name
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::competitive_alignment::{CompetitiveAligner, FragmentAdjudication};
+    use crate::fastq_input::FragmentReader;
+    use crate::reference_index::{build_index, IndexOptions};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn sequence(seed: u64, length: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state & 3) as usize]
+            })
+            .collect()
+    }
+
+    fn write_fasta(path: &Path, id: &str, sequence: &[u8]) {
+        let mut file = File::create(path).unwrap();
+        writeln!(file, ">{id}\n{}", String::from_utf8_lossy(sequence)).unwrap();
+    }
+
+    #[test]
+    fn phase5_gate_counterfactual_quantifies_exhaustive_evidence_difference() {
+        let root = std::env::temp_dir().join(format!(
+            "viroflash-phase5-gate-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let host = sequence(17, 600);
+        let target = sequence(91, 600);
+        write_fasta(&root.join("host.fa"), "host", &host);
+        write_fasta(&root.join("target.fa"), "target", &target);
+        let index = build_index(&IndexOptions {
+            host_fa: root.join("host.fa"),
+            target_fa: root.join("target.fa"),
+            out_dir: root.join("index"),
+            threads: 1,
+        })
+        .unwrap();
+
+        let exact = target[100..220].to_vec();
+        let mut approximate = exact.clone();
+        for offset in (10..approximate.len()).step_by(20) {
+            approximate[offset] = match approximate[offset] {
+                b'A' => b'C',
+                b'C' => b'G',
+                b'G' => b'T',
+                _ => b'A',
+            };
+        }
+        let reads = [exact, approximate, host[100..220].to_vec()];
+        let mut fastq = File::create(root.join("small.fastq")).unwrap();
+        for (ordinal, read) in reads.iter().enumerate() {
+            writeln!(
+                fastq,
+                "@fragment-{ordinal}\n{}\n+\n{}",
+                String::from_utf8_lossy(read),
+                "I".repeat(read.len())
+            )
+            .unwrap();
+        }
+        drop(fastq);
+
+        let aligner = CompetitiveAligner::open(&index.mmi_path).unwrap();
+        let mut reader = FragmentReader::open(&root.join("small.fastq"), None).unwrap();
+        let mut gate_evaluations = Vec::new();
+        let mut exhaustive = Vec::new();
+        while let Some(fragment) = reader.next_fragment().unwrap() {
+            gate_evaluations.push(index.bloom.evaluate_fragment(&fragment.r1, None));
+            exhaustive.push(
+                aligner
+                    .align_fragment_competitively(&fragment, &index.contigs)
+                    .unwrap()
+                    .adjudication,
+            );
+        }
+
+        assert_eq!(
+            gate_evaluations,
+            [
+                GateEvaluation::Pass,
+                GateEvaluation::Negative,
+                GateEvaluation::Negative
+            ]
+        );
+        assert!(matches!(exhaustive[0], FragmentAdjudication::Supporting(0)));
+        assert!(matches!(
+            exhaustive[1],
+            FragmentAdjudication::NoTargetEvidence
+        ));
+        assert!(matches!(
+            exhaustive[2],
+            FragmentAdjudication::NoTargetEvidence
+        ));
+        let exhaustive_support = exhaustive
+            .iter()
+            .filter(|result| matches!(result, FragmentAdjudication::Supporting(0)))
+            .count();
+        let gated_support = exhaustive
+            .iter()
+            .zip(&gate_evaluations)
+            .filter(|(result, gate)| {
+                matches!(result, FragmentAdjudication::Supporting(0))
+                    && **gate == GateEvaluation::Pass
+            })
+            .count();
+        assert_eq!((gated_support, exhaustive_support), (1, 1));
+        assert_eq!(
+            gate_evaluations
+                .iter()
+                .filter(|evaluation| **evaluation == GateEvaluation::Pass)
+                .count(),
+            1
+        );
+        assert_eq!(exhaustive.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

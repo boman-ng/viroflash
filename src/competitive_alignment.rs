@@ -8,6 +8,8 @@ use minimap2::{Aligner, Built, Mapping, Strand};
 use crate::fastq_input::Fragment;
 use crate::reference_index::{ReferenceContig, ReferenceRole};
 
+const ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD: usize = 1;
+
 pub struct CompetitiveAligner {
     aligner: Aligner<Built>,
 }
@@ -283,9 +285,10 @@ where
     let aligners = (0..threads)
         .map(|_| CompetitiveAligner::open(index_path))
         .collect::<Result<Vec<_>, _>>()?;
-    let (task_sender, task_receiver) = sync_channel::<Fragment>(threads);
+    let queue_capacity = threads * ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD;
+    let (task_sender, task_receiver) = sync_channel::<Fragment>(queue_capacity);
     let task_receiver = Arc::new(Mutex::new(task_receiver));
-    let (result_sender, result_receiver) = sync_channel(threads);
+    let (result_sender, result_receiver) = sync_channel(queue_capacity);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
         for aligner in aligners {
