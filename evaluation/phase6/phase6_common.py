@@ -12,7 +12,10 @@ REPO = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO / "evaluation/phase0/evaluation-manifest.json"
 PROFILE_PATH = REPO / "evaluation/phase0/analysis-profile.json"
 CONFIG_PATH = Path(__file__).resolve().with_name("phase6_config.json")
+COMMON_PATH = Path(__file__).resolve()
+SCORER_PATH = COMMON_PATH.with_name("phase6_scorer.py")
 BINARY_PATH = REPO / "target/release/viroflash"
+SCORING_PROVENANCE_NAME = "scoring-provenance.json"
 INDEX_FILES = {"manifest.json", "ref.mmi", "bloom.bin", "reference-groups.tsv", "reference.fa"}
 REPORT_FILES = {"report.csv", "report.html", "perf.json"}
 REPORT_HEADER = (
@@ -54,6 +57,28 @@ FLOAT_FIELDS = {
     "estimated_input_supporting_fragments", "coverage_fraction",
 }
 EMPTY_ALLOWED_FIELDS = {"reason_codes", "limitation_codes"}
+INDEX_LEDGER_HEADER = (
+    "group_ordinal", "target_group_id", "representative_id", "member_ordinal",
+    "member_id", "representative_length", "target_fasta_sha256", "profile_digest",
+)
+SCORER_CORRECTIONS = (
+    {
+        "commit": "853677e",
+        "timing": "PRE_SCORING",
+        "discovery": "independent report audit",
+        "correction": "Expected internal labels map to every matching exact-sequence ReferenceGroup; any observed matching row establishes expected-observed concordance.",
+    },
+    {
+        "commit": "26aeab2",
+        "timing": "POST_RUN_PRE_FINAL_SCORING",
+        "discovery": "evaluation semantic review",
+        "correction": "Internal adjudication is limited to the frozen EBV/HBV/HPV16/HPV18 label scope while preserving total observed evidence separately.",
+    },
+)
+RETROSPECTIVE_PROVENANCE_LIMIT = (
+    "The completed current campaign did not bind scorer/config/manifest inputs before execution. "
+    "This ledger was created retrospectively before reviewer-requested rescoring and cannot establish pre-run scoring immutability."
+)
 
 
 def require(condition, message):
@@ -236,7 +261,73 @@ def parse_perf_json(path):
     return perf
 
 
-def validate_success_directory(directory, run, expected_profile_digest, expected_index_digest):
+def close_float(actual, expected, absolute=1e-15, relative=1e-12):
+    return math.isclose(actual, expected, abs_tol=absolute, rel_tol=relative)
+
+
+def validate_report_invariants(csv_run, csv_targets, index_contract):
+    input_fragments = int(csv_run["input_fragments"])
+    selected_fragments = int(csv_run["selected_fragments"])
+    prescreen_fragments = int(csv_run["prescreen_passed_fragments"])
+    aligned_fragments = int(csv_run["aligned_fragments"])
+    unassigned_fragments = int(csv_run["unassigned_fragments"])
+    family_size = int(csv_run["target_family_size"])
+    probability = float(csv_run["selection_probability"])
+    minimum_fraction = float(csv_run["minimum_relevant_fraction"])
+    miss_probability = float(csv_run["familywise_miss_probability"])
+    family_interval_level = float(csv_run["interval_level"])
+    require(family_size == index_contract["target_family_size"], "reported target family size differs from index ledger")
+    require(0 < minimum_fraction <= 1 and 0 < miss_probability < 1, "reported sampling design probabilities are out of range")
+    require(0 < probability <= 1, "reported selection probability is out of range")
+    require(0 < selected_fragments <= input_fragments, "selected/input fragment counts are incoherent")
+    require(unassigned_fragments <= aligned_fragments <= prescreen_fragments <= selected_fragments, "reported fragment counts are not ordered")
+    minimum_relevant = math.ceil(minimum_fraction * input_fragments)
+    require((1.0 - probability) ** minimum_relevant <= miss_probability / family_size, "selection probability exceeds the reported familywise miss budget")
+    if probability == 1.0:
+        require(selected_fragments == input_fragments, "census selection probability did not select every fragment")
+    require(0 < family_interval_level < 1, "familywise interval level is out of range")
+    expected_target_level = 1.0 - (1.0 - family_interval_level) / family_size
+    previous_ordinal = -1
+    for target in csv_targets:
+        group = index_contract["groups"].get(target["target_group_id"])
+        require(group is not None, f"reported target group is absent from index ledger: {target['target_group_id']}")
+        require(group["ordinal"] > previous_ordinal, "reported target groups are not in index-ledger order")
+        previous_ordinal = group["ordinal"]
+        require(target["representative_id"] == group["representative_id"], "reported target representative differs from index ledger")
+        require(target["member_ids"].split(";") == group["member_ids"], "reported target members differ from index ledger")
+        require(int(target["representative_length"]) == group["representative_length"], "reported representative length differs from index ledger")
+        supporting = int(target["supporting_selected_fragments"])
+        denominator = int(target["selected_fragment_denominator"])
+        attributed_fraction = float(target["attributed_fragment_fraction"])
+        lower = float(target["interval_lower"])
+        upper = float(target["interval_upper"])
+        covered_bases = int(target["covered_bases"])
+        representative_length = int(target["representative_length"])
+        require(denominator == selected_fragments and supporting <= denominator, "target support fraction denominator/count is incoherent")
+        require(close_float(attributed_fraction, supporting / denominator), "target attributed fraction arithmetic mismatch")
+        require(target["interval_method"] == "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION", "unexpected target interval method")
+        require(close_float(float(target["interval_level"]), expected_target_level), "target interval level does not implement familywise allocation")
+        require(0 <= lower <= attributed_fraction <= upper <= 1, "target interval bounds are unordered or out of range")
+        require(covered_bases <= representative_length, "covered bases exceed representative length")
+        require(close_float(float(target["coverage_fraction"]), covered_bases / representative_length), "target coverage fraction arithmetic mismatch")
+        require(close_float(float(target["estimated_input_supporting_fragments"]), attributed_fraction * input_fragments, absolute=1e-9, relative=1e-11), "estimated input support arithmetic mismatch")
+        require(int(target["occupied_windows"]) <= representative_length, "occupied windows exceed representative length")
+        require(int(target["host_confounded_fragments"]) <= selected_fragments, "host-confounded count exceeds selected fragments")
+        require(int(target["cross_group_ambiguous_fragments"]) <= selected_fragments, "cross-group ambiguous count exceeds selected fragments")
+        require(int(target["split_events"]) <= supporting, "split-event count exceeds supporting fragments")
+        require(int(target["discordant_fragments"]) <= supporting, "discordant count exceeds supporting fragments")
+        observed = target["evidence_status"] == "REFERENCE_SIGNAL_OBSERVED"
+        require(observed == (supporting > 0), "target evidence status contradicts supporting count")
+        if observed:
+            require(target["attribution_status"] in {"RESOLVED_TO_REFERENCE_GROUP", "AMBIGUOUS_WITHIN_GROUP"}, "observed target has incoherent attribution status")
+        else:
+            require(target["attribution_status"] in {"CONFOUNDED_WITH_HOST", "UNRESOLVED_ACROSS_GROUPS"}, "indeterminate target has incoherent attribution status")
+    has_run_limitations = bool(csv_run["reason_codes"])
+    require((csv_run["analysis_status"] == "CONFORMANT_WITH_LIMITATIONS") == has_run_limitations, "analysis status and run limitations are incoherent")
+    require((csv_run["analysis_status"] == "CONFORMANT_COMPLETE") == (not has_run_limitations), "complete analysis status has limitations")
+
+
+def validate_success_directory(directory, run, expected_profile_digest, expected_index_digest, index_contract):
     directory = Path(directory)
     require(directory.is_dir(), f"missing report directory: {directory}")
     require({entry.name for entry in directory.iterdir()} == REPORT_FILES, f"successful directory does not contain exactly three reports: {directory}")
@@ -262,9 +353,7 @@ def validate_success_directory(directory, run, expected_profile_digest, expected
     require(perf["configured_threads"] == run["planned_threads"], "reported thread count differs from frozen manifest")
     for field in ("input_fragments", "selected_fragments", "prescreen_passed_fragments", "aligned_fragments"):
         require(perf[field] == int(csv_run[field]), f"perf/CSV count mismatch: {field}")
-    require(int(csv_run["input_fragments"]) > 0 and int(csv_run["selected_fragments"]) > 0, "successful run has no input or selected fragments")
-    require(int(csv_run["prescreen_passed_fragments"]) <= int(csv_run["selected_fragments"]), "prescreen count exceeds selected count")
-    require(int(csv_run["aligned_fragments"]) <= int(csv_run["prescreen_passed_fragments"]), "aligned count exceeds prescreen count")
+    validate_report_invariants(csv_run, csv_targets, index_contract)
     return {"run": csv_run, "targets": csv_targets, "perf": perf}
 
 
@@ -294,19 +383,145 @@ def verify_index_directory(index_dir, expected):
     return actual
 
 
+def load_index_report_contract(index_dir, expected):
+    index_dir = Path(index_dir)
+    manifest = load_json(index_dir / "manifest.json")
+    require(manifest["profile_digest"] == expected["profile_digest"], "index/report profile digest mismatch")
+    require(manifest["target_fasta_sha256"] == expected["target_fasta_sha256"], "index/report target digest mismatch")
+    groups = {}
+    with (index_dir / "reference-groups.tsv").open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        require(tuple(reader.fieldnames or ()) == INDEX_LEDGER_HEADER, "reference-group ledger header differs from contract")
+        for row in reader:
+            group_ordinal = int(row["group_ordinal"])
+            member_ordinal = int(row["member_ordinal"])
+            group = groups.get(row["target_group_id"])
+            if group is None:
+                require(group_ordinal == len(groups), "reference groups are not contiguous and ordered")
+                require(member_ordinal == 0, "reference-group member ordinals do not start at zero")
+                group = {
+                    "ordinal": group_ordinal,
+                    "representative_id": row["representative_id"],
+                    "representative_length": int(row["representative_length"]),
+                    "member_ids": [],
+                }
+                groups[row["target_group_id"]] = group
+            require(group["ordinal"] == group_ordinal, "target group appears in multiple ledger ordinals")
+            require(group["representative_id"] == row["representative_id"], "group representative changes within ledger")
+            require(group["representative_length"] == int(row["representative_length"]), "group representative length changes within ledger")
+            require(member_ordinal == len(group["member_ids"]), "reference-group members are not contiguous and ordered")
+            require(row["target_fasta_sha256"] == expected["target_fasta_sha256"], "ledger target digest mismatch")
+            require(row["profile_digest"] == expected["profile_digest"], "ledger profile digest mismatch")
+            group["member_ids"].append(row["member_id"])
+    require(groups, "reference-group ledger contains no groups")
+    return {"target_family_size": len(groups), "groups": groups}
+
+
 def load_digest_ledger(campaign_dir):
     ledger = load_json(Path(campaign_dir) / "digest-ledger.json")
     require(ledger["binary"]["path"] == str(BINARY_PATH), "campaign binary path is not target/release/viroflash")
     return ledger
 
 
-def verify_campaign_digests(campaign_dir, include_index_artifacts=True):
+def verify_manifest_identity(manifest_path, prepared):
+    manifest_path = Path(manifest_path)
+    manifest = load_json(manifest_path)
+    require(prepared["path"] == str(manifest_path), "campaign manifest path changed")
+    require(sha256_file(manifest_path) == prepared["sha256"], "campaign manifest digest changed")
+    require(manifest["frozen_evaluation_digest"] == prepared["frozen_evaluation_digest"], "campaign frozen evaluation identity changed")
+    return manifest
+
+
+def verify_prepared_digests(campaign_dir, include_index_artifacts=True):
     ledger = load_digest_ledger(campaign_dir)
+    verify_manifest_identity(MANIFEST_PATH, ledger["manifest"])
     require(sha256_file(BINARY_PATH) == ledger["binary"]["sha256"], "campaign binary digest changed")
     require(sha256_file(PROFILE_PATH) == ledger["profile"]["sha256"], "campaign profile digest changed")
     if include_index_artifacts:
         for index_id, expected in ledger["indexes"].items():
             verify_index_directory(Path(campaign_dir) / "indexes" / index_id, expected)
+    return ledger
+
+
+def historical_path(run, config):
+    if run["dataset_id"] == "internal-68":
+        return Path(config["historical"]["internal_results"]) / f"{run['run_id']}.json"
+    return Path(config["historical"]["external_results"]) / run["cohort"] / f"{run['run_id']}.json"
+
+
+def historical_perf_path(run, config):
+    return historical_path(run, config).with_suffix(".perf.json")
+
+
+def digest_record(path):
+    path = Path(path)
+    require(path.is_file(), f"scoring input is missing: {path}")
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+
+
+def scoring_input_records(manifest, config):
+    references = {}
+    for run in manifest["runs"]:
+        for role in ("host_reference", "target_reference"):
+            record = run[role]
+            key = (role, record["path"])
+            if key in references:
+                continue
+            actual = digest_record(record["path"])
+            require(actual["bytes"] == record["compressed_bytes"], f"frozen reference byte size changed: {record['path']}")
+            require(actual["sha256"] == record["sha256"], f"frozen reference digest changed: {record['path']}")
+            references[key] = {"role": role, **actual, "manifest_sha256": record["sha256"]}
+    historical = []
+    for run in manifest["runs"]:
+        for kind, path in (("result", historical_path(run, config)), ("performance", historical_perf_path(run, config))):
+            historical.append({"dataset_id": run["dataset_id"], "cohort": run["cohort"], "run_id": run["run_id"], "kind": kind, **digest_record(path)})
+    historical.append({"kind": "internal_index_performance", **digest_record(config["historical"]["internal_index_perf"])})
+    return {
+        "evaluation_sources": [digest_record(COMMON_PATH), digest_record(SCORER_PATH)],
+        "config": digest_record(CONFIG_PATH),
+        "manifest": {**digest_record(MANIFEST_PATH), "frozen_evaluation_digest": manifest["frozen_evaluation_digest"]},
+        "references": sorted(references.values(), key=lambda item: (item["role"], item["path"])),
+        "historical": historical,
+    }
+
+
+def create_scoring_provenance(campaign_dir, manifest, config, mode, created_at):
+    campaign_dir = Path(campaign_dir)
+    destination = campaign_dir / SCORING_PROVENANCE_NAME
+    require(not destination.exists(), "scoring provenance ledger already exists")
+    verify_prepared_digests(campaign_dir)
+    require(mode in {"PRE_EXECUTION_BOUND", "RETROSPECTIVE_PRE_RESCORING"}, "invalid scoring provenance mode")
+    value = {
+        "schema_id": "viroflash.phase6.scoring-provenance.v1",
+        "contract_id": config["contract_id"],
+        "mode": mode,
+        "created_at": created_at,
+        "inputs": scoring_input_records(manifest, config),
+        "prior_evaluation_only_corrections": list(SCORER_CORRECTIONS),
+        "provenance_limitation": None if mode == "PRE_EXECUTION_BOUND" else RETROSPECTIVE_PROVENANCE_LIMIT,
+    }
+    atomic_json(destination, value)
+    return value
+
+
+def verify_scoring_provenance(campaign_dir, manifest, config):
+    path = Path(campaign_dir) / SCORING_PROVENANCE_NAME
+    require(path.is_file(), "campaign scoring provenance ledger is missing")
+    recorded = load_json(path)
+    require(recorded["schema_id"] == "viroflash.phase6.scoring-provenance.v1", "unexpected scoring provenance schema")
+    require(recorded["contract_id"] == config["contract_id"], "scoring provenance contract changed")
+    require(recorded["mode"] in {"PRE_EXECUTION_BOUND", "RETROSPECTIVE_PRE_RESCORING"}, "invalid scoring provenance mode")
+    require(recorded["prior_evaluation_only_corrections"] == list(SCORER_CORRECTIONS), "scoring correction disclosure changed")
+    expected_limit = None if recorded["mode"] == "PRE_EXECUTION_BOUND" else RETROSPECTIVE_PROVENANCE_LIMIT
+    require(recorded["provenance_limitation"] == expected_limit, "scoring provenance limitation changed")
+    require(recorded["inputs"] == scoring_input_records(manifest, config), "scoring input digest ledger changed")
+    return recorded
+
+
+def verify_campaign_digests(campaign_dir, include_index_artifacts=True):
+    manifest, config = load_contract()
+    ledger = verify_prepared_digests(campaign_dir, include_index_artifacts)
+    verify_scoring_provenance(campaign_dir, manifest, config)
     return ledger
 
 

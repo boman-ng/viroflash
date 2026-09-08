@@ -14,9 +14,10 @@ from pathlib import Path
 
 from phase6_common import (
     BINARY_PATH, MANIFEST_PATH, PROFILE_PATH, atomic_json, atomic_text, index_id_for,
-    load_contract, load_digest_ledger, load_json, output_dir, parse_time_verbose, require,
-    sha256_file, validate_error_directory, validate_success_directory,
-    verify_campaign_digests, verify_index_directory,
+    create_scoring_provenance, load_contract, load_digest_ledger, load_index_report_contract,
+    load_json, output_dir, parse_time_verbose, require, sha256_file,
+    validate_error_directory, validate_success_directory, verify_campaign_digests,
+    verify_index_directory,
 )
 
 
@@ -114,6 +115,7 @@ def prepare(campaign_dir):
         "indexes": indexes,
     }
     atomic_json(campaign_dir / "digest-ledger.json", ledger)
+    create_scoring_provenance(campaign_dir, manifest, config, "PRE_EXECUTION_BOUND", now())
     verify_campaign_digests(campaign_dir)
     print(f"prepared {len(indexes)} indexes in {campaign_dir}")
 
@@ -143,7 +145,7 @@ def preflight_fastqs(campaign_dir, manifest):
     atomic_json(destination, {"verified_at": now(), "runs": rows})
 
 
-def run_one(campaign_dir, run, config, digest_ledger, ledger_path):
+def run_one(campaign_dir, run, config, digest_ledger, index_contracts, ledger_path):
     index_id = index_id_for(run, config)
     index = digest_ledger["indexes"][index_id]
     directory = output_dir(campaign_dir, run)
@@ -161,7 +163,7 @@ def run_one(campaign_dir, run, config, digest_ledger, ledger_path):
     try:
         returncode, timing = run_timed(command, log_dir / f"{run['run_id']}.stdout", log_dir / f"{run['run_id']}.stderr", log_dir / f"{run['run_id']}.time")
         if returncode == 0:
-            parsed = validate_success_directory(directory, run, digest_ledger["profile"]["sha256"], index["index_digest"])
+            parsed = validate_success_directory(directory, run, digest_ledger["profile"]["sha256"], index["index_digest"], index_contracts[index_id])
             status = "SUCCESS"
             summary = {
                 "analysis_status": parsed["run"]["analysis_status"],
@@ -189,6 +191,10 @@ def execute(campaign_dir):
     manifest, config = load_contract()
     campaign_dir = Path(campaign_dir).resolve()
     digest_ledger = verify_campaign_digests(campaign_dir)
+    index_contracts = {
+        index_id: load_index_report_contract(index["path"], index)
+        for index_id, index in digest_ledger["indexes"].items()
+    }
     ledger_path = campaign_dir / "run-ledger.jsonl"
     require(not ledger_path.exists(), "run ledger already exists; sample retries are forbidden")
     require(not (campaign_dir / "runs").exists(), "run output root already exists; sample retries are forbidden")
@@ -204,7 +210,7 @@ def execute(campaign_dir):
         require(len(jobs) == 1, f"cohort has inconsistent planned jobs: {cohort}")
         print(f"starting {cohort}: {len(runs)} runs, {next(iter(jobs))} jobs", flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=next(iter(jobs))) as executor:
-            futures = [executor.submit(run_one, campaign_dir, run, config, digest_ledger, ledger_path) for run in runs]
+            futures = [executor.submit(run_one, campaign_dir, run, config, digest_ledger, index_contracts, ledger_path) for run in runs]
             statuses.extend(future.result() for future in futures)
     verify_campaign_digests(campaign_dir)
     require(len(statuses) == 127, "campaign did not reach 127 terminal harness outcomes")
@@ -242,7 +248,7 @@ def gzip_variants(campaign_dir, run):
     return plain, multi
 
 
-def run_repro_one(campaign_dir, run, threads, repetition, config, digest_ledger, ledger_path, root):
+def run_repro_one(campaign_dir, run, threads, repetition, config, digest_ledger, index_contracts, ledger_path, root):
     canonical = output_dir(campaign_dir, run) / "report.csv"
     require(canonical.is_file(), f"canonical campaign report missing: {run['run_id']}")
     repro_run = dict(run)
@@ -261,7 +267,7 @@ def run_repro_one(campaign_dir, run, threads, repetition, config, digest_ledger,
     log = destination.parent / f"run-{repetition}"
     returncode, timing = run_timed(command, Path(str(log) + ".stdout"), Path(str(log) + ".stderr"), Path(str(log) + ".time"))
     require(returncode == 0, f"reproducibility run failed: {identity}")
-    validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"])
+    validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"], index_contracts[index_id])
     identical = canonical.read_bytes() == (destination / "report.csv").read_bytes()
     append_event(ledger_path, {**identity, "event": "TERMINAL", "at": now(), "status": "SUCCESS", "report_csv_byte_identical": identical, "time": timing})
     require(identical, f"report.csv reproducibility failure: {identity}")
@@ -272,6 +278,10 @@ def execute_repro(campaign_dir):
     manifest, config = load_contract()
     campaign_dir = Path(campaign_dir).resolve()
     digest_ledger = verify_campaign_digests(campaign_dir)
+    index_contracts = {
+        index_id: load_index_report_contract(index["path"], index)
+        for index_id, index in digest_ledger["indexes"].items()
+    }
     ledger_path = campaign_dir / "reproducibility/repro-ledger.jsonl"
     require(not ledger_path.exists(), "reproducibility ledger already exists; retries are forbidden")
     by_id = {run["run_id"]: run for run in manifest["runs"]}
@@ -289,7 +299,7 @@ def execute_repro(campaign_dir):
         futures = [
             executor.submit(
                 run_repro_one, campaign_dir, run, threads, repetition, config,
-                digest_ledger, ledger_path, root,
+                digest_ledger, index_contracts, ledger_path, root,
             )
             for run, threads, repetition in tasks
         ]
@@ -310,7 +320,7 @@ def execute_repro(campaign_dir):
         destination.parent.mkdir(parents=True, exist_ok=True)
         returncode, timing = run_timed(command, Path(str(destination) + ".stdout"), Path(str(destination) + ".stderr"), Path(str(destination) + ".time"))
         require(returncode == 0, f"encoding equivalence run failed: {variant}")
-        validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"])
+        validate_success_directory(destination, repro_run, digest_ledger["profile"]["sha256"], index["index_digest"], index_contracts[index_id_for(variant_run, config)])
         identical = canonical.read_bytes() == (destination / "report.csv").read_bytes()
         append_event(ledger_path, {**identity, "event": "TERMINAL", "at": now(), "status": "SUCCESS", "report_csv_byte_identical": identical, "time": timing})
         require(identical, f"report.csv encoding equivalence failure: {variant}")

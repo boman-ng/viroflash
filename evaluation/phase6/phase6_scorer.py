@@ -10,8 +10,10 @@ from pathlib import Path
 from statistics import NormalDist
 
 from phase6_common import (
-    CONFIG_PATH, MANIFEST_PATH, atomic_json, atomic_text, index_id_for, load_contract,
-    load_digest_ledger, load_json, output_dir, parse_time_verbose, require, sha256_file,
+    RETROSPECTIVE_PROVENANCE_LIMIT, SCORER_CORRECTIONS, SCORING_PROVENANCE_NAME,
+    atomic_json, atomic_text, create_scoring_provenance, historical_path,
+    historical_perf_path, index_id_for, load_contract, load_index_report_contract,
+    load_json, output_dir, parse_time_verbose, require, sha256_file,
     validate_error_directory, validate_success_directory, verify_campaign_digests,
 )
 
@@ -46,13 +48,40 @@ def fasta_labels(path, terms):
         for line in handle:
             if not line.startswith(">"):
                 continue
-            member = line[1:].split(maxsplit=1)[0]
-            header = line[1:]
-            matched = [label for label, patterns in terms.items() if any(pattern.casefold() in header.casefold() for pattern in patterns)]
+            member, separator, description = line[1:].partition(" ")
+            require(separator, f"reference header lacks a description: {member}")
+            description = description.lstrip(" |\t").casefold()
+            matched = [
+                label
+                for label, patterns in terms.items()
+                if any(
+                    description == pattern.casefold()
+                    or (
+                        description.startswith(pattern.casefold())
+                        and len(description) > len(pattern)
+                        and not description[len(pattern)].isalnum()
+                    )
+                    for pattern in patterns
+                )
+            ]
             require(len(matched) <= 1, f"reference header maps to multiple expected labels: {member}")
             if matched:
                 labels[member] = matched[0]
     return labels
+
+
+def verified_internal_labels(manifest, config):
+    records = {
+        (run["target_reference"]["path"], run["target_reference"]["compressed_bytes"], run["target_reference"]["sha256"])
+        for run in manifest["runs"]
+        if run["dataset_id"] == "internal-68"
+    }
+    require(len(records) == 1, "internal runs do not share one frozen target reference")
+    path_value, expected_bytes, expected_digest = records.pop()
+    path = Path(path_value)
+    require(path.is_file() and path.stat().st_size == expected_bytes, "internal target FASTA bytes differ from frozen manifest")
+    require(sha256_file(path) == expected_digest, "internal target FASTA digest differs from frozen manifest")
+    return fasta_labels(path, config["internal_label_header_terms"])
 
 
 def expected_signals(run, targets, internal_labels):
@@ -140,16 +169,6 @@ def adjudicate(run, parsed, internal_labels):
     }
 
 
-def historical_path(run, config):
-    if run["dataset_id"] == "internal-68":
-        return Path(config["historical"]["internal_results"]) / f"{run['run_id']}.json"
-    return Path(config["historical"]["external_results"]) / run["cohort"] / f"{run['run_id']}.json"
-
-
-def historical_perf_path(run, config):
-    return historical_path(run, config).with_suffix(".perf.json")
-
-
 def old_expected_observed(run, old, internal_labels):
     expected = run.get("expected_group_key")
     if expected is None:
@@ -224,12 +243,16 @@ def score(campaign_dir):
     evidence_dir = campaign_dir / "evidence"
     require(not evidence_dir.exists(), "campaign evidence already exists; frozen scoring outputs are write-once")
     digest_ledger = verify_campaign_digests(campaign_dir)
+    scoring_provenance = load_json(campaign_dir / SCORING_PROVENANCE_NAME)
+    index_contracts = {
+        index_id: load_index_report_contract(index["path"], index)
+        for index_id, index in digest_ledger["indexes"].items()
+    }
     starts, terminals = terminal_events(campaign_dir / "run-ledger.jsonl")
     expected_keys = {(run["dataset_id"], run["run_id"]) for run in manifest["runs"]}
     require(set(starts) == expected_keys and set(terminals) == expected_keys, "campaign ledger does not contain exactly 127 started and terminal runs")
     reproducibility = reproducibility_summary(campaign_dir / "reproducibility/repro-ledger.jsonl", config)
-    internal_target = next(run["target_reference"]["path"] for run in manifest["runs"] if run["dataset_id"] == "internal-68")
-    internal_labels = fasta_labels(internal_target, config["internal_label_header_terms"])
+    internal_labels = verified_internal_labels(manifest, config)
     require(all(any(label == expected for label in internal_labels.values()) for expected in config["internal_label_header_terms"]), "an internal expected label maps to no frozen reference")
     records = []
     failures = []
@@ -239,7 +262,7 @@ def score(campaign_dir):
         directory = output_dir(campaign_dir, run)
         if terminal["status"] == "SUCCESS":
             index = digest_ledger["indexes"][index_id_for(run, config)]
-            parsed = validate_success_directory(directory, run, digest_ledger["profile"]["sha256"], index["index_digest"])
+            parsed = validate_success_directory(directory, run, digest_ledger["profile"]["sha256"], index["index_digest"], index_contracts[index_id_for(run, config)])
             decision = adjudicate(run, parsed, internal_labels)
             records.append({"manifest": run, "parsed": parsed, "decision": decision, "terminal": terminal})
         else:
@@ -258,12 +281,19 @@ def score(campaign_dir):
     summary_value = {
         "contract_id": config["contract_id"],
         "scored_at": datetime.now(timezone.utc).isoformat(),
+        "scoring_provenance": {
+            "path": str(campaign_dir / SCORING_PROVENANCE_NAME),
+            "sha256": sha256_file(campaign_dir / SCORING_PROVENANCE_NAME),
+            "mode": scoring_provenance["mode"],
+            "prior_evaluation_only_corrections": list(SCORER_CORRECTIONS),
+            "limitation": scoring_provenance["provenance_limitation"],
+        },
         "terminal": {"total": 127, "success": len(records), "failure": len(failures)},
         "hard_gates": {
             "exactly_127_started_once": len(starts) == 127,
             "exactly_127_terminal": len(terminals) == 127,
             "all_success_directories_exact": not failures,
-            "binary_profile_index_digests_reverified": True,
+            "binary_profile_index_manifest_scoring_input_digests_reverified": True,
             "pass1_pass2_counts_ids_input_digest": "ENFORCED_BY_VERIFIED_BINARY_BEFORE_SUCCESS_REPORT",
             "reproducibility_report_csv_byte_identical": reproducibility["runs"] == reproducibility["report_csv_byte_identical"],
             **performance_gates,
@@ -279,6 +309,7 @@ def score(campaign_dir):
             "Labels cover only mapped groups and do not establish sensitivity or specificity across all indexed references.",
             "Real samples do not establish abundance bias, interval coverage, LoD/LoQ, absolute quantitation, or clinical validity.",
             "Pass1/Pass2 pair-ID and decoded-byte equality are binary-enforced invariants; reports expose the terminal digest/count consequences, not separate per-pass pair-ID ledgers.",
+            *([RETROSPECTIVE_PROVENANCE_LIMIT] if scoring_provenance["provenance_limitation"] else []),
         ],
     }
     atomic_json(evidence_dir / "summary.json", summary_value)
@@ -483,8 +514,16 @@ def write_paired(path, paired):
 def main():
     parser = argparse.ArgumentParser(description="Frozen Phase 6 real-E2E campaign scorer")
     parser.add_argument("--campaign-dir", required=True)
+    parser.add_argument("--write-retrospective-provenance", action="store_true")
     args = parser.parse_args()
-    score(args.campaign_dir)
+    if args.write_retrospective_provenance:
+        manifest, config = load_contract()
+        create_scoring_provenance(
+            Path(args.campaign_dir).resolve(), manifest, config,
+            "RETROSPECTIVE_PRE_RESCORING", datetime.now(timezone.utc).isoformat(),
+        )
+    else:
+        score(args.campaign_dir)
 
 
 if __name__ == "__main__":
