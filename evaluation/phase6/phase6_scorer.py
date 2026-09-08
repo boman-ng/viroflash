@@ -200,7 +200,6 @@ def score(campaign_dir):
     campaign_dir = Path(campaign_dir).resolve()
     evidence_dir = campaign_dir / "evidence"
     require(not evidence_dir.exists(), "campaign evidence already exists; frozen scoring outputs are write-once")
-    evidence_dir.mkdir()
     digest_ledger = verify_campaign_digests(campaign_dir)
     starts, terminals = terminal_events(campaign_dir / "run-ledger.jsonl")
     expected_keys = {(run["dataset_id"], run["run_id"]) for run in manifest["runs"]}
@@ -228,6 +227,7 @@ def score(campaign_dir):
     scientific = scientific_metrics(records, manifest)
     performance, paired = performance_metrics(records, config, digest_ledger, starts, terminals, internal_labels)
     adjudication_rows = [record for record in records if record["decision"]["classification"].startswith("LABEL_DISCORDANT")]
+    evidence_dir.mkdir()
     write_adjudication(evidence_dir / "adjudication.tsv", adjudication_rows)
     write_run_table(evidence_dir / "run-results.tsv", records, failures)
     write_paired(evidence_dir / "old-system-paired.tsv", paired)
