@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import argparse
 import csv
 import hashlib
 import json
+import sys
 import tomllib
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -28,7 +28,7 @@ RUN_FIELDS = {
     "dataset_id", "cohort", "run_id", "sample_id", "input_mode", "r1", "r2",
     "host_reference", "target_reference", "truth_label", "expectation_kind",
     "expected_group_key", "label_provenance", "evaluability_status", "ambiguity_notes",
-    "profile_digest", "planned_threads", "planned_jobs", "index_id",
+    "profile_digest", "planned_threads", "planned_jobs",
 }
 FILE_FIELDS = {"path", "compressed_bytes", "sha256", "checksum_status"}
 PROFILE_PARAMETERS = {
@@ -49,12 +49,7 @@ INDEX_AND_ALIGNMENT = {
     "alignment_role_margin": 0,
     "occupied_window_bins": 10,
 }
-INDEX_IDS = {"internal-dna-panel", "external-respiratory-panel", "external-hpv-panel"}
-INDEX_ID_BY_TARGET = {
-    "dna_virus_genome.fasta": "internal-dna-panel",
-    "target_respiratory_panel.fa": "external-respiratory-panel",
-    "target_hpv16_hpv18.fa": "external-hpv-panel",
-}
+REFERENCE_GROUP_SOURCE_IDS = {"internal-dna-panel", "external-respiratory-panel", "external-hpv-panel"}
 OUTPUT_FIELDS = {
     ("report.csv", "RUN"): {
         "schema_id", "record_type", "sample_id", "analysis_status", "reason_codes",
@@ -133,31 +128,12 @@ def validate_profile():
     profile_path = PHASE0 / "analysis-profile.json"
     profile = json.loads(profile_path.read_text())
     require(set(profile) == {"contract_id", "decision_status", "frozen_on", "index_and_alignment", "parameters"}, "profile fields changed")
-    require(profile["decision_status"] == "FROZEN_BEFORE_FIRST_V0_5_RESULT", "profile is not frozen")
+    require(profile["decision_status"] == "PENDING_PRODUCT_DECISION", "profile decision status changed")
     require(profile["parameters"] == PROFILE_PARAMETERS, "profile parameter contract changed")
     require(profile["index_and_alignment"] == INDEX_AND_ALIGNMENT, "index/alignment profile changed")
     require(ALPHABET == frozenset(b"ACGTMRWSYKVHDBN"), "parser IUPAC alphabet changed")
     require(b"ACGTMRWSYKVHDBN".translate(COMPLEMENT) == b"TGCAKYWSRMBDHVN", "parser IUPAC complement changed")
     return file_sha256(profile_path)
-
-
-def validate_execution_state(manifest, e2e_gate):
-    binding = manifest["execution_binding"]
-    require(set(binding) == {"binary_sha256", "index_sha256_by_index_id", "bound_at"}, "execution binding fields changed")
-    require(set(binding["index_sha256_by_index_id"]) == INDEX_IDS, "execution index binding set changed")
-    state = manifest["freeze_state"]
-    if state == "PRE_EXECUTION_FROZEN":
-        require(binding["binary_sha256"] is None, "pre-execution binary digest must be null")
-        require(all(value is None for value in binding["index_sha256_by_index_id"].values()), "pre-execution index digests must be null")
-        require(binding["bound_at"] is None, "pre-execution bound_at must be null")
-    elif state == "EXECUTION_BOUND":
-        require(is_sha256(binding["binary_sha256"]), "bound binary digest is invalid")
-        require(all(is_sha256(value) for value in binding["index_sha256_by_index_id"].values()), "bound index digest is invalid")
-        require(isinstance(binding["bound_at"], str) and binding["bound_at"], "bound_at is missing")
-    else:
-        require(False, f"invalid freeze state: {state}")
-    if e2e_gate:
-        require(state == "EXECUTION_BOUND", "E2E gate requires one-time binary/index binding")
 
 
 def validate_internal_checksum_freeze(runs):
@@ -250,7 +226,7 @@ def validate_reference_groups(profile_digest, manifest):
     require(set(group_manifest) == {"contract_id", "profile_digest", "sources"}, "reference-group manifest fields changed")
     require(group_manifest["contract_id"] == "viroflash.phase0.reference-groups", "reference-group manifest identity changed")
     require(group_manifest["profile_digest"] == profile_digest, "reference-group profile digest mismatch")
-    require({source["source_id"] for source in group_manifest["sources"]} == INDEX_IDS, "reference-group source set changed")
+    require({source["source_id"] for source in group_manifest["sources"]} == REFERENCE_GROUP_SOURCE_IDS, "reference-group source set changed")
     external_reference_sums = read_checksum_list(EXTERNAL_REFERENCE_SUMS)
     internal_target_digest = json.loads(INTERNAL_RUN_CONFIG.read_text())["target_fasta_sha256"]
 
@@ -302,15 +278,14 @@ def validate_reference_groups(profile_digest, manifest):
             require(all(row["representative_id"] == members[0] for row in rows), f"{source['source_id']}: representative invalid")
 
 
-def validate_manifest(profile_digest, e2e_gate):
+def validate_manifest(profile_digest):
     manifest = json.loads(MANIFEST.read_text())
-    require(set(manifest) == {"manifest_schema", "frozen_on", "freeze_state", "profile_digest", "frozen_evaluation_digest", "checksum_provenance", "reference_groups_sha256", "execution_binding", "runs"}, "manifest fields changed")
+    require(set(manifest) == {"manifest_schema", "frozen_on", "freeze_state", "profile_digest", "frozen_evaluation_digest", "checksum_provenance", "reference_groups_sha256", "runs"}, "manifest fields changed")
     require(manifest["manifest_schema"] == "viroflash.phase0.evaluation-manifest", "manifest identity changed")
+    require(manifest["freeze_state"] == "PRE_EXECUTION_FROZEN", "manifest must remain pre-execution")
     require(manifest["profile_digest"] == profile_digest, "manifest profile digest mismatch")
     require(manifest["frozen_evaluation_digest"] == frozen_evaluation_digest(manifest), "frozen evaluation digest mismatch")
     require(manifest["checksum_provenance"] == {INTERNAL_CHECKSUM_STATUS: {"frozen_on": "2026-09-08", "method": "SHA-256 streamed over existing gzip file bytes without decompression", "list": "internal-fastq-sha256.tsv"}}, "internal checksum provenance changed")
-    validate_execution_state(manifest, e2e_gate)
-
     runs = manifest["runs"]
     require(len(runs) == 127, "manifest must contain 127 runs")
     require(Counter(run.get("dataset_id") for run in runs) == {"internal-68": 68, "external-59": 59}, "dataset counts differ from 68+59")
@@ -323,8 +298,7 @@ def validate_manifest(profile_digest, e2e_gate):
     for run in runs:
         run_id = run.get("run_id", "<missing>")
         require(set(run) == RUN_FIELDS, f"{run_id}: run fields changed")
-        expected_index_id = INDEX_ID_BY_TARGET.get(Path(run["target_reference"]["path"]).name)
-        require(run["profile_digest"] == profile_digest and run["index_id"] == expected_index_id, f"{run_id}: profile/index identity mismatch")
+        require(run["profile_digest"] == profile_digest, f"{run_id}: profile identity mismatch")
         require((run["r2"] is None) == (run["input_mode"] == "SE"), f"{run_id}: input-mode mismatch")
         for field in ("r1", "r2", "host_reference", "target_reference"):
             record = run[field]
@@ -370,13 +344,11 @@ def validate_contract_files():
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--e2e-gate", action="store_true", help="require one-time binary and cohort-index binding")
-    args = parser.parse_args()
+    require(len(sys.argv) == 1, "this metadata verifier accepts no execution or E2E gate arguments")
     profile_digest = validate_profile()
-    validate_manifest(profile_digest, args.e2e_gate)
+    validate_manifest(profile_digest)
     validate_contract_files()
-    print("Phase 0 verification passed: checksums, 68+59 truth mapping, and three ReferenceGroup ledgers")
+    print("Phase 0 checksum metadata consistency passed; FASTQ bytes were not read; analysis profile remains pending product decision")
 
 
 if __name__ == "__main__":

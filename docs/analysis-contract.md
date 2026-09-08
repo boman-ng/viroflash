@@ -1,10 +1,10 @@
 # Phase 0 analysis contract
 
-This document freezes only Phase 0 decisions and audit assets. It does not alter the production path, change a production schema, or authorize inspecting a v0.5 result.
+This document freezes Phase 0 evidence and proposed decisions for review. It does not alter the production path, change a production schema, authorize the proposed scientific values, or authorize inspecting a v0.5 result.
 
 ## Frozen AnalysisProfile
 
-`evaluation/phase0/analysis-profile.json` was frozen before a v0.5 implementation or result existed. The user authorized execution of this plan on 2026-09-08; no person, committee, or approval system beyond that instruction is asserted. The 68 internal and 59 external runs must not be used to revise it.
+`evaluation/phase0/analysis-profile.json` has decision status `PENDING_PRODUCT_DECISION`. Its concrete values are proposals only and must not be used by an implementation or to produce results. The user must explicitly confirm the scientific choices before the status can become `FROZEN`. The 68 internal and 59 external runs must not be used to select or revise them.
 
 | Field | Symbol | Value | Product decision |
 |---|---:|---:|---|
@@ -15,7 +15,7 @@ This document freezes only Phase 0 decisions and audit assets. It does not alter
 
 There is no minimum-read, MAPQ, edit-distance, alignment-margin, coverage, window, p/q, or PASS cutoff. `k=21`, minimap2 `sr`, all-chain enumeration, and ten equal-width diagnostic windows are profile inputs, not CLI choices. Changing any profile byte creates a new profile digest, requires new indexes, and restarts all 127 evaluations.
 
-The four values are authorized product/scientific choices from the plan, not estimates or calibration results from these datasets. Horvitz and Thompson support explicit inclusion-probability accounting; exact hypergeometric bounds support finite-population intervals; Dunn supports Bonferroni simultaneous coverage. These references justify the planned methods, not the numerical choices δ/w=1e-5 or α/β=.05: <https://doi.org/10.1080/01621459.1952.10483446>, <https://doi.org/10.1007/978-1-4612-3140-0>, <https://doi.org/10.1080/01621459.1961.10482090>.
+The four values are not authorized, estimated, or calibrated from these datasets. Horvitz and Thompson support explicit inclusion-probability accounting; exact hypergeometric bounds support finite-population intervals; Dunn supports Bonferroni simultaneous coverage. These references justify candidate methods, not δ/w=1e-5 or α/β=.05: <https://doi.org/10.1080/01621459.1952.10483446>, <https://doi.org/10.1007/978-1-4612-3140-0>, <https://doi.org/10.1080/01621459.1961.10482090>.
 
 ## Digest and analysis identity
 
@@ -25,10 +25,7 @@ Composite identities use this unambiguous framing: the ASCII domain followed by 
 
 - `input_digest`: domain `viroflash-input-v1`; ordered items are `mode`, then `r1` and, for PE, `r2`. The mode item is the SHA-256 of literal `SE` or `PE`; each read item is the exact compressed-file digest. PE order is R1 then R2.
 - `reference_set_digest`: domain `viroflash-reference-set-v1`; ordered items are `host_fasta`, `target_fasta`, and `reference_group_ledger`.
-- `index_digest`: domain `viroflash-index-v1`; ordered items are `profile`, `reference_set`, and every required index artifact digest in manifest order.
-- `analysis_identity`: domain `viroflash-analysis-v1`; ordered items are `binary`, `profile`, `index`, and `input`.
-
-Missing component digests leave the composite identity unavailable; null is required and no placeholder is hashed. All input-file digests are now frozen. The v0.5 binary and indexes do not yet exist, so analysis identities remain unavailable in `PRE_EXECUTION_FROZEN`. Phase 1/2 may implement these formulas but may not add a second identity path.
+All input-file digests are frozen, but the v0.5 binary, index artifacts, and their final artifact contract do not exist. Phase 0 therefore does not define or claim a computable index digest, artifact binding, or complete analysis identity.
 
 ## ReferenceGroup ledger
 
@@ -77,16 +74,16 @@ There is no automatic index build, scientific parameter option, legacy alias, co
 
 ## Evaluation and historical baseline
 
-`evaluation/phase0/evaluation-manifest.json` freezes 68 internal and 59 external run IDs, cohorts, SE/PE layouts, absolute input/reference paths, byte sizes, truth labels, provenance, checksums, known label/history discrepancies, planned resources, and index IDs. It is evaluation metadata, not production configuration.
+`evaluation/phase0/evaluation-manifest.json` freezes 68 internal and 59 external run IDs, cohorts, SE/PE layouts, absolute input/reference paths, byte sizes, truth labels, provenance, checksums, known label/history discrepancies, and planned resources. It is evaluation metadata, not production configuration.
 
 The external 82 FASTQ digests correspond exactly to `metadata/FASTQ_SHA256SUMS`; external reference digests correspond to `refs/SHA256SUMS`. Internal truth and target-reference digests correspond to the existing `run_config.json`. The 136 internal FASTQ digests were computed on 2026-09-08 by parallel streaming SHA-256 over the existing gzip bytes without decompression and are independently frozen in `internal-fastq-sha256.tsv` with status `PHASE0_FROZEN_COMPRESSED_SHA256`; this is explicit Phase 0 provenance, not an upstream authoritative source. The internal host digest remains `PHASE0_COMPUTED` metadata.
 
-The manifest has one state transition. `PRE_EXECUTION_FROZEN` means sample/truth/profile/checksum/ledger data are fixed while binary and all three cohort-index digests are null. Before the first E2E result, those four actual artifact digests and `bound_at` must be written once and state changed to `EXECUTION_BOUND`; the frozen evaluation digest must remain unchanged. No registry, migration, alternate schema, rebinding, or claim of current artifact binding exists.
+`PRE_EXECUTION_FROZEN` means sample, truth, checksum, ledger, and the bytes of the pending profile proposal are fixed for review. It does not mean the proposal is approved or that any binary/index artifact is bound. Phase 6 owns artifact validation: the final E2E runner must stream SHA-256 from the actual binary and cohort-index paths under the then-current concrete artifact contract before running results. Git review, not this verifier, controls any attempted rebinding. No Phase 0 artifact gate, registry, migration, alternate schema, or binding claim exists.
 
 `evaluation/phase0/historical/` is an immutable snapshot of old-system observations. It is comparison evidence only: not v0.5 acceptance truth, not a pristine holdout, not a scorer input, and not permission to tune δ/α/β/w.
 
 ## Verification
 
-Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, exact profile fields, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`.
+Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, exact pending profile fields, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`. Its success means checksum metadata consistency; it does not read or recompute FASTQ bytes and does not authorize implementation or E2E.
 
-Run `python3 evaluation/phase0/verify.py --e2e-gate` immediately before E2E. It must fail in the committed `PRE_EXECUTION_FROZEN` state and passes only after the one-time actual binary/index binding reaches `EXECUTION_BOUND`.
+Phase 6 Input Pass 1 owns streaming recomputation of the 136 internal FASTQ digests while reading the exact compressed inputs. Any mismatch must stop that run before analysis. No separate default Phase 0 byte scan is implied.
