@@ -58,8 +58,8 @@ Target records are grouped during indexing only when their complete uppercase IU
 
 FASTQ analysis has two streaming passes:
 
-1. validate every record and PE identifier, count fragments exactly, and compute the input identity;
-2. apply deterministic BLAKE3 Bernoulli inclusion to each fragment, then run a target-only 21-mer Bloom workload gate and HOST+TARGET competitive alignment.
+1. validate every record and PE identifier, count fragments exactly, and compute the compressed-byte input identity from that same stream;
+2. repeat validation and digesting on the analysis stream, reject any cross-pass change, apply deterministic BLAKE3 Bernoulli inclusion, then run a target-only 21-mer Bloom workload gate and HOST+TARGET competitive alignment through a bounded worker queue.
 
 For `N` input fragments and `m` fixed target groups:
 
@@ -69,6 +69,8 @@ M_min = ceil(δN)
 ```
 
 PE ends share one selection key and one attribution. A fragment contributes at most once to one group. Host ties or advantages are confounded; cross-group ties remain unresolved; multiple exact-equivalent members within one group retain group-level support.
+
+Selected fragments shorter than 21 bases or without an encodable 21-mer are counted explicitly and produce `CONFORMANT_WITH_LIMITATIONS`; they are not silently treated as target-negative.
 
 The point estimate is `x/n`. Simultaneous intervals use Bonferroni `α/m` and equal-tailed exact hypergeometric inversion conditional on the realized `n`. Census intervals collapse to the exact fraction. The implementation follows the finite-population inversion in [samplingbook `Sprop`](https://rdrr.io/cran/samplingbook/src/R/Sprop.R); distribution evaluation uses the maintained Rust `statrs` implementation. Coverage, windows, split, discordant, and integration fields are diagnostics only.
 
