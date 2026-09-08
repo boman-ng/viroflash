@@ -26,7 +26,7 @@ impl AnalysisStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunEvidence {
     pub sample_id: String,
     pub analysis_status: AnalysisStatus,
@@ -48,7 +48,7 @@ pub struct RunEvidence {
     pub read_ends_per_fragment: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TargetSignal {
     pub target_group_id: String,
     pub representative_id: String,
@@ -75,7 +75,7 @@ pub struct TargetSignal {
     pub limitation_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceReport {
     pub schema_id: &'static str,
     pub run: RunEvidence,

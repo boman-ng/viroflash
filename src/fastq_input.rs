@@ -28,6 +28,7 @@ pub struct InputCensus {
     pub input_mode: &'static str,
     pub fragments: u64,
     pub input_digest: String,
+    pub(crate) compressed_artifact_digest: String,
     pub read_ends_per_fragment: u8,
 }
 
@@ -91,8 +92,19 @@ impl FragmentReader {
 
     pub fn input_digest(&self) -> String {
         composite_input_digest(
+            b"viroflash-input-v1\0",
             self.r1.decoded_digest(),
             self.r2.as_ref().map(FastqReader::decoded_digest),
+        )
+    }
+
+    pub fn compressed_artifact_digest(&self) -> String {
+        composite_input_digest(
+            b"viroflash-compressed-input-artifact-v1\0",
+            self.r1.compressed_artifact_digest(),
+            self.r2
+                .as_ref()
+                .map(FastqReader::compressed_artifact_digest),
         )
     }
 }
@@ -124,8 +136,8 @@ impl<R: Read> Read for DigestingReader<R> {
 }
 
 enum EncodedInput {
-    Plain(File),
-    Gzip(Box<MultiGzDecoder<File>>),
+    Plain(DigestingReader<File>),
+    Gzip(Box<MultiGzDecoder<DigestingReader<File>>>),
 }
 
 impl Read for EncodedInput {
@@ -133,6 +145,15 @@ impl Read for EncodedInput {
         match self {
             Self::Plain(reader) => reader.read(buffer),
             Self::Gzip(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl EncodedInput {
+    fn compressed_artifact_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Plain(reader) => reader.digest(),
+            Self::Gzip(reader) => reader.get_ref().digest(),
         }
     }
 }
@@ -148,9 +169,9 @@ impl FastqReader {
         let file =
             File::open(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
         let input = if path.extension().is_some_and(|extension| extension == "gz") {
-            EncodedInput::Gzip(Box::new(MultiGzDecoder::new(file)))
+            EncodedInput::Gzip(Box::new(MultiGzDecoder::new(DigestingReader::new(file))))
         } else {
-            EncodedInput::Plain(file)
+            EncodedInput::Plain(DigestingReader::new(file))
         };
         Ok(Self {
             reader: BufReader::with_capacity(
@@ -164,6 +185,10 @@ impl FastqReader {
 
     fn decoded_digest(&self) -> [u8; 32] {
         self.reader.get_ref().digest()
+    }
+
+    fn compressed_artifact_digest(&self) -> [u8; 32] {
+        self.reader.get_ref().inner.compressed_artifact_digest()
     }
 
     fn line(&mut self) -> Result<Option<Vec<u8>>, String> {
@@ -238,12 +263,13 @@ pub fn census_fastq(r1: &Path, r2: Option<&Path>) -> Result<InputCensus, String>
         input_mode: if r2.is_some() { "PE" } else { "SE" },
         fragments,
         input_digest: reader.input_digest(),
+        compressed_artifact_digest: reader.compressed_artifact_digest(),
         read_ends_per_fragment: if r2.is_some() { 2 } else { 1 },
     })
 }
 
-fn composite_input_digest(r1: [u8; 32], r2: Option<[u8; 32]>) -> String {
-    let mut bytes = b"viroflash-input-v1\0".to_vec();
+fn composite_input_digest(domain: &[u8], r1: [u8; 32], r2: Option<[u8; 32]>) -> String {
+    let mut bytes = domain.to_vec();
     let mode = if r2.is_some() {
         b"PE".as_slice()
     } else {
@@ -266,6 +292,8 @@ fn append_digest_item(bytes: &mut Vec<u8>, tag: &[u8], digest: [u8; 32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
 
     #[test]
@@ -279,6 +307,29 @@ mod tests {
         let census = census_fastq(&root.join("r1.fq"), Some(&root.join("r2.fq"))).unwrap();
         assert_eq!(census.fragments, 2);
         assert_eq!(census.read_ends_per_fragment, 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decoded_identity_is_encoding_invariant_but_artifact_identity_is_not() {
+        let root = std::env::temp_dir().join(format!("vf-fastq-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = b"@a\nACGT\n+\nIIII\n";
+        std::fs::write(root.join("sample.fastq"), bytes).unwrap();
+        let mut gzip = GzEncoder::new(
+            File::create(root.join("sample.fastq.gz")).unwrap(),
+            Compression::fast(),
+        );
+        gzip.write_all(bytes).unwrap();
+        gzip.finish().unwrap();
+
+        let plain = census_fastq(&root.join("sample.fastq"), None).unwrap();
+        let compressed = census_fastq(&root.join("sample.fastq.gz"), None).unwrap();
+        assert_eq!(plain.input_digest, compressed.input_digest);
+        assert_ne!(
+            plain.compressed_artifact_digest,
+            compressed.compressed_artifact_digest
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -64,6 +64,12 @@ def main():
     if not binary.is_file():
         raise SystemExit(f"binary does not exist: {binary}")
 
+    structural_test = (
+        "competitive_alignment::tests::"
+        "phase5_alignment_retention_is_threads_times_max_fragment_not_total_selected"
+    )
+    run_checked(["cargo", "test", structural_test, "--locked"])
+
     measurements = []
     with tempfile.TemporaryDirectory(prefix="viroflash-phase5-memory-") as temporary:
         root = Path(temporary)
@@ -148,19 +154,18 @@ def main():
     result = {
         "measurements": measurements,
         "adjacent_slopes": adjacent_slopes,
-        "structural_evidence": {
-            "sequence_reservoir": "absent",
-            "fastq_reader_buffer_bytes_per_input_end": 1048576,
-            "alignment_task_queue_capacity_fragments": f"{args.threads} threads x 1",
-            "alignment_result_queue_capacity_fragments": f"{args.threads} threads x 1",
-            "retained_evidence_owner": "fixed reference groups plus merged reference intervals",
+        "structural_oracle": {
+            "status": "COMPLETE",
+            "test": structural_test,
+            "exact_bound": "threads * maximum fragment sequence bytes",
+            "counterfactual_linear_retention": "REJECTED",
         },
         "evidence_limits": [
             "The curve is an observation, not a proof of a universal RSS bound.",
             "Linux VmHWM is a high-water estimate and may be imprecise.",
             "Minimap2 internal allocations are opaque to this structural audit.",
-            "Queue item count is bounded, but one arbitrarily long FASTQ record is not byte-capped.",
-            "The structural bound is independent of selected-fragment count only for a fixed index, thread count, and maximum fragment length.",
+            "No arbitrary FASTQ record-size cutoff is imposed; maximum fragment bytes remain an unavoidable term.",
+            "The structural bound is independent of selected-fragment count only for a fixed index and thread count.",
         ],
         "acceptance_role": "raw_measurement_no_subjective_tolerance",
     }

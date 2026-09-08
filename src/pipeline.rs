@@ -103,6 +103,9 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
         if fragments.input_digest() != census.input_digest {
             return Err("FASTQ bytes changed between pass 1 and pass 2".into());
         }
+        if fragments.compressed_artifact_digest() != census.compressed_artifact_digest {
+            return Err("Compressed FASTQ artifacts changed between pass 1 and pass 2".into());
+        }
         counts.3 = accumulator.aligned_fragments;
         stages.pass2_sample_prescreen_align = started.elapsed().as_millis() as u64;
 
@@ -213,9 +216,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::competitive_alignment::{CompetitiveAligner, FragmentAdjudication};
-    use crate::fastq_input::FragmentReader;
+    use crate::competitive_alignment::CompetitiveAligner;
+    use crate::evidence::EvidenceAccumulator;
+    use crate::fastq_input::{census_fastq, FragmentReader};
     use crate::reference_index::{build_index, IndexOptions};
+    use crate::report::{build_evidence_report, EvidenceReport, ReportInputs};
+    use crate::sampling_design::SamplingDesign;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -234,6 +240,48 @@ mod tests {
     fn write_fasta(path: &Path, id: &str, sequence: &[u8]) {
         let mut file = File::create(path).unwrap();
         writeln!(file, ">{id}\n{}", String::from_utf8_lossy(sequence)).unwrap();
+    }
+
+    fn gate_counterfactual_report(
+        fastq: &Path,
+        index: &crate::reference_index::ReferenceIndex,
+        exhaustive: bool,
+    ) -> EvidenceReport {
+        let census = census_fastq(fastq, None).unwrap();
+        let aligner = CompetitiveAligner::open(&index.mmi_path).unwrap();
+        let mut reader = FragmentReader::open(fastq, None).unwrap();
+        let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
+        let mut submitted = 0;
+        while let Some(fragment) = reader.next_fragment().unwrap() {
+            if !exhaustive
+                && index.bloom.evaluate_fragment(&fragment.r1, None) != GateEvaluation::Pass
+            {
+                continue;
+            }
+            submitted += 1;
+            accumulator.accumulate_group_evidence(
+                aligner
+                    .align_fragment_competitively(&fragment, &index.contigs)
+                    .unwrap(),
+            );
+        }
+        build_evidence_report(
+            ReportInputs {
+                sample_id: "phase5-gate-counterfactual".into(),
+                census: &census,
+                design: SamplingDesign {
+                    selection_probability: 1.0,
+                    minimum_relevant_fragments: 1,
+                },
+                selected_fragments: census.fragments,
+                prescreen_passed_fragments: submitted,
+                profile: AnalysisProfile::FROZEN,
+                index_digest: index.index_digest.clone(),
+                unevaluable_fragments: 0,
+            },
+            accumulator,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -279,58 +327,32 @@ mod tests {
         }
         drop(fastq);
 
-        let aligner = CompetitiveAligner::open(&index.mmi_path).unwrap();
-        let mut reader = FragmentReader::open(&root.join("small.fastq"), None).unwrap();
-        let mut gate_evaluations = Vec::new();
-        let mut exhaustive = Vec::new();
-        while let Some(fragment) = reader.next_fragment().unwrap() {
-            gate_evaluations.push(index.bloom.evaluate_fragment(&fragment.r1, None));
-            exhaustive.push(
-                aligner
-                    .align_fragment_competitively(&fragment, &index.contigs)
-                    .unwrap()
-                    .adjudication,
-            );
-        }
+        let gated = gate_counterfactual_report(&root.join("small.fastq"), &index, false);
+        let exhaustive = gate_counterfactual_report(&root.join("small.fastq"), &index, true);
+        assert_eq!(gated.schema_id, exhaustive.schema_id);
+        assert_eq!(gated.target_signals, exhaustive.target_signals);
 
+        let mut normalized_exhaustive_run = exhaustive.run.clone();
+        normalized_exhaustive_run.prescreen_passed_fragments = gated.run.prescreen_passed_fragments;
+        normalized_exhaustive_run.aligned_fragments = gated.run.aligned_fragments;
+        normalized_exhaustive_run.unassigned_fragments = gated.run.unassigned_fragments;
+        assert_eq!(gated.run, normalized_exhaustive_run);
         assert_eq!(
-            gate_evaluations,
-            [
-                GateEvaluation::Pass,
-                GateEvaluation::Negative,
-                GateEvaluation::Negative
-            ]
+            (
+                gated.run.prescreen_passed_fragments,
+                gated.run.aligned_fragments,
+                gated.run.unassigned_fragments,
+            ),
+            (1, 1, 0)
         );
-        assert!(matches!(exhaustive[0], FragmentAdjudication::Supporting(0)));
-        assert!(matches!(
-            exhaustive[1],
-            FragmentAdjudication::NoTargetEvidence
-        ));
-        assert!(matches!(
-            exhaustive[2],
-            FragmentAdjudication::NoTargetEvidence
-        ));
-        let exhaustive_support = exhaustive
-            .iter()
-            .filter(|result| matches!(result, FragmentAdjudication::Supporting(0)))
-            .count();
-        let gated_support = exhaustive
-            .iter()
-            .zip(&gate_evaluations)
-            .filter(|(result, gate)| {
-                matches!(result, FragmentAdjudication::Supporting(0))
-                    && **gate == GateEvaluation::Pass
-            })
-            .count();
-        assert_eq!((gated_support, exhaustive_support), (1, 1));
         assert_eq!(
-            gate_evaluations
-                .iter()
-                .filter(|evaluation| **evaluation == GateEvaluation::Pass)
-                .count(),
-            1
+            (
+                exhaustive.run.prescreen_passed_fragments,
+                exhaustive.run.aligned_fragments,
+                exhaustive.run.unassigned_fragments,
+            ),
+            (3, 2, 1)
         );
-        assert_eq!(exhaustive.len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 }

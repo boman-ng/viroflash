@@ -10,6 +10,36 @@ use crate::reference_index::{ReferenceContig, ReferenceRole};
 
 const ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD: usize = 1;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AlignmentRetention {
+    pending_fragments: usize,
+    pending_sequence_bytes: usize,
+    maximum_pending_fragments: usize,
+    maximum_pending_sequence_bytes: usize,
+    maximum_fragment_bytes: usize,
+    total_sequence_bytes: usize,
+}
+
+impl AlignmentRetention {
+    fn claim(&mut self, fragment_bytes: usize, threads: usize) {
+        self.pending_fragments += 1;
+        self.pending_sequence_bytes += fragment_bytes;
+        self.maximum_pending_fragments = self.maximum_pending_fragments.max(self.pending_fragments);
+        self.maximum_pending_sequence_bytes = self
+            .maximum_pending_sequence_bytes
+            .max(self.pending_sequence_bytes);
+        self.maximum_fragment_bytes = self.maximum_fragment_bytes.max(fragment_bytes);
+        self.total_sequence_bytes += fragment_bytes;
+        assert!(self.pending_fragments <= threads);
+        assert!(self.pending_sequence_bytes <= threads.saturating_mul(self.maximum_fragment_bytes));
+    }
+
+    fn release(&mut self, fragment_bytes: usize) {
+        self.pending_fragments -= 1;
+        self.pending_sequence_bytes -= fragment_bytes;
+    }
+}
+
 pub struct CompetitiveAligner {
     aligner: Aligner<Built>,
 }
@@ -282,6 +312,29 @@ where
     N: FnMut() -> Result<Option<Fragment>, String>,
     S: FnMut(FragmentAlignmentEvidence),
 {
+    align_fragments_bounded_inner(
+        index_path,
+        contigs,
+        threads,
+        &mut next_fragment,
+        &mut sink,
+        |_| {},
+    )
+}
+
+fn align_fragments_bounded_inner<N, S, O>(
+    index_path: &Path,
+    contigs: &std::collections::HashMap<String, ReferenceContig>,
+    threads: usize,
+    next_fragment: &mut N,
+    sink: &mut S,
+    mut observe_batch: O,
+) -> Result<(), String>
+where
+    N: FnMut() -> Result<Option<Fragment>, String>,
+    S: FnMut(FragmentAlignmentEvidence),
+    O: FnMut(AlignmentRetention),
+{
     let aligners = (0..threads)
         .map(|_| CompetitiveAligner::open(index_path))
         .collect::<Result<Vec<_>, _>>()?;
@@ -298,20 +351,31 @@ where
                 let task = task_receiver.lock().expect("task receiver lock").recv();
                 let Ok(fragment) = task else { break };
                 let ordinal = fragment.ordinal;
+                let fragment_bytes =
+                    fragment.r1.len() + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
                 let result = aligner.align_fragment_competitively(&fragment, contigs);
-                if result_sender.send((ordinal, result)).is_err() {
+                drop(fragment);
+                if result_sender
+                    .send((ordinal, fragment_bytes, result))
+                    .is_err()
+                {
                     break;
                 }
             }));
         }
         drop(result_sender);
         let processing = (|| -> Result<(), String> {
+            let mut retention = AlignmentRetention::default();
             loop {
                 let mut submitted = 0;
                 while submitted < threads {
                     let Some(fragment) = next_fragment()? else {
                         break;
                     };
+                    let fragment_bytes = fragment.r1.len()
+                        + fragment.r2.as_ref().map_or(0, |sequence| sequence.len());
+                    retention.claim(fragment_bytes, threads);
+                    observe_batch(retention);
                     task_sender
                         .send(fragment)
                         .map_err(|_| "Alignment worker queue closed".to_string())?;
@@ -322,17 +386,20 @@ where
                 }
                 let mut completed = Vec::with_capacity(submitted);
                 for _ in 0..submitted {
-                    completed.push(
-                        result_receiver
-                            .recv()
-                            .map_err(|_| "Alignment worker result queue closed".to_string())?,
-                    );
+                    let completed_fragment = result_receiver
+                        .recv()
+                        .map_err(|_| "Alignment worker result queue closed".to_string())?;
+                    retention.release(completed_fragment.1);
+                    observe_batch(retention);
+                    completed.push(completed_fragment);
                 }
-                completed.sort_by_key(|(ordinal, _)| *ordinal);
-                for (_, result) in completed {
+                completed.sort_by_key(|(ordinal, _, _)| *ordinal);
+                for (_, _, result) in completed {
                     sink(result?);
                 }
             }
+            assert_eq!(retention.pending_fragments, 0);
+            assert_eq!(retention.pending_sequence_bytes, 0);
             Ok(())
         })();
         drop(task_sender);
@@ -348,7 +415,115 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
     use super::*;
+    use crate::reference_index::{build_index, IndexOptions};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn retention_within_bound(stats: AlignmentRetention, threads: usize) -> bool {
+        stats.maximum_pending_fragments <= threads
+            && stats.maximum_pending_sequence_bytes
+                <= threads.saturating_mul(stats.maximum_fragment_bytes)
+    }
+
+    fn measured_alignment(
+        index_path: &Path,
+        contigs: &std::collections::HashMap<String, ReferenceContig>,
+        threads: usize,
+        fragments: Vec<Fragment>,
+    ) -> AlignmentRetention {
+        let stats = RefCell::new(AlignmentRetention::default());
+        let mut fragments = VecDeque::from(fragments);
+        align_fragments_bounded_inner(
+            index_path,
+            contigs,
+            threads,
+            &mut || Ok(fragments.pop_front()),
+            &mut |_| {},
+            |observation| {
+                *stats.borrow_mut() = observation;
+            },
+        )
+        .unwrap();
+        stats.into_inner()
+    }
+
+    fn fixture() -> (std::path::PathBuf, crate::reference_index::ReferenceIndex) {
+        let root = std::env::temp_dir().join(format!(
+            "viroflash-phase5-retention-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for (name, base) in [("host", b'A'), ("target", b'C')] {
+            let mut file = File::create(root.join(format!("{name}.fa"))).unwrap();
+            writeln!(
+                file,
+                ">{name}\n{}",
+                char::from(base).to_string().repeat(8_192)
+            )
+            .unwrap();
+        }
+        let index = build_index(&IndexOptions {
+            host_fa: root.join("host.fa"),
+            target_fa: root.join("target.fa"),
+            out_dir: root.join("index"),
+            threads: 1,
+        })
+        .unwrap();
+        (root, index)
+    }
+
+    #[test]
+    fn phase5_alignment_retention_is_threads_times_max_fragment_not_total_selected() {
+        let (root, index) = fixture();
+        for read_length in [40, 120, 4_096] {
+            for threads in [1, 2, 4, 8] {
+                let fragments = |count| {
+                    (0..count)
+                        .map(|ordinal| Fragment {
+                            ordinal,
+                            id: format!("fragment-{ordinal}"),
+                            r1: vec![b'G'; read_length],
+                            r2: Some(vec![b'T'; read_length]),
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let small = measured_alignment(
+                    &index.mmi_path,
+                    &index.contigs,
+                    threads,
+                    fragments(threads as u64 * 2),
+                );
+                let large = measured_alignment(
+                    &index.mmi_path,
+                    &index.contigs,
+                    threads,
+                    fragments(threads as u64 * 20),
+                );
+                assert!(retention_within_bound(small, threads));
+                assert!(retention_within_bound(large, threads));
+                assert_eq!(
+                    small.maximum_pending_sequence_bytes,
+                    large.maximum_pending_sequence_bytes
+                );
+                assert!(large.total_sequence_bytes > small.total_sequence_bytes);
+
+                let counterfactual = AlignmentRetention {
+                    maximum_pending_sequence_bytes: large.total_sequence_bytes,
+                    ..large
+                };
+                assert!(!retention_within_bound(counterfactual, threads));
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn target(group: usize, score: i32) -> AlignmentHit {
         AlignmentHit {

@@ -311,6 +311,74 @@ impl IntervalUnion {
 mod tests {
     use super::*;
 
+    fn choose(total: u64, count: u64) -> u128 {
+        let count = count.min(total - count);
+        (1..=count).fold(1_u128, |value, step| {
+            value * u128::from(total - count + step) / u128::from(step)
+        })
+    }
+
+    fn hypergeometric_count(
+        population: u64,
+        total_successes: u64,
+        sample: u64,
+        observed: u64,
+    ) -> u128 {
+        if observed > total_successes
+            || observed > sample
+            || sample - observed > population - total_successes
+        {
+            return 0;
+        }
+        choose(total_successes, observed) * choose(population - total_successes, sample - observed)
+    }
+
+    fn exact_cdf_count(observed: u64, population: u64, total_successes: u64, sample: u64) -> u128 {
+        (0..=observed)
+            .map(|candidate| hypergeometric_count(population, total_successes, sample, candidate))
+            .sum()
+    }
+
+    fn exact_interval_endpoints(
+        population: u64,
+        sample: u64,
+        successes: u64,
+        family_size: u64,
+    ) -> (u64, u64) {
+        if sample == population {
+            return (successes, successes);
+        }
+        let denominator = choose(population, sample);
+        let tail_denominator = 40 * u128::from(family_size);
+        let feasible_low = successes;
+        let feasible_high = population - (sample - successes);
+        let lower = if successes == 0 {
+            0
+        } else {
+            let mut candidate = feasible_low;
+            while candidate < feasible_high
+                && exact_cdf_count(successes - 1, population, candidate, sample) * tail_denominator
+                    >= denominator * (tail_denominator - 1)
+            {
+                candidate += 1;
+            }
+            candidate.saturating_sub(1).max(feasible_low)
+        };
+        let upper = if successes == sample {
+            population
+        } else {
+            let mut candidate = feasible_high;
+            while candidate > feasible_low
+                && exact_cdf_count(successes, population, candidate, sample) * tail_denominator
+                    < denominator
+            {
+                candidate -= 1;
+            }
+            candidate.saturating_add(1).min(feasible_high)
+        };
+        (lower, upper)
+    }
+
     fn group() -> ReferenceGroup {
         ReferenceGroup {
             ordinal: 0,
@@ -368,6 +436,66 @@ mod tests {
                         upper,
                         "N={population} n={sample} x={successes}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase5_production_endpoints_bias_and_family_coverage_match_exact_enumeration() {
+        let interval = finite_population_interval(50, 10, 3, 0.05).unwrap();
+        assert_eq!(
+            (
+                (interval.lower * 50.0).round() as u64,
+                (interval.upper * 50.0).round() as u64
+            ),
+            exact_interval_endpoints(50, 10, 3, 1)
+        );
+        assert_eq!(exact_interval_endpoints(50, 10, 3, 1), (4, 32));
+
+        for family_size in [1_u64, 20_560] {
+            for population in 2..=20 {
+                for sample in 1..=population {
+                    let denominator = choose(population, sample);
+                    for total_successes in 0..=population {
+                        let weighted_sum = (0..=sample)
+                            .map(|successes| {
+                                u128::from(successes)
+                                    * hypergeometric_count(
+                                        population,
+                                        total_successes,
+                                        sample,
+                                        successes,
+                                    )
+                            })
+                            .sum::<u128>();
+                        assert_eq!(
+                            weighted_sum * u128::from(population),
+                            u128::from(total_successes) * u128::from(sample) * denominator
+                        );
+
+                        let noncoverage = (0..=sample)
+                            .filter(|successes| {
+                                let interval = finite_population_interval(
+                                    population,
+                                    sample,
+                                    *successes,
+                                    0.05 / family_size as f64,
+                                )
+                                .unwrap();
+                                let lower = (interval.lower * population as f64).round() as u64;
+                                let upper = (interval.upper * population as f64).round() as u64;
+                                total_successes < lower || total_successes > upper
+                            })
+                            .map(|successes| {
+                                hypergeometric_count(population, total_successes, sample, successes)
+                            })
+                            .sum::<u128>();
+                        assert!(
+                            noncoverage * 20 * u128::from(family_size) <= denominator,
+                            "N={population} n={sample} M={total_successes} m={family_size}"
+                        );
+                    }
                 }
             }
         }
