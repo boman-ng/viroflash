@@ -1,73 +1,71 @@
-# CI and release strategy
+# CI and Release Strategy
 
-## Continuous integration
+## Continuous Integration
 
-The `CI` workflow runs for every pull request and every push to `master`. It has three required jobs:
+The `CI` workflow runs formatting, type checks, Clippy with warnings denied, debug and release
+tests, and the Phase 0 verifier with the committed lockfile. Its Docker and Apptainer jobs build a
+deterministic HOST/TARGET fixture, create a reusable index, run analysis through `--index`, and
+assert that the output directory contains exactly:
 
-- `Rust quality and tests` checks formatting and types, denies all Clippy warnings, runs debug and optimized tests, and builds the production binary with the committed lockfile.
-- `Docker image` builds the OCI image, checks the embedded version command, and runs a positive synthetic dataset through a bind-mounted work directory as the image's unprivileged user.
-- `Apptainer image` builds the Linux binary and SIF image on Ubuntu 22.04, then runs the same mounted-data smoke test as the host user.
+```text
+perf.json
+report.csv
+report.html
+```
 
-Before merging, wait for all three jobs to pass. Configure them as required status checks if the repository plan supports protected private branches. The current private repository plan does not, so this gate is procedural rather than server-enforced. Dependabot may update pinned action commits and container base versions, but those changes should pass all three jobs before merge.
+The Docker smoke runs as UID/GID `65532`; the mounted fixture directory must be writable by that
+identity. The Apptainer smoke runs as the invoking host user.
 
-## Versioned releases
+## Tagged Releases
 
-Releases are immutable and tag-driven. The package version in `Cargo.toml` is the source of truth. The workflow accepts only a `vMAJOR.MINOR.PATCH` tag (with an optional SemVer prerelease suffix) whose version exactly matches the Cargo package.
+Releases are immutable and tag-driven. A release tag must be `vMAJOR.MINOR.PATCH`, optionally with
+a SemVer prerelease suffix, and must match the package version already reviewed in `Cargo.toml`.
+Changing that package version requires explicit authorization and a separate reviewed change.
 
-Prepare a release as follows:
+The release workflow:
 
-1. Update the version in `Cargo.toml`, run `cargo check` to refresh `Cargo.lock`, then run `cargo check --locked` to verify it, update user-facing documentation, and merge the change through CI.
-2. Create an annotated or signed tag at the reviewed commit, for example `git tag -s v0.2.0`.
-3. Push only that tag after CI is green: `git push origin v0.2.0`.
-4. Wait for the `Release` workflow. It publishes the GitHub release only after every binary, SIF, and OCI job succeeds.
+1. validates the tag against `Cargo.toml`;
+2. builds and inspects the static Linux amd64 binary;
+3. unpacks that binary and exercises the current `index` then `run --index` contract;
+4. builds and smoke-tests the Apptainer image through the same contract;
+5. publishes the amd64 OCI image only if its versioned tag does not already exist;
+6. verifies checksums before creating the GitHub release.
 
-The workflow publishes:
+Published assets are the Linux amd64 archive and checksum, the amd64 SIF and checksum, and OCI
+tags for the exact version plus stable convenience tags. Do not replace versioned assets or OCI
+tags. Repair a released defect with a newly authorized patch release.
 
-- `viroflash-VERSION-linux-x86_64.tar.gz`, a static Linux amd64 executable plus the README;
-- `viroflash-VERSION-x86_64.sif`, an immutable Apptainer amd64 image;
-- SHA-256 checksum files for both downloadable artifacts;
-- `ghcr.io/boman-ng/viroflash:VERSION`, `:MAJOR.MINOR`, and, for stable versions, `:latest`, as a `linux/amd64` OCI image;
-
-The repository deliberately does not publish to crates.io (`publish = false`). The OCI version tag and release assets are immutable. If a released build is defective, fix it in a new patch release; move only the convenience tags (`MAJOR.MINOR` and `latest`) forward. Never replace a versioned asset or OCI tag with different bytes.
-
-The container job refuses to replace an existing versioned OCI tag, and GitHub also refuses to create the same release twice. Use the Actions UI to rerun a failed job only before it has published external state. If an interrupted release has already published its OCI version tag, inspect that partial release and create a new patch version instead of mutating it.
-
-## Local image builds
-
-Build and run the Docker image:
+## Local Docker Check
 
 ```bash
+test_dir="$(mktemp -d)"
+python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
+chmod -R a+rwX "${test_dir}"
 docker build --tag viroflash:local .
-docker run --rm viroflash:local version
-docker run --rm -v "$PWD:/work" viroflash:local run --help
+docker run --rm viroflash:local --help
+docker run --rm --volume "${test_dir}:/work" viroflash:local index \
+  --host-fa /work/host.fa --target-fa /work/target.fa --threads 2 --out /work/index
+docker run --rm --volume "${test_dir}:/work" viroflash:local run \
+  --r1 /work/sample.fastq --index /work/index --threads 2 --out /work/result
+find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
 ```
 
-The Docker image runs as UID/GID `65532`. A bind-mounted output directory must therefore be writable by that identity. Input data and indexes are not embedded in the image.
+## Local Apptainer Check
 
-Build the static Linux binary and Apptainer image on Ubuntu 22.04 or an ABI-compatible system:
+Build the release binary first, then the image:
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-sudo apt-get install musl-tools
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker" \
-  cargo build --release --locked --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/viroflash target/release/viroflash
+cargo build --release --locked
 apptainer build viroflash.sif Apptainer.def
-apptainer run --bind "$PWD:/work" --pwd /work viroflash.sif version
+test_dir="$(mktemp -d)"
+python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
+apptainer run viroflash.sif --help
+apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif index \
+  --host-fa /work/host.fa --target-fa /work/target.fa --threads 2 --out /work/index
+apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif run \
+  --r1 /work/sample.fastq --index /work/index --threads 2 --out /work/result
+find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
 ```
 
-Apptainer runs with the invoking host UID and is the preferred image for shared HPC filesystems. Published binaries, SIF files, and OCI images are amd64-only. The standalone binary is statically linked and has no host glibc or zlib requirement.
-
-## Verification
-
-Verify downloaded files before use:
-
-```bash
-sha256sum --check viroflash-0.2.0-linux-x86_64.tar.gz.sha256
-sha256sum --check viroflash-0.2.0-x86_64.sif.sha256
-```
-
-Prefer versioned image tags or recorded OCI digests in production and HPC workflows. `latest` is only a discovery convenience.
-
-GitHub artifact attestations are intentionally disabled while this repository is private on a non-Enterprise plan. GitHub supports attestations for private repositories only on Enterprise Cloud. Enable them if the repository becomes public or moves to Enterprise Cloud.
+The listed result must be exactly the three successful artifacts above. Verify downloaded release
+assets with `sha256sum --check` before use.

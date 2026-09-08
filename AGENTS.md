@@ -1,33 +1,56 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Project Structure
 
-`viroflash` is a Rust 2021 command-line application. `src/main.rs` defines the CLI and exit behavior, while `src/lib.rs` orchestrates the detection pipeline. Domain modules own individual stages: `index.rs` and `reference.rs` build reusable indexes, `prescreen.rs` performs k-mer filtering, `align.rs` wraps minimap2 alignment, `stats.rs` evaluates candidates, and `report.rs` writes JSON/TSV output. Performance reporting lives in `perf.rs`. Integration coverage is in `tests/smoke.rs`; focused unit tests live beside their modules. `scripts/` contains portable synthetic-data utilities. Never commit local datasets, indexes, reports, `.local/`, `target/`, or `*.work/` directories.
+`viroflash` is a Rust 2021 command-line application. `src/main.rs` owns the strict `index` and
+`run` CLI, `src/lib.rs` exposes only supported entry points, and `src/pipeline.rs` orchestrates
+analysis. `analysis_profile.rs`, `fastq_input.rs`, and `sampling_design.rs` own the frozen profile
+and two FASTQ passes. `reference_group.rs` and `reference_index.rs` build and load reusable
+HOST+TARGET indexes. `kmer_gate.rs`, `competitive_alignment.rs`, `evidence.rs`, and
+`integration_evidence.rs` own fragment evidence. `report.rs` writes `report.csv` and visible
+`report.html`; `performance_report.rs` writes telemetry-only `perf.json`.
 
-## Build, Test, and Development Commands
+Integration coverage is in `tests/smoke.rs`; focused unit tests live beside their modules. Never
+commit local datasets, indexes, reports, `.local/`, `target/`, `.tmp/`, or `*.work/` directories.
 
-Use the committed lockfile for reproducible builds:
+## Build and Test
+
+Use the committed lockfile:
 
 ```bash
-cargo fmt --all -- --check                         # verify formatting
-cargo check --locked                               # type-check quickly
+cargo fmt --all -- --check
+cargo check --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --locked                  # unit and smoke tests
-cargo test --release --locked                      # optimized-path tests
-cargo build --release --locked                     # production binary
-cargo run --locked -- --help                       # inspect the CLI
+cargo test --all-targets --locked
+cargo test --release --locked
+cargo build --release --locked
+python3 evaluation/phase0/verify.py
 ```
 
-Run the narrowest relevant test first, for example `cargo test stats::tests --locked`, then broaden checks for shared pipeline changes.
+Run the narrowest relevant test first, such as `cargo test sampling_design::tests --locked`, then
+broaden checks for shared pipeline changes.
 
-## Coding Style & Naming Conventions
+## Coding Conventions
 
-Follow default `rustfmt`: four-space indentation, `snake_case` functions and modules, and `CamelCase` types. Keep thresholds in the module that owns the corresponding stage. Production input paths return `Result<T, String>` and must not panic or hide errors. Prefer the standard library and existing dependencies. Preserve deterministic ordering, fixed seeds, CLI options, JSON schemas, TSV column order, and 0-based half-open coordinates unless a contract change is explicitly required.
+Follow default `rustfmt`: four-space indentation, `snake_case` functions and modules, and
+`CamelCase` types. Stable scientific constants belong to `analysis_profile.rs`; do not create
+unsupported runtime choices. Production input paths return `Result<T, String>` and must not panic
+or hide errors. Prefer the standard library and existing dependencies. Preserve deterministic
+fragment selection, report column order, atomic output writes, and 0-based half-open coordinates.
 
-## Testing Guidelines
+## Testing Contract
 
-Add unit tests near changed logic and end-to-end behavior to `tests/smoke.rs`. Cover success and error paths for CLI or parsing changes. Reporting changes require JSON parsing plus JSON/TSV field-consistency checks. Concurrency, sampling, and index changes must verify deterministic output and equivalence between reusable-index and automatic-build execution.
+Add unit tests near changed logic and end-to-end behavior to `tests/smoke.rs`. Cover success and
+error paths for CLI or parser changes. Reporting changes require strict CSV column-order checks and
+comparison of every visible HTML field against CSV. Concurrency and sampling changes must verify
+deterministic output across thread counts. Index changes must exercise reusable `index` followed by
+`run --index`; analysis always consumes a reusable index.
 
-## Commit & Pull Request Guidelines
+Successful runs must produce exactly `report.csv`, `report.html`, and `perf.json`. Failed runs may
+leave only an error-shaped `perf.json`.
 
-Use Conventional Commits seen in history, such as `feat(index): ...`, `fix(report): ...`, or `test(smoke): ...`. Keep each commit limited to one self-contained purpose and review its staged diff before committing. Pull requests should explain the user-visible effect, affected contracts, verification commands, and any compatibility or performance impact. Link relevant issues and include representative output when report formats change. Do not push, tag, rewrite history, or modify remotes without explicit authorization.
+## Change Control
+
+Use focused Conventional Commits such as `fix(evidence): ...`, `fix(index): ...`, or
+`docs: align release guidance`. Review the complete staged diff before committing. Do not push, tag, rewrite
+history, modify remotes, or change package/schema versions without explicit authorization.
