@@ -32,8 +32,10 @@ python3 evaluation/phase6/phase6_scorer.py \
   --write-retrospective-provenance
 ```
 
-That ledger explicitly records the limitation and the two prior evaluation-only corrections:
+That ledger explicitly records the limitation and the three post-run evaluation-only corrections:
 all exact-sequence ReferenceGroups matching an internal truth label participate in expected-signal
 adjudication (`853677e`), and internal adjudication is limited to the frozen EBV/HBV/HPV16/HPV18
-label scope while retaining all evidence (`26aeab2`). It does not claim those scorer inputs were
-frozen before production execution.
+label scope while retaining all evidence (`26aeab2`). Taxon matching starts at the FASTA
+description, excludes non-human `Heron hepatitis B virus`, and is accompanied by independent public
+report semantic validation and scoring-provenance binding (`e55dbd2`). It does not claim any of
+these scorer inputs or corrections were frozen before production execution.

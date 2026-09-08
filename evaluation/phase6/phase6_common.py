@@ -74,6 +74,12 @@ SCORER_CORRECTIONS = (
         "discovery": "evaluation semantic review",
         "correction": "Internal adjudication is limited to the frozen EBV/HBV/HPV16/HPV18 label scope while preserving total observed evidence separately.",
     },
+    {
+        "commit": "e55dbd2",
+        "timing": "POST_RUN_POST_INITIAL_SCORING_PRE_REVIEW_RESCORING",
+        "discovery": "Phase 6 reviewer integrity review",
+        "correction": "Internal taxon matching starts at the FASTA description and excludes non-human Heron hepatitis B virus; independent public report semantic validation and scoring provenance binding were added.",
+    },
 )
 RETROSPECTIVE_PROVENANCE_LIMIT = (
     "The completed current campaign did not bind scorer/config/manifest inputs before execution. "
