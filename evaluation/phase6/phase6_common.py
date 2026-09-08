@@ -286,7 +286,8 @@ def close_float(actual, expected, absolute=1e-15, relative=1e-12):
     return math.isclose(actual, expected, abs_tol=absolute, rel_tol=relative)
 
 
-def hypergeometric_tail_reaches(population, total_successes, sample, observed, upper_tail, threshold):
+def hypergeometric_tail_reaches(
+        population, total_successes, sample, observed, upper_tail, threshold, inclusive=True):
     support_low = max(0, sample - (population - total_successes))
     support_high = min(sample, total_successes)
     if upper_tail:
@@ -335,7 +336,8 @@ def hypergeometric_tail_reaches(population, total_successes, sample, observed, u
             tail_terms.append(weight)
     total_weight = math.fsum(total_terms)
     tail_weight = math.fsum(tail_terms)
-    return tail_weight >= threshold * total_weight
+    scaled_threshold = threshold * total_weight
+    return tail_weight >= scaled_threshold if inclusive else tail_weight > scaled_threshold
 
 
 @lru_cache(maxsize=None)
@@ -354,7 +356,8 @@ def exact_hypergeometric_interval(population, sample, successes, level):
         low, high = feasible_low, feasible_high
         while low < high:
             middle = low + (high - low) // 2
-            if hypergeometric_tail_reaches(population, middle, sample, successes, True, tail):
+            if hypergeometric_tail_reaches(
+                    population, middle, sample, successes, True, tail, inclusive=False):
                 high = middle
             else:
                 low = middle + 1

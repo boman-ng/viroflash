@@ -185,6 +185,15 @@ class Phase6Tests(unittest.TestCase):
         self.assertEqual(exact_hypergeometric_interval(50, 10, 3, 0.95), (0.08, 0.64))
         self.assertEqual(exact_hypergeometric_interval.cache_info().hits, 1)
 
+    def test_exact_hypergeometric_oracle_matches_production_regression(self):
+        population = 35_801_278
+        lower, upper = exact_hypergeometric_interval(
+            population, 1_268_602, 51, 0.9999975680933852)
+        self.assertEqual(
+            (round(lower * population), round(upper * population)),
+            (692, 2612),
+        )
+
     def test_frozen_internal_reference_label_audit(self):
         manifest, config = load_contract()
         ledger = load_digest_ledger("../../.tmp/phase6-real-e2e")

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
-use statrs::distribution::{DiscreteCDF, Hypergeometric};
 
 use crate::competitive_alignment::{FragmentAdjudication, FragmentAlignmentEvidence};
 use crate::integration_evidence::IntegrationStatus;
@@ -186,7 +185,12 @@ pub fn finite_population_interval(
     successes: u64,
     alpha: f64,
 ) -> Result<FinitePopulationInterval, String> {
-    if sample > population || successes > sample || population == 0 || sample == 0 {
+    if sample > population
+        || successes > sample
+        || population == 0
+        || sample == 0
+        || !(0.0..1.0).contains(&alpha)
+    {
         return Err("Invalid finite-population interval inputs".into());
     }
     if sample == population {
@@ -204,7 +208,15 @@ pub fn finite_population_interval(
         0
     } else {
         first_true(feasible_low, feasible_high, |total_successes| {
-            Ok(hypergeom_cdf(successes - 1, population, total_successes, sample)? < 1.0 - tail)
+            hypergeometric_tail_reaches(
+                population,
+                total_successes,
+                sample,
+                successes,
+                Tail::Upper,
+                tail,
+                false,
+            )
         })?
         .saturating_sub(1)
         .max(feasible_low)
@@ -213,7 +225,15 @@ pub fn finite_population_interval(
         population
     } else {
         last_true(feasible_low, feasible_high, |total_successes| {
-            Ok(hypergeom_cdf(successes, population, total_successes, sample)? >= tail)
+            hypergeometric_tail_reaches(
+                population,
+                total_successes,
+                sample,
+                successes,
+                Tail::Lower,
+                tail,
+                true,
+            )
         })?
         .saturating_add(1)
         .min(feasible_high)
@@ -225,15 +245,128 @@ pub fn finite_population_interval(
     })
 }
 
-fn hypergeom_cdf(
-    x: u64,
+#[derive(Clone, Copy)]
+enum Tail {
+    Lower,
+    Upper,
+}
+
+#[derive(Default)]
+struct CompensatedSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedSum {
+    fn add(&mut self, value: f64) {
+        let adjusted = value - self.correction;
+        let next = self.sum + adjusted;
+        self.correction = (next - self.sum) - adjusted;
+        self.sum = next;
+    }
+}
+
+fn ratio(numerator: u128, denominator: u128) -> Result<f64, String> {
+    if numerator == 0 || denominator == 0 {
+        return Err("Invalid hypergeometric recurrence".into());
+    }
+    Ok(numerator as f64 / denominator as f64)
+}
+
+fn negligible_remainder(weight: f64, next_ratio: f64, accumulated: f64) -> bool {
+    next_ratio < 1.0
+        && weight * next_ratio / (1.0 - next_ratio) <= f64::EPSILON * accumulated.max(1.0)
+}
+
+fn hypergeometric_tail_reaches(
     population: u64,
     total_successes: u64,
     sample: u64,
-) -> Result<f64, String> {
-    Hypergeometric::new(population, total_successes, sample)
-        .map(|distribution| distribution.cdf(x))
-        .map_err(|error| format!("Invalid hypergeometric distribution: {error}"))
+    observed: u64,
+    tail: Tail,
+    threshold: f64,
+    inclusive: bool,
+) -> Result<bool, String> {
+    let support_low = sample.saturating_sub(population - total_successes);
+    let support_high = sample.min(total_successes);
+    match tail {
+        Tail::Upper if observed <= support_low => return Ok(true),
+        Tail::Upper if observed > support_high => return Ok(false),
+        Tail::Lower if observed < support_low => return Ok(false),
+        Tail::Lower if observed >= support_high => return Ok(true),
+        _ => {}
+    }
+
+    let mode = (((u128::from(sample) + 1) * (u128::from(total_successes) + 1))
+        / (u128::from(population) + 2)) as u64;
+    let mode = mode.clamp(support_low, support_high);
+    let mut total_weight = CompensatedSum::default();
+    let mut tail_weight = CompensatedSum::default();
+    total_weight.add(1.0);
+    if matches!(tail, Tail::Upper) && mode >= observed
+        || matches!(tail, Tail::Lower) && mode <= observed
+    {
+        tail_weight.add(1.0);
+    }
+
+    let mut weight = 1.0;
+    let mut current = mode;
+    while current > support_low {
+        let step_ratio = ratio(
+            u128::from(current) * u128::from(population - total_successes - (sample - current)),
+            u128::from(total_successes - current + 1) * u128::from(sample - current + 1),
+        )?;
+        weight *= step_ratio;
+        current -= 1;
+        total_weight.add(weight);
+        if matches!(tail, Tail::Lower) && current <= observed {
+            tail_weight.add(weight);
+        }
+        if current == support_low {
+            break;
+        }
+        let next_ratio = ratio(
+            u128::from(current) * u128::from(population - total_successes - (sample - current)),
+            u128::from(total_successes - current + 1) * u128::from(sample - current + 1),
+        )?;
+        if negligible_remainder(weight, next_ratio, total_weight.sum) {
+            break;
+        }
+    }
+
+    weight = 1.0;
+    current = mode;
+    while current < support_high {
+        let step_ratio = ratio(
+            u128::from(total_successes - current) * u128::from(sample - current),
+            u128::from(current + 1)
+                * u128::from(population - total_successes - (sample - current) + 1),
+        )?;
+        weight *= step_ratio;
+        current += 1;
+        total_weight.add(weight);
+        if matches!(tail, Tail::Upper) && current >= observed {
+            tail_weight.add(weight);
+        }
+        if current == support_high {
+            break;
+        }
+        let next_ratio = ratio(
+            u128::from(total_successes - current) * u128::from(sample - current),
+            u128::from(current + 1)
+                * u128::from(population - total_successes - (sample - current) + 1),
+        )?;
+        if negligible_remainder(weight, next_ratio, total_weight.sum) {
+            break;
+        }
+    }
+
+    let scaled_threshold = threshold * total_weight.sum;
+    Ok(if inclusive {
+        tail_weight.sum >= scaled_threshold
+    } else {
+        tail_weight.sum > scaled_threshold
+    })
 }
 
 fn first_true(
@@ -310,6 +443,7 @@ impl IntervalUnion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use statrs::distribution::{DiscreteCDF, Hypergeometric};
 
     fn choose(total: u64, count: u64) -> u128 {
         let count = count.min(total - count);
@@ -399,33 +533,8 @@ mod tests {
             for sample in 1..population {
                 for successes in 0..=sample {
                     let actual =
-                        finite_population_interval(population, sample, successes, 0.1).unwrap();
-                    let lower = if successes == 0 {
-                        0
-                    } else {
-                        let mut candidate = successes;
-                        while candidate < population - (sample - successes)
-                            && hypergeom_cdf(successes - 1, population, candidate, sample).unwrap()
-                                >= 0.95
-                        {
-                            candidate += 1;
-                        }
-                        candidate.saturating_sub(1).max(successes)
-                    };
-                    let upper = if successes == sample {
-                        population
-                    } else {
-                        let mut candidate = population - (sample - successes);
-                        while candidate > successes
-                            && hypergeom_cdf(successes, population, candidate, sample).unwrap()
-                                < 0.05
-                        {
-                            candidate -= 1;
-                        }
-                        candidate
-                            .saturating_add(1)
-                            .min(population - (sample - successes))
-                    };
+                        finite_population_interval(population, sample, successes, 0.05).unwrap();
+                    let (lower, upper) = exact_interval_endpoints(population, sample, successes, 1);
                     assert_eq!(
                         (actual.lower * population as f64).round() as u64,
                         lower,
@@ -437,6 +546,58 @@ mod tests {
                         "N={population} n={sample} x={successes}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_tail_recurrence_fixes_real_lower_endpoint() {
+        let population = 35_801_278;
+        let sample = 1_268_602;
+        let successes = 51;
+        let alpha = 0.05 / 20_560.0;
+        let interval = finite_population_interval(population, sample, successes, alpha).unwrap();
+        assert_eq!(
+            (
+                (interval.lower * population as f64).round() as u64,
+                (interval.upper * population as f64).round() as u64,
+            ),
+            (692, 2612)
+        );
+
+        let tail = alpha / 2.0;
+        assert!(hypergeometric_tail_reaches(
+            population,
+            693,
+            sample,
+            successes,
+            Tail::Upper,
+            tail,
+            false,
+        )
+        .unwrap());
+        let old_distribution = Hypergeometric::new(population, 693, sample).unwrap();
+        assert!(old_distribution.cdf(successes - 1) >= 1.0 - tail);
+    }
+
+    #[test]
+    fn interval_endpoints_are_bounded_and_monotone() {
+        for &(population, sample, alpha) in &[(101, 17, 0.05), (10_003, 997, 0.05 / 20_560.0)] {
+            let mut previous = (0, 0);
+            for successes in 0..=sample {
+                let interval =
+                    finite_population_interval(population, sample, successes, alpha).unwrap();
+                let endpoints = (
+                    (interval.lower * population as f64).round() as u64,
+                    (interval.upper * population as f64).round() as u64,
+                );
+                let feasible_high = population - (sample - successes);
+                assert!(successes <= endpoints.0);
+                assert!(endpoints.0 <= endpoints.1);
+                assert!(endpoints.1 <= feasible_high);
+                assert!(previous.0 <= endpoints.0);
+                assert!(previous.1 <= endpoints.1);
+                previous = endpoints;
             }
         }
     }
