@@ -4,7 +4,7 @@ This document freezes only Phase 0 decisions and audit assets. It does not alter
 
 ## Frozen AnalysisProfile
 
-`evaluation/phase0/analysis-profile.json` was frozen before a v0.5 implementation or result existed. The 68 internal and 59 external runs must not be used to revise it.
+`evaluation/phase0/analysis-profile.json` was frozen before a v0.5 implementation or result existed. The user authorized execution of this plan on 2026-09-08; no person, committee, or approval system beyond that instruction is asserted. The 68 internal and 59 external runs must not be used to revise it.
 
 | Field | Symbol | Value | Product decision |
 |---|---:|---:|---|
@@ -14,6 +14,8 @@ This document freezes only Phase 0 decisions and audit assets. It does not alter
 | `maximum_interval_width` | w | 0.00001 | Call precision met only at interval width no greater than 10 fragments per million. |
 
 There is no minimum-read, MAPQ, edit-distance, alignment-margin, coverage, window, p/q, or PASS cutoff. `k=21`, minimap2 `sr`, all-chain enumeration, and ten equal-width diagnostic windows are profile inputs, not CLI choices. Changing any profile byte creates a new profile digest, requires new indexes, and restarts all 127 evaluations.
+
+The four values are authorized product/scientific choices from the plan, not estimates or calibration results from these datasets. Horvitz and Thompson support explicit inclusion-probability accounting; exact hypergeometric bounds support finite-population intervals; Dunn supports Bonferroni simultaneous coverage. These references justify the planned methods, not the numerical choices δ/w=1e-5 or α/β=.05: <https://doi.org/10.1080/01621459.1952.10483446>, <https://doi.org/10.1007/978-1-4612-3140-0>, <https://doi.org/10.1080/01621459.1961.10482090>.
 
 ## Digest and analysis identity
 
@@ -26,15 +28,17 @@ Composite identities use this unambiguous framing: the ASCII domain followed by 
 - `index_digest`: domain `viroflash-index-v1`; ordered items are `profile`, `reference_set`, and every required index artifact digest in manifest order.
 - `analysis_identity`: domain `viroflash-analysis-v1`; ordered items are `binary`, `profile`, `index`, and `input`.
 
-Missing component digests leave the composite identity unavailable; null is required and no placeholder is hashed. This is the Phase 0 gap for the 136 internal FASTQ files. Phase 1/2 may implement these formulas but may not add a second identity path.
+Missing component digests leave the composite identity unavailable; null is required and no placeholder is hashed. All input-file digests are now frozen. The v0.5 binary and indexes do not yet exist, so analysis identities remain unavailable in `PRE_EXECUTION_FROZEN`. Phase 1/2 may implement these formulas but may not add a second identity path.
 
 ## ReferenceGroup ledger
 
-`evaluation/phase0/reference-group-ledger-contract.tsv` is the executable ledger contract. Actual ledgers are index outputs and cannot be materialized in Phase 0 without reading reference sequence content; no historical 97%-identity group is imported.
+`evaluation/phase0/reference-group-ledger-contract.tsv` is the executable ledger contract. `evaluation/phase0/reference-groups.json` freezes actual ledgers for the internal DNA panel, external respiratory panel, and external HPV panel. No historical 97%-identity or 95%-coverage group is imported.
 
-Every target FASTA record appears in exactly one group. Two records may share a group only when their complete ASCII-uppercased sequence is byte-identical, allowing complete reverse-complement equality because alignment is strand-independent. Length must match. Circular rotations, high identity, partial coverage, shared taxonomy, names, and runtime reads never merge groups. `target_group_id` is `sha256:` plus the SHA-256 of the lexicographically smaller byte string of the normalized sequence and its reverse complement. The representative is the lexicographically smallest member ID; membership is OR-only and never supports a member-level claim.
+Every target FASTA record appears in exactly one group. The record ID is the first whitespace-delimited header token and must be non-empty UTF-8 and unique within the FASTA. Sequence lines are joined after removing ASCII whitespace and uppercasing. Accepted DNA symbols are exactly `ACGTMRWSYKVHDBN`; complement pairs are `A-T`, `C-G`, `M-K`, `R-Y`, `W-W`, `S-S`, `V-B`, `H-D`, and `N-N`. Any other character rejects the file; it is never silently removed or replaced. This follows the NCBI FASTA requirement for a unique SeqID and IUPAC symbols and the INSDC standard nucleotide-code table: <https://www.ncbi.nlm.nih.gov/genbank/fastaformat>, <https://www.insdc.org/submitting-standards/feature-table/>.
 
-The canonical ledger is UTF-8 TSV with the contract header order excluding the manifest-owned `ledger_digest`, LF endings, rows in `group_ordinal` order, member IDs sorted bytewise and joined by `;`, no quoting, and a final LF. The index manifest's `ledger_digest` covers those exact ledger bytes; it is not embedded in the hashed file. Runtime FASTQ cannot create, split, merge, or reorder groups; ledger row count fixes the multiplicity denominator.
+Two records may share a group only when their complete normalized sequence is byte-identical to the other's complete sequence or reverse complement. Length must match. Circular rotations, high identity, partial coverage, shared taxonomy, names, and runtime reads never merge groups. `target_group_id` is `sha256:` plus the SHA-256 of the lexicographically smaller byte string of the normalized sequence and its reverse complement. The representative is the lexicographically smallest member ID; membership is OR-only and never supports a member-level claim.
+
+The canonical ledger is UTF-8 TSV with one row per FASTA record, the contract header order excluding the manifest-owned `ledger_digest`, LF endings, groups ordered by `target_group_id`, members ordered bytewise by ID, and a final LF. The index manifest's `ledger_digest` covers those exact ledger bytes; it is not embedded in the hashed file. The frozen counts are 21,790 records/20,560 groups for the internal panel and 2 records/2 groups for each external panel. Runtime FASTQ cannot create, split, merge, or reorder groups; distinct group count fixes the multiplicity denominator.
 
 ## Competitive adjudication
 
@@ -73,12 +77,16 @@ There is no automatic index build, scientific parameter option, legacy alias, co
 
 ## Evaluation and historical baseline
 
-`evaluation/phase0/evaluation-manifest.json` freezes 68 internal and 59 external run IDs, cohorts, SE/PE layouts, absolute input/reference paths, byte sizes, truth labels, provenance, available checksums, known label/history discrepancies, and planned resources. It is read-only evaluation metadata, not production configuration.
+`evaluation/phase0/evaluation-manifest.json` freezes 68 internal and 59 external run IDs, cohorts, SE/PE layouts, absolute input/reference paths, byte sizes, truth labels, provenance, checksums, known label/history discrepancies, planned resources, and index IDs. It is evaluation metadata, not production configuration.
 
-The external 82 FASTQ digests correspond exactly to `metadata/FASTQ_SHA256SUMS`; external reference digests correspond to `refs/SHA256SUMS`. Internal truth and target-reference digests correspond to the existing `run_config.json`. The internal host digest is retained as non-authoritative `PHASE0_COMPUTED` metadata and is not eligible for `reference_set_digest`. No authoritative checksum source exists for the 136 internal FASTQs, so all are null `MISSING_AUTHORITATIVE_CHECKSUM`; this evidence gap is not repaired or disguised in Phase 0. Binary/index digests remain null because v0.5 artifacts do not exist.
+The external 82 FASTQ digests correspond exactly to `metadata/FASTQ_SHA256SUMS`; external reference digests correspond to `refs/SHA256SUMS`. Internal truth and target-reference digests correspond to the existing `run_config.json`. The 136 internal FASTQ digests were computed on 2026-09-08 by parallel streaming SHA-256 over the existing gzip bytes without decompression and are independently frozen in `internal-fastq-sha256.tsv` with status `PHASE0_FROZEN_COMPRESSED_SHA256`; this is explicit Phase 0 provenance, not an upstream authoritative source. The internal host digest remains `PHASE0_COMPUTED` metadata.
+
+The manifest has one state transition. `PRE_EXECUTION_FROZEN` means sample/truth/profile/checksum/ledger data are fixed while binary and all three cohort-index digests are null. Before the first E2E result, those four actual artifact digests and `bound_at` must be written once and state changed to `EXECUTION_BOUND`; the frozen evaluation digest must remain unchanged. No registry, migration, alternate schema, rebinding, or claim of current artifact binding exists.
 
 `evaluation/phase0/historical/` is an immutable snapshot of old-system observations. It is comparison evidence only: not v0.5 acceptance truth, not a pristine holdout, not a scorer input, and not permission to tune δ/α/β/w.
 
 ## Verification
 
-Run `python3 evaluation/phase0/verify.py`. It reads only committed assets and small truth/label/checksum/config metadata, checks 68+59 counts, unique IDs, exact fields, paths, sizes, checksum syntax and authoritative path correspondence, historical counts, the frozen profile digest, and Cargo version `0.3.0`. It has no FASTQ reader or checksum mode.
+Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, exact profile fields, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`.
+
+Run `python3 evaluation/phase0/verify.py --e2e-gate` immediately before E2E. It must fail in the committed `PRE_EXECUTION_FROZEN` state and passes only after the one-time actual binary/index binding reaches `EXECUTION_BOUND`.

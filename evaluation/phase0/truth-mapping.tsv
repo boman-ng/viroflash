@@ -1,5 +1,5 @@
 dataset_id	cohort	source_label	expectation_kind	expected_group_key	known_ambiguity
-internal-68	internal_dna_virus_68	null	MOCK	-	-
+internal-68	internal_dna_virus_68	<NULL>	MOCK	-	-
 internal-68	internal_dna_virus_68	ebv_wt	EXPECTED_GROUP	EBV	-
 internal-68	internal_dna_virus_68	hbv_b	EXPECTED_GROUP	HBV	-
 internal-68	internal_dna_virus_68	hbv_c	EXPECTED_GROUP	HBV	-

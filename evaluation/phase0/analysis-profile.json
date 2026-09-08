@@ -6,6 +6,10 @@
     "kmer_length": 21,
     "minimap2_preset": "sr",
     "reference_group_equivalence": "uppercase full sequence equals another member or its reverse complement",
+    "fasta_record_id": "first whitespace-delimited header token, UTF-8 and unique within the file",
+    "sequence_normalization": "remove ASCII whitespace between FASTA headers, then uppercase",
+    "iupac_dna_alphabet": "ACGTMRWSYKVHDBN",
+    "invalid_sequence_symbol": "reject the reference file without dropping or replacing the symbol",
     "alignment_acceptance": "all emitted chains with CIGAR and positive query length",
     "alignment_role_margin": 0,
     "occupied_window_bins": 10

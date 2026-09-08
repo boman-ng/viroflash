@@ -20,6 +20,7 @@ report.csv	RUN	index_digest	exactly one	Index digest.
 report.csv	RUN	input_digest	exactly one	Validated input digest.
 report.csv	RUN	read_ends_per_fragment	exactly one	One for SE and two for PE.
 report.csv	TARGET_SIGNAL	target_group_id	exactly one	ReferenceGroup identifier.
+report.csv	TARGET_SIGNAL	record_type	exactly one	Literal TARGET_SIGNAL.
 report.csv	TARGET_SIGNAL	representative_id	exactly one	Ledger representative identifier.
 report.csv	TARGET_SIGNAL	member_ids	exactly one	Ordered ledger member list.
 report.csv	TARGET_SIGNAL	evidence_status	exactly one	Evidence axis.
