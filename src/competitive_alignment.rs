@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{mpsc::sync_channel, Arc, Mutex};
+use std::sync::{mpsc::sync_channel, Arc};
 
 use minimap2::{Aligner, Built, Mapping, Strand};
 
@@ -346,17 +346,18 @@ where
 {
     let aligner = Arc::new(CompetitiveAligner::open(index_path)?);
     let queue_capacity = threads * ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD;
-    let (task_sender, task_receiver) = sync_channel::<Fragment>(queue_capacity);
-    let task_receiver = Arc::new(Mutex::new(task_receiver));
     let (result_sender, result_receiver) = sync_channel(queue_capacity);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
+        let mut task_senders = Vec::with_capacity(threads);
         for _ in 0..threads {
+            let (task_sender, task_receiver) =
+                sync_channel::<Fragment>(ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD);
+            task_senders.push(task_sender);
             let aligner = Arc::clone(&aligner);
-            let task_receiver = Arc::clone(&task_receiver);
             let result_sender = result_sender.clone();
             handles.push(scope.spawn(move || loop {
-                let task = task_receiver.lock().expect("task receiver lock").recv();
+                let task = task_receiver.recv();
                 let Ok(fragment) = task else { break };
                 let ordinal = fragment.ordinal;
                 #[cfg(test)]
@@ -394,7 +395,7 @@ where
                         retention.claim(fragment_bytes, threads);
                         observe_retention(retention);
                     }
-                    task_sender
+                    task_senders[submitted]
                         .send(fragment)
                         .map_err(|_| "Alignment worker queue closed".to_string())?;
                     submitted += 1;
@@ -426,7 +427,7 @@ where
             }
             Ok(())
         })();
-        drop(task_sender);
+        drop(task_senders);
         let mut join_error = None;
         for handle in handles {
             if handle.join().is_err() {
