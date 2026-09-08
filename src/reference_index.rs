@@ -205,8 +205,12 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     verify_digest(&directory.join(BLOOM), &manifest.bloom_digest)?;
     verify_digest(&directory.join(LEDGER), &manifest.ledger_digest)?;
     let bloom = TargetKmerBloom::read(&directory.join(BLOOM), profile.kmer_length)?;
-    if bloom.summary() != manifest.bloom {
-        return Err("Bloom summary does not match bloom.bin".into());
+    let actual_bloom_summary = bloom.summary();
+    if !bloom_summary_matches_serialized(&manifest.bloom, &actual_bloom_summary)? {
+        return Err(format!(
+            "Bloom summary does not match bloom.bin: manifest={:?}, actual={actual_bloom_summary:?}",
+            manifest.bloom
+        ));
     }
     let ledger_bytes = std::fs::read(directory.join(LEDGER))
         .map_err(|error| format!("Cannot read ReferenceGroup ledger: {error}"))?;
@@ -233,6 +237,17 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
         profile_digest: manifest.profile_digest,
         index_digest: hex_sha256(&bytes),
     })
+}
+
+fn bloom_summary_matches_serialized(
+    manifest: &BloomSummary,
+    actual: &BloomSummary,
+) -> Result<bool, String> {
+    let bytes = serde_json::to_vec(actual)
+        .map_err(|error| format!("Cannot serialize Bloom summary: {error}"))?;
+    let serialized_actual = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Cannot deserialize Bloom summary: {error}"))?;
+    Ok(manifest == &serialized_actual)
 }
 
 fn parse_ledger(
@@ -472,4 +487,33 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| "Digest is not hexadecimal".to_string())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_validation_uses_exact_serialized_float_identity() {
+        let actual = BloomSummary {
+            inserted_kmers: 15_721,
+            bit_count: 262_144,
+            hash_count: 4,
+            fill_fraction: 55_809_f64 / 262_144_f64,
+            theoretical_false_positive_rate: (55_809_f64 / 262_144_f64).powi(4),
+        };
+        let manifest: BloomSummary = serde_json::from_str(
+            r#"{
+                "inserted_kmers": 15721,
+                "bit_count": 262144,
+                "hash_count": 4,
+                "fill_fraction": 0.21289443969726562,
+                "theoretical_false_positive_rate": 0.002054268824373143
+            }"#,
+        )
+        .unwrap();
+
+        assert_ne!(actual.fill_fraction, manifest.fill_fraction);
+        assert!(bloom_summary_matches_serialized(&manifest, &actual).unwrap());
+    }
 }
