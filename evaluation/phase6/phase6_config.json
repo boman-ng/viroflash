@@ -1,0 +1,46 @@
+{
+  "contract_id": "viroflash.phase6.real-e2e.v1",
+  "index_by_cohort": {
+    "internal_dna_virus_68": "internal-dna-panel",
+    "gse147507_sars": "external-respiratory-panel",
+    "gse147507_rsv": "external-respiratory-panel",
+    "gse91065_hpv": "external-hpv-panel"
+  },
+  "internal_label_header_terms": {
+    "EBV": [
+      "Epstein-Barr virus",
+      "Human gammaherpesvirus 4"
+    ],
+    "HBV": [
+      "Hepatitis B virus"
+    ],
+    "HPV16": [
+      "Human papillomavirus type 16"
+    ],
+    "HPV18": [
+      "Human papillomavirus type 18",
+      "Human papillomavirus 18"
+    ]
+  },
+  "reproducibility_runs": [
+    {"run_id": "2543068", "covers": ["internal-largest", "negative"]},
+    {"run_id": "253040", "covers": ["internal-smallest", "EBV"]},
+    {"run_id": "249392", "covers": ["HBV"]},
+    {"run_id": "2538812", "covers": ["HPV16"]},
+    {"run_id": "251519", "covers": ["HPV18-ambiguity"]},
+    {"run_id": "SRR11517741", "covers": ["SARS-positive"]},
+    {"run_id": "SRR11517681", "covers": ["SARS-mock", "plain-multimember-gzip"]},
+    {"run_id": "SRR11517753", "covers": ["RSV-positive"]},
+    {"run_id": "SRR11517750", "covers": ["RSV-mock"]},
+    {"run_id": "SRR5090597", "covers": ["external-HPV16"]},
+    {"run_id": "SRR5090623", "covers": ["external-HPV18"]},
+    {"run_id": "SRR5090635", "covers": ["SRR5090635"]}
+  ],
+  "reproducibility_threads": [1, 2, 4, 8],
+  "reproducibility_repetitions": 2,
+  "gzip_equivalence_run_id": "SRR11517681",
+  "historical": {
+    "internal_results": "/home/wubw/data/viroflash/dna_virus_68_20260827/results",
+    "external_results": "/home/wubw/data/viroflash-benchmarks/results_20260827"
+  }
+}
