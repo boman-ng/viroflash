@@ -41,6 +41,7 @@
   "gzip_equivalence_run_id": "SRR11517681",
   "historical": {
     "internal_results": "/home/wubw/data/viroflash/dna_virus_68_20260827/results",
-    "external_results": "/home/wubw/data/viroflash-benchmarks/results_20260827"
+    "external_results": "/home/wubw/data/viroflash-benchmarks/results_20260827",
+    "internal_index_perf": "/home/wubw/data/viroflash/dna_virus_68_20260827/index_single_part.perf.json"
   }
 }

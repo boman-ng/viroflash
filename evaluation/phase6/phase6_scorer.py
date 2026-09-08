@@ -86,6 +86,8 @@ def adjudicate(run, parsed, internal_labels):
         classification = "LABEL_DISCORDANT_WITH_SEQUENCE_EVIDENCE"
     else:
         classification = "LABEL_DISCORDANT_UNRESOLVED"
+    if run["evaluability_status"] != "EVALUABLE":
+        classification = "NOT_EVALUABLE"
     wrong_resolved = any(
         target is not expected and target["attribution_status"] == "RESOLVED_TO_REFERENCE_GROUP"
         for target in observed_targets
@@ -226,7 +228,8 @@ def score(campaign_dir):
             failures.append(failure)
     scientific = scientific_metrics(records, manifest)
     performance, paired = performance_metrics(records, config, digest_ledger, starts, terminals, internal_labels)
-    adjudication_rows = [record for record in records if record["decision"]["classification"].startswith("LABEL_DISCORDANT")]
+    adjudication_rows = [record for record in records if record["decision"]["classification"].startswith("LABEL_DISCORDANT") or record["decision"]["classification"] == "NOT_EVALUABLE"]
+    performance_gates = performance_hard_gates(performance)
     evidence_dir.mkdir()
     write_adjudication(evidence_dir / "adjudication.tsv", adjudication_rows)
     write_run_table(evidence_dir / "run-results.tsv", records, failures)
@@ -242,6 +245,7 @@ def score(campaign_dir):
             "binary_profile_index_digests_reverified": True,
             "pass1_pass2_counts_ids_input_digest": "ENFORCED_BY_VERIFIED_BINARY_BEFORE_SUCCESS_REPORT",
             "reproducibility_report_csv_byte_identical": reproducibility["runs"] == reproducibility["report_csv_byte_identical"],
+            **performance_gates,
             "cargo_version_unchanged_0_3_0": cargo_version_is_frozen(),
         },
         "reproducibility": reproducibility,
@@ -277,7 +281,8 @@ def scientific_metrics(records, manifest):
         "mock_unexpected_signal": wilson(sum(record["decision"]["observed_signal_count"] > 0 for record in mocks), len(mocks)),
         "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in records), len(records)),
         "ambiguous_attribution": wilson(sum(record["decision"]["ambiguous_attribution"] for record in records), len(records)),
-        "not_evaluable": wilson(sum(run["evaluability_status"] == "NOT_EVALUABLE" for run in manifest["runs"]), len(manifest["runs"])),
+        "not_evaluable": wilson(sum(run["evaluability_status"] != "EVALUABLE" for run in manifest["runs"]), len(manifest["runs"])),
+        "classification_counts": dict(sorted(Counter(record["decision"]["classification"] for record in records).items())),
     }
     interval_fields = ("interval_lower", "interval_upper")
     expected_signals = [record["decision"]["expected_signal"] for record in expected if record["decision"]["expected_observed"]]
@@ -286,10 +291,16 @@ def scientific_metrics(records, manifest):
         for field in interval_fields
     }
     internal = [record for record in records if record["manifest"]["dataset_id"] == "internal-68"]
-    internal_without_ambiguity = [record for record in internal if record["manifest"]["evaluability_status"] != "LABEL_SEQUENCE_AMBIGUITY"]
+    internal_without_ambiguity = [record for record in internal if record["manifest"]["evaluability_status"] == "EVALUABLE"]
     concordant = lambda record: record["decision"]["classification"].startswith("LABEL_CONCORDANT")
-    result["internal_label_concordance_including_hpv18_ambiguity"] = wilson(sum(concordant(record) for record in internal), len(internal))
-    result["internal_label_concordance_excluding_hpv18_ambiguity"] = wilson(sum(concordant(record) for record in internal_without_ambiguity), len(internal_without_ambiguity))
+    result["internal_label_concordance_including_hpv18_ambiguity"] = {
+        **wilson(sum(concordant(record) for record in internal), len(internal)),
+        "denominator_policy": "all successful internal runs; NOT_EVALUABLE rows remain in the denominator",
+    }
+    result["internal_label_concordance_excluding_hpv18_ambiguity"] = {
+        **wilson(sum(concordant(record) for record in internal_without_ambiguity), len(internal_without_ambiguity)),
+        "denominator_policy": "successful internal runs with manifest evaluability_status EVALUABLE",
+    }
     result["external_by_cohort"] = {}
     for cohort in ("gse147507_sars", "gse147507_rsv", "gse91065_hpv"):
         cohort_records = [record for record in records if record["manifest"]["cohort"] == cohort]
@@ -300,6 +311,7 @@ def scientific_metrics(records, manifest):
             "mock_unexpected_signal": wilson(sum(record["decision"]["observed_signal_count"] > 0 for record in cohort_mocks), len(cohort_mocks)),
             "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in cohort_records), len(cohort_records)),
             "ambiguous_attribution": wilson(sum(record["decision"]["ambiguous_attribution"] for record in cohort_records), len(cohort_records)),
+            "not_evaluable": wilson(sum(record["manifest"]["evaluability_status"] != "EVALUABLE" for record in cohort_records), len(cohort_records)),
         }
     return result
 
@@ -339,6 +351,16 @@ def performance_metrics(records, config, digest_ledger, starts, terminals, inter
     result = {"indexes": {}, "datasets": {}, "cohorts": {}}
     for index_id, index in digest_ledger["indexes"].items():
         result["indexes"][index_id] = index["build"]
+    historical_internal_index = load_json(config["historical"]["internal_index_perf"])
+    historical_internal_index_peak = historical_internal_index["process"]["rss_bytes_peak"]
+    current_internal_index_peak = digest_ledger["indexes"]["internal-dna-panel"]["build"]["peak_rss_bytes"]
+    result["internal_index_build_memory_comparison"] = {
+        "historical_path": config["historical"]["internal_index_perf"],
+        "historical_peak_rss_bytes": historical_internal_index_peak,
+        "current_peak_rss_bytes": current_internal_index_peak,
+        "within_historical_max": current_internal_index_peak <= historical_internal_index_peak,
+        "scope": "internal-dna-panel only; no corresponding external historical index-build evidence",
+    }
     for grouping, key_name in (("datasets", "dataset_id"), ("cohorts", "cohort")):
         keys = sorted({row[key_name] for row in paired})
         for key in keys:
@@ -370,6 +392,18 @@ def performance_metrics(records, config, digest_ledger, starts, terminals, inter
                 result[grouping][key]["configured_jobs"] = cohort_runs[0]["planned_jobs"]
                 result[grouping][key]["configured_threads_per_run"] = cohort_runs[0]["planned_threads"]
     return result, paired
+
+
+def performance_hard_gates(performance):
+    sample_rss = all(not group["new_samples_over_historical_max"] for group in performance["datasets"].values())
+    wall = all(not group["systematic_wall_regression"] for group in performance["cohorts"].values())
+    index_rss = performance["internal_index_build_memory_comparison"]["within_historical_max"]
+    return {
+        "sample_peak_rss_within_corresponding_historical_max": sample_rss,
+        "internal_index_build_peak_rss_within_historical_max": index_rss,
+        "no_unaccepted_systematic_wall_regression": wall,
+        "performance_converged": sample_rss and index_rss and wall,
+    }
 
 
 def write_adjudication(path, records):
