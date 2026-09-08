@@ -9,12 +9,10 @@ use crate::evidence::{
 };
 use crate::fastq_input::InputCensus;
 use crate::sampling_design::SamplingDesign;
-use serde::Serialize;
 
 pub const REPORT_SCHEMA: &str = "viroflash.evidence-report.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisStatus {
     ConformantComplete,
     ConformantWithLimitations,
@@ -28,7 +26,7 @@ impl AnalysisStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct RunEvidence {
     pub sample_id: String,
     pub analysis_status: AnalysisStatus,
@@ -50,7 +48,7 @@ pub struct RunEvidence {
     pub read_ends_per_fragment: u8,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct TargetSignal {
     pub target_group_id: String,
     pub representative_id: String,
@@ -63,6 +61,7 @@ pub struct TargetSignal {
     pub interval_lower: f64,
     pub interval_upper: f64,
     pub interval_level: f64,
+    pub interval_method: &'static str,
     pub estimated_input_supporting_fragments: f64,
     pub covered_bases: u64,
     pub representative_length: u64,
@@ -76,8 +75,9 @@ pub struct TargetSignal {
     pub limitation_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct EvidenceReport {
+    pub schema_id: &'static str,
     pub run: RunEvidence,
     pub target_signals: Vec<TargetSignal>,
 }
@@ -126,6 +126,7 @@ pub fn build_evidence_report(
             interval_lower: interval.lower,
             interval_upper: interval.upper,
             interval_level: interval.level,
+            interval_method: INTERVAL_METHOD,
             estimated_input_supporting_fragments: fraction * inputs.census.fragments as f64,
             covered_bases,
             representative_length: evidence.group.representative_length,
@@ -149,6 +150,7 @@ pub fn build_evidence_report(
         .into_iter()
         .collect();
     Ok(EvidenceReport {
+        schema_id: REPORT_SCHEMA,
         run: RunEvidence {
             sample_id: inputs.sample_id,
             analysis_status: if inputs.unevaluable_fragments == 0 {
@@ -226,15 +228,53 @@ pub fn write_report_csv(path: &Path, report: &EvidenceReport) -> Result<(), Stri
     let mut output = String::new();
     output.push_str(&HEADER.join(","));
     output.push('\n');
-    let run = &report.run;
     let mut row = vec![String::new(); HEADER.len()];
-    set(&mut row, "schema_id", REPORT_SCHEMA);
-    set(&mut row, "record_type", "RUN");
-    set(&mut row, "sample_id", &run.sample_id);
-    set(&mut row, "analysis_status", run.analysis_status.as_str());
-    set(&mut row, "reason_codes", &run.reason_codes.join(";"));
-    set(&mut row, "input_mode", &run.input_mode);
-    for (field, value) in [
+    for (field, value) in run_fields(report) {
+        set(&mut row, field, &value);
+    }
+    push_csv_row(&mut output, &row);
+    for signal in &report.target_signals {
+        let mut row = vec![String::new(); HEADER.len()];
+        for (field, value) in target_fields(signal) {
+            set(&mut row, field, &value);
+        }
+        push_csv_row(&mut output, &row);
+    }
+    atomic_write(path, output.as_bytes())
+}
+
+pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), String> {
+    let run_rows = visible_field_rows(&run_fields(report));
+    let mut signals = String::new();
+    for signal in &report.target_signals {
+        signals.push_str(&format!(
+            "<section class=\"target-signal\" data-group=\"{}\"><h3>{}</h3><table><tbody>{}</tbody></table></section>",
+            html(&signal.target_group_id),
+            html(&signal.target_group_id),
+            visible_field_rows(&target_fields(signal))
+        ));
+    }
+    let html_document = format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Viroflash evidence report</title><style>body{{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#17202a}}table{{border-collapse:collapse;width:100%;margin-bottom:1.5rem}}th,td{{border:1px solid #ccd1d1;padding:.45rem;text-align:left;overflow-wrap:anywhere}}th{{width:22rem}}.boundary{{background:#fff4d6;padding:1rem;border-left:4px solid #d68910}}</style></head><body>
+<h1>Viroflash Evidence Report</h1><section><h2>Interpretation boundary</h2><p class="boundary">Profile-attributed fragment fraction measures input-library fragments attributed under the frozen Viroflash profile. It is not viral load, absolute quantitation, or a clinical positive/negative conclusion.</p></section>
+<section id="run-integrity"><h2>Run integrity</h2><table><tbody>{}</tbody></table></section>
+<section id="observed-target-signals"><h2>Observed target signals</h2>{}</section>
+<section><h2>Evidence detail</h2><p>The table reports every model value for host conflict, cross-group ambiguity, coverage, ten occupied windows, split events, discordance, and integration. These diagnostics do not create a decision cutoff.</p></section>
+<section><h2>Methods and limitations</h2><p>FASTQ is fully validated and counted in pass 1. Pass 2 applies deterministic BLAKE3 Bernoulli fragment inclusion, a target-only 21-mer Bloom workload gate, and HOST+TARGET competitive minimap2 alignment. Intervals use simultaneous equal-tailed exact hypergeometric inversion. References absent from the index remain unmodeled.</p></section></body></html>"#,
+        run_rows, signals
+    );
+    atomic_write(path, html_document.as_bytes())
+}
+
+fn run_fields(report: &EvidenceReport) -> Vec<(&'static str, String)> {
+    let run = &report.run;
+    vec![
+        ("schema_id", report.schema_id.into()),
+        ("record_type", "RUN".into()),
+        ("sample_id", run.sample_id.clone()),
+        ("analysis_status", run.analysis_status.as_str().into()),
+        ("reason_codes", run.reason_codes.join(";")),
+        ("input_mode", run.input_mode.clone()),
         ("input_fragments", run.input_fragments.to_string()),
         ("selected_fragments", run.selected_fragments.to_string()),
         (
@@ -257,119 +297,84 @@ pub fn write_report_csv(path: &Path, report: &EvidenceReport) -> Result<(), Stri
         ),
         ("aligned_fragments", run.aligned_fragments.to_string()),
         ("unassigned_fragments", run.unassigned_fragments.to_string()),
+        ("profile_digest", run.profile_digest.clone()),
+        ("index_digest", run.index_digest.clone()),
+        ("input_digest", run.input_digest.clone()),
         (
             "read_ends_per_fragment",
             run.read_ends_per_fragment.to_string(),
         ),
-    ] {
-        set(&mut row, field, &value);
-    }
-    set(&mut row, "profile_digest", &run.profile_digest);
-    set(&mut row, "index_digest", &run.index_digest);
-    set(&mut row, "input_digest", &run.input_digest);
-    push_csv_row(&mut output, &row);
-    for signal in &report.target_signals {
-        let mut row = vec![String::new(); HEADER.len()];
-        set(&mut row, "record_type", "TARGET_SIGNAL");
-        set(&mut row, "target_group_id", &signal.target_group_id);
-        set(&mut row, "representative_id", &signal.representative_id);
-        set(&mut row, "member_ids", &signal.member_ids.join(";"));
-        set(&mut row, "evidence_status", signal.evidence_status.as_str());
-        set(
-            &mut row,
-            "attribution_status",
-            signal.attribution_status.as_str(),
-        );
-        for (field, value) in [
-            (
-                "supporting_selected_fragments",
-                signal.supporting_selected_fragments.to_string(),
-            ),
-            (
-                "selected_fragment_denominator",
-                signal.selected_fragment_denominator.to_string(),
-            ),
-            (
-                "attributed_fragment_fraction",
-                format_float(signal.attributed_fragment_fraction),
-            ),
-            ("interval_lower", format_float(signal.interval_lower)),
-            ("interval_upper", format_float(signal.interval_upper)),
-            ("interval_level", format_float(signal.interval_level)),
-            (
-                "estimated_input_supporting_fragments",
-                format_float(signal.estimated_input_supporting_fragments),
-            ),
-            ("covered_bases", signal.covered_bases.to_string()),
-            (
-                "representative_length",
-                signal.representative_length.to_string(),
-            ),
-            ("coverage_fraction", format_float(signal.coverage_fraction)),
-            ("occupied_windows", signal.occupied_windows.to_string()),
-            (
-                "host_confounded_fragments",
-                signal.host_confounded_fragments.to_string(),
-            ),
-            (
-                "cross_group_ambiguous_fragments",
-                signal.cross_group_ambiguous_fragments.to_string(),
-            ),
-            ("split_events", signal.split_events.to_string()),
-            (
-                "discordant_fragments",
-                signal.discordant_fragments.to_string(),
-            ),
-        ] {
-            set(&mut row, field, &value);
-        }
-        set(&mut row, "interval_method", INTERVAL_METHOD);
-        set(&mut row, "integration_status", signal.integration_status);
-        set(
-            &mut row,
-            "limitation_codes",
-            &signal.limitation_codes.join(";"),
-        );
-        push_csv_row(&mut output, &row);
-    }
-    atomic_write(path, output.as_bytes())
+    ]
 }
 
-pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), String> {
-    let mut rows = String::new();
-    for signal in &report.target_signals {
-        rows.push_str(&format!("<tr data-group=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td data-fraction=\"{}\">{}</td><td data-lower=\"{}\" data-upper=\"{}\">[{}, {}]</td><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            html(&signal.target_group_id), html(&signal.target_group_id), html(&signal.representative_id), html(&signal.member_ids.join(";")), signal.supporting_selected_fragments,
-            format_float(signal.attributed_fragment_fraction), format_float(signal.attributed_fragment_fraction), format_float(signal.interval_lower), format_float(signal.interval_upper),
-            format_float(signal.interval_lower), format_float(signal.interval_upper), signal.evidence_status.as_str(), signal.attribution_status.as_str(), signal.covered_bases,
-            signal.representative_length, signal.occupied_windows, signal.host_confounded_fragments, signal.cross_group_ambiguous_fragments, signal.split_events,
-            signal.discordant_fragments, signal.integration_status));
-    }
-    let embedded_report = serde_json::to_string(report)
-        .map_err(|error| format!("Cannot serialize HTML EvidenceReport model: {error}"))?
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e");
-    let html_document = format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Viroflash evidence report</title><style>body{{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#17202a}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccd1d1;padding:.45rem;text-align:left}}code{{overflow-wrap:anywhere}}.boundary{{background:#fff4d6;padding:1rem;border-left:4px solid #d68910}}</style></head><body>
-<h1>Viroflash Evidence Report</h1><section><h2>Interpretation boundary</h2><p class="boundary">Profile-attributed fragment fraction measures input-library fragments attributed under the frozen Viroflash profile. It is not viral load, absolute quantitation, or a clinical positive/negative conclusion.</p></section>
-<section><h2>Run integrity</h2><dl><dt>Status</dt><dd>{}</dd><dt>Reason codes</dt><dd>{}</dd><dt>Sample</dt><dd>{}</dd><dt>Input</dt><dd>{} fragments; {} selected at probability {}</dd><dt>Profile digest</dt><dd><code>{}</code></dd><dt>Index digest</dt><dd><code>{}</code></dd><dt>Input digest</dt><dd><code>{}</code></dd></dl></section>
-<section><h2>Observed target signals</h2><table><thead><tr><th>Group</th><th>Representative</th><th>Members</th><th>Supporting fragments</th><th>Fraction</th><th>Simultaneous interval</th><th>Evidence</th><th>Attribution</th><th>Coverage</th><th>Windows</th><th>Host-confounded</th><th>Cross-group ambiguous</th><th>Split</th><th>Discordant</th><th>Integration</th></tr></thead><tbody>{}</tbody></table></section>
-<section><h2>Evidence detail</h2><p>The table reports every model value for host conflict, cross-group ambiguity, coverage, ten occupied windows, split events, discordance, and integration. These diagnostics do not create a decision cutoff.</p></section>
-<section><h2>Methods and limitations</h2><p>FASTQ is fully validated and counted in pass 1. Pass 2 applies deterministic BLAKE3 Bernoulli fragment inclusion, a target-only 21-mer Bloom workload gate, and HOST+TARGET competitive minimap2 alignment. Intervals use simultaneous equal-tailed exact hypergeometric inversion. References absent from the index remain unmodeled.</p></section><script id="evidence-report" type="application/json">{}</script></body></html>"#,
-        report.run.analysis_status.as_str(),
-        html(&report.run.reason_codes.join(";")),
-        html(&report.run.sample_id),
-        report.run.input_fragments,
-        report.run.selected_fragments,
-        format_float(report.run.selection_probability),
-        report.run.profile_digest,
-        report.run.index_digest,
-        report.run.input_digest,
-        rows,
-        embedded_report
-    );
-    atomic_write(path, html_document.as_bytes())
+fn target_fields(signal: &TargetSignal) -> Vec<(&'static str, String)> {
+    vec![
+        ("target_group_id", signal.target_group_id.clone()),
+        ("record_type", "TARGET_SIGNAL".into()),
+        ("representative_id", signal.representative_id.clone()),
+        ("member_ids", signal.member_ids.join(";")),
+        ("evidence_status", signal.evidence_status.as_str().into()),
+        (
+            "attribution_status",
+            signal.attribution_status.as_str().into(),
+        ),
+        (
+            "supporting_selected_fragments",
+            signal.supporting_selected_fragments.to_string(),
+        ),
+        (
+            "selected_fragment_denominator",
+            signal.selected_fragment_denominator.to_string(),
+        ),
+        (
+            "attributed_fragment_fraction",
+            format_float(signal.attributed_fragment_fraction),
+        ),
+        ("interval_lower", format_float(signal.interval_lower)),
+        ("interval_upper", format_float(signal.interval_upper)),
+        ("interval_level", format_float(signal.interval_level)),
+        ("interval_method", signal.interval_method.into()),
+        (
+            "estimated_input_supporting_fragments",
+            format_float(signal.estimated_input_supporting_fragments),
+        ),
+        ("covered_bases", signal.covered_bases.to_string()),
+        (
+            "representative_length",
+            signal.representative_length.to_string(),
+        ),
+        ("coverage_fraction", format_float(signal.coverage_fraction)),
+        ("occupied_windows", signal.occupied_windows.to_string()),
+        (
+            "host_confounded_fragments",
+            signal.host_confounded_fragments.to_string(),
+        ),
+        (
+            "cross_group_ambiguous_fragments",
+            signal.cross_group_ambiguous_fragments.to_string(),
+        ),
+        ("integration_status", signal.integration_status.into()),
+        ("split_events", signal.split_events.to_string()),
+        (
+            "discordant_fragments",
+            signal.discordant_fragments.to_string(),
+        ),
+        ("limitation_codes", signal.limitation_codes.join(";")),
+    ]
+}
+
+fn visible_field_rows(fields: &[(&str, String)]) -> String {
+    fields
+        .iter()
+        .map(|(field, value)| {
+            format!(
+                "<tr data-field=\"{}\"><th>{}</th><td>{}</td></tr>",
+                field,
+                field,
+                html(value)
+            )
+        })
+        .collect()
 }
 
 fn set(row: &mut [String], field: &str, value: &str) {

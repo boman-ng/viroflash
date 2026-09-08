@@ -81,58 +81,90 @@ fn csv_rows(text: &str) -> (Vec<&str>, Vec<Vec<&str>>) {
     (header, rows)
 }
 
-fn assert_model_cell(field: &str, value: &serde_json::Value, cell: &str) {
-    match value {
-        serde_json::Value::String(value) => assert_eq!(cell, value),
-        serde_json::Value::Number(value) if value.is_f64() => {
-            let csv_value = cell.parse::<f64>().unwrap();
-            let model_value = value.as_f64().unwrap();
-            assert!(
-                (csv_value - model_value).abs() <= f64::EPSILON,
-                "field {field}: CSV={csv_value:?}, model={model_value:?}"
-            )
-        }
-        serde_json::Value::Number(value) => assert_eq!(cell, value.to_string()),
-        serde_json::Value::Array(values) => assert_eq!(
-            cell,
-            values
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect::<Vec<_>>()
-                .join(";")
-        ),
-        _ => panic!("unsupported report model value: {value}"),
-    }
+fn visible_fields(fragment: &str) -> Vec<(String, String)> {
+    fragment
+        .split(r#"<tr data-field=""#)
+        .skip(1)
+        .map(|row| {
+            let (field, remainder) = row.split_once(r#""><th>"#).unwrap();
+            let value = remainder
+                .split_once("<td>")
+                .unwrap()
+                .1
+                .split_once("</td>")
+                .unwrap()
+                .0;
+            (field.to_string(), value.to_string())
+        })
+        .collect()
 }
 
-fn assert_csv_and_html_share_complete_model(csv: &str, html: &str) {
-    let marker = r#"<script id="evidence-report" type="application/json">"#;
-    let embedded = html
-        .split_once(marker)
+fn contract_fields(record_type: &str) -> Vec<String> {
+    std::fs::read_to_string("evaluation/phase0/output-fields.tsv")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            (columns[0] == "report.csv" && columns[1] == record_type)
+                .then(|| columns[2].to_string())
+        })
+        .collect()
+}
+
+fn assert_csv_and_visible_html_share_all_fields(csv: &str, html: &str) {
+    assert!(!html.contains("application/json"));
+    let (header, rows) = csv_rows(csv);
+    let run_section = html
+        .split_once(r#"<section id="run-integrity">"#)
         .unwrap()
         .1
-        .split_once("</script>")
+        .split_once(r#"<section id="observed-target-signals">"#)
         .unwrap()
         .0;
-    let model: serde_json::Value = serde_json::from_str(embedded).unwrap();
-    let (header, rows) = csv_rows(csv);
-    let run = &rows[0];
-    for (field, value) in model["run"].as_object().unwrap() {
+    let visible_run = visible_fields(run_section);
+    assert_eq!(
+        visible_run
+            .iter()
+            .map(|(field, _)| field.clone())
+            .collect::<Vec<_>>(),
+        contract_fields("RUN")
+    );
+    for (field, value) in visible_run {
         let column = header
             .iter()
-            .position(|candidate| *candidate == field)
+            .position(|candidate| **candidate == field)
             .unwrap();
-        assert_model_cell(field, value, run[column]);
+        assert_eq!(value, rows[0][column], "RUN field {field}");
     }
-    let signals = model["target_signals"].as_array().unwrap();
-    assert_eq!(signals.len(), rows.len() - 1);
-    for (signal, row) in signals.iter().zip(&rows[1..]) {
-        for (field, value) in signal.as_object().unwrap() {
+
+    let target_area = html
+        .split_once(r#"<section id="observed-target-signals">"#)
+        .unwrap()
+        .1
+        .split_once("<section><h2>Evidence detail</h2>")
+        .unwrap()
+        .0;
+    let visible_targets = target_area
+        .split(r#"<section class="target-signal""#)
+        .skip(1)
+        .map(|signal| visible_fields(signal.split_once("</section>").unwrap().0))
+        .collect::<Vec<_>>();
+    assert_eq!(visible_targets.len(), rows.len() - 1);
+    for (visible, row) in visible_targets.iter().zip(&rows[1..]) {
+        assert_eq!(
+            visible
+                .iter()
+                .map(|(field, _)| field.clone())
+                .collect::<Vec<_>>(),
+            contract_fields("TARGET_SIGNAL")
+        );
+        for (field, value) in visible {
             let column = header
                 .iter()
                 .position(|candidate| *candidate == field)
                 .unwrap();
-            assert_model_cell(field, value, row[column]);
+            assert_eq!(value, row[column], "TARGET_SIGNAL field {field}");
         }
     }
 }
@@ -242,7 +274,7 @@ fn cli_index_and_se_run_produce_three_source_consistent_files() {
     );
     let header = lines[0].split(',').collect::<Vec<_>>();
     let html = std::fs::read_to_string(root.join("out-one/report.html")).unwrap();
-    assert_csv_and_html_share_complete_model(&text, &html);
+    assert_csv_and_visible_html_share_all_fields(&text, &html);
     let run = lines[1].split(',').collect::<Vec<_>>();
     let run_value = |field: &str| {
         run[header
@@ -428,6 +460,8 @@ fn short_selected_fragments_are_reported_as_a_quantified_limitation() {
         String::from_utf8_lossy(&output.stderr)
     );
     let csv = std::fs::read_to_string(root.join("out/report.csv")).unwrap();
+    let html = std::fs::read_to_string(root.join("out/report.html")).unwrap();
+    assert_csv_and_visible_html_share_all_fields(&csv, &html);
     let (header, rows) = csv_rows(&csv);
     assert_eq!(rows.len(), 1);
     let run = &rows[0];
