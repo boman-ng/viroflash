@@ -58,8 +58,8 @@ Target records are grouped during indexing only when their complete uppercase IU
 
 FASTQ analysis has two streaming passes:
 
-1. validate every record and PE identifier, count fragments exactly, and compute the compressed-byte input identity from that same stream;
-2. repeat validation and digesting on the analysis stream, reject any cross-pass change, apply deterministic BLAKE3 Bernoulli inclusion, then run a target-only 21-mer Bloom workload gate and HOST+TARGET competitive alignment through a bounded worker queue.
+1. validate every record and PE identifier, count fragments exactly, compute the decoded FASTQ content identity reported as `input_digest`, and independently retain the compressed-file artifact digest;
+2. repeat validation and both digests on the analysis stream, reject decoded-content or compressed-artifact changes, apply deterministic BLAKE3 Bernoulli inclusion, then run a target-only 21-mer Bloom workload gate and HOST+TARGET competitive alignment through a bounded worker queue.
 
 For `N` input fragments and `m` fixed target groups:
 

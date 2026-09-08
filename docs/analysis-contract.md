@@ -24,7 +24,7 @@ All digests are lowercase SHA-256. A file digest covers exact file bytes. `profi
 
 Composite identities use this unambiguous framing: the ASCII domain followed by NUL, then each ordered item as `u16_be(tag_byte_length) || tag_utf8 || 32_digest_bytes`. Paths, sample labels, output directories, thread counts, jobs, and timestamps are excluded.
 
-- `input_digest`: domain `viroflash-input-v1`; ordered items are `mode`, then `r1` and, for PE, `r2`. The mode item is the SHA-256 of literal `SE` or `PE`; each read item is the exact compressed-file digest. PE order is R1 then R2.
+- `input_digest`: domain `viroflash-input-v1`; ordered items are `mode`, then `r1` and, for PE, `r2`. The mode item is the SHA-256 of literal `SE` or `PE`; each read item is the SHA-256 of the decoded FASTQ byte stream consumed by validation. PE order is R1 then R2. Plain, single-member gzip, and differently segmented multi-member gzip containing the same decoded stream therefore share report identity.
 - `reference_set_digest`: domain `viroflash-reference-set-v1`; ordered items are `host_fasta`, `target_fasta`, and `reference_group_ledger`.
 All input-file digests are frozen, but the v0.5 binary, index artifacts, and their final artifact contract do not exist. Phase 0 therefore does not define or claim a computable index digest, artifact binding, or complete analysis identity.
 
@@ -87,4 +87,4 @@ The external 82 FASTQ digests correspond exactly to `metadata/FASTQ_SHA256SUMS`;
 
 Run `python3 evaluation/phase0/verify.py`. It directly checks all 68 internal runs against `panel_truth.json`, all 59 external runs against `label_comparison.tsv`, run-to-FASTQ names, the independent 136-file checksum ledger, the exact frozen three-parameter profile, and every target FASTA record against the three committed ReferenceGroup ledgers. It also checks output fields, historical snapshots, and Cargo version `0.3.0`. Its success means checksum metadata consistency; it does not read or recompute FASTQ bytes or validate future execution artifacts.
 
-Phase 6 Input Pass 1 owns streaming recomputation of the 136 internal FASTQ digests while reading the exact compressed inputs. Any mismatch must stop that run before analysis. No separate default Phase 0 byte scan is implied.
+Phase 6 Input Pass 1 owns two distinct checks in the same read: streaming recomputation of each exact compressed-file SHA-256 against the frozen artifact manifest, and computation of the decoded FASTQ content identity used by selection and `report.csv`. Pass 2 repeats both digests; any compressed-artifact or decoded-content mismatch must stop that run. The frozen compressed SHA remains provenance and is not substituted for report identity. No separate default Phase 0 byte scan is implied.
