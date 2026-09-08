@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::analysis_profile::hex_sha256;
 
+const FASTQ_READER_BUFFER_BYTES: usize = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastqRecord {
     pub id: String,
@@ -89,8 +91,8 @@ impl FragmentReader {
 
     pub fn input_digest(&self) -> String {
         composite_input_digest(
-            self.r1.compressed_digest(),
-            self.r2.as_ref().map(FastqReader::compressed_digest),
+            self.r1.decoded_digest(),
+            self.r2.as_ref().map(FastqReader::decoded_digest),
         )
     }
 }
@@ -121,12 +123,12 @@ impl<R: Read> Read for DigestingReader<R> {
     }
 }
 
-enum DecodedInput {
-    Plain(DigestingReader<File>),
-    Gzip(Box<MultiGzDecoder<DigestingReader<File>>>),
+enum EncodedInput {
+    Plain(File),
+    Gzip(Box<MultiGzDecoder<File>>),
 }
 
-impl Read for DecodedInput {
+impl Read for EncodedInput {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(buffer),
@@ -135,17 +137,8 @@ impl Read for DecodedInput {
     }
 }
 
-impl DecodedInput {
-    fn compressed_digest(&self) -> [u8; 32] {
-        match self {
-            Self::Plain(reader) => reader.digest(),
-            Self::Gzip(reader) => reader.get_ref().digest(),
-        }
-    }
-}
-
 struct FastqReader {
-    reader: BufReader<DecodedInput>,
+    reader: BufReader<DigestingReader<EncodedInput>>,
     path: PathBuf,
     line: Vec<u8>,
 }
@@ -155,19 +148,22 @@ impl FastqReader {
         let file =
             File::open(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
         let input = if path.extension().is_some_and(|extension| extension == "gz") {
-            DecodedInput::Gzip(Box::new(MultiGzDecoder::new(DigestingReader::new(file))))
+            EncodedInput::Gzip(Box::new(MultiGzDecoder::new(file)))
         } else {
-            DecodedInput::Plain(DigestingReader::new(file))
+            EncodedInput::Plain(file)
         };
         Ok(Self {
-            reader: BufReader::with_capacity(1 << 20, input),
+            reader: BufReader::with_capacity(
+                FASTQ_READER_BUFFER_BYTES,
+                DigestingReader::new(input),
+            ),
             path: path.to_path_buf(),
             line: Vec::new(),
         })
     }
 
-    fn compressed_digest(&self) -> [u8; 32] {
-        self.reader.get_ref().compressed_digest()
+    fn decoded_digest(&self) -> [u8; 32] {
+        self.reader.get_ref().digest()
     }
 
     fn line(&mut self) -> Result<Option<Vec<u8>>, String> {

@@ -72,6 +72,15 @@ fn fastq_bytes(sequence: &[u8], count: usize) -> Vec<u8> {
     bytes
 }
 
+fn write_gzip_members(path: &Path, members: &[&[u8]]) {
+    let mut file = File::create(path).unwrap();
+    for member in members {
+        let mut writer = GzEncoder::new(Vec::new(), Compression::fast());
+        writer.write_all(member).unwrap();
+        file.write_all(&writer.finish().unwrap()).unwrap();
+    }
+}
+
 fn csv_rows(text: &str) -> (Vec<&str>, Vec<Vec<&str>>) {
     let mut lines = text.lines();
     let header = lines.next().unwrap().split(',').collect();
@@ -302,6 +311,64 @@ fn cli_index_and_se_run_produce_three_source_consistent_files() {
         })
         .collect::<Vec<_>>();
     assert_eq!(header, expected);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn phase5_report_is_invariant_across_threads_reloads_and_gzip_segmentation() {
+    let (root, target) = build_fixture("phase5-invariance");
+    let fastq = fastq_bytes(&target[..120], 40);
+    let split = fastq
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == b"\n@").then_some(index + 1))
+        .nth(19)
+        .unwrap();
+
+    let plain = root.join("plain/sample.fastq");
+    let single = root.join("single/sample.fastq.gz");
+    let multiple = root.join("multiple/sample.fastq.gz");
+    for path in [&plain, &single, &multiple] {
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+    }
+    std::fs::write(&plain, &fastq).unwrap();
+    write_gzip_members(&single, &[&fastq]);
+    write_gzip_members(&multiple, &[&fastq[..split], &fastq[split..]]);
+
+    let mut expected = None;
+    for (encoding, input) in [
+        ("plain", &plain),
+        ("single", &single),
+        ("multiple", &multiple),
+    ] {
+        for threads in [1, 2, 4, 8] {
+            for repeat in 1..=2 {
+                let output_dir = root.join(format!("out-{encoding}-{threads}-{repeat}"));
+                let output = command(&[
+                    "run",
+                    "--r1",
+                    input.to_str().unwrap(),
+                    "--index",
+                    root.join("index").to_str().unwrap(),
+                    "--out",
+                    output_dir.to_str().unwrap(),
+                    "--threads",
+                    &threads.to_string(),
+                ]);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let report = std::fs::read(output_dir.join("report.csv")).unwrap();
+                if let Some(expected) = &expected {
+                    assert_eq!(&report, expected);
+                } else {
+                    expected = Some(report);
+                }
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
