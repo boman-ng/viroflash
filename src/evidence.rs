@@ -116,7 +116,9 @@ impl TargetGroupEvidence {
         occupied.len() as u64
     }
     pub fn integration_status(&self) -> IntegrationStatus {
-        if self.split_events > 0 || self.discordant_fragments > 0 {
+        if self.supporting_selected_fragments > 0
+            && (self.split_events > 0 || self.discordant_fragments > 0)
+        {
             IntegrationStatus::DiagnosticEvidenceObserved
         } else {
             IntegrationStatus::NotObserved
@@ -146,13 +148,11 @@ impl EvidenceAccumulator {
         if evidence.aligned {
             self.aligned_fragments += 1;
         }
-        for group in &evidence.split_groups {
-            self.groups[*group].split_events += 1;
-        }
         match &evidence.adjudication {
             FragmentAdjudication::Supporting(group) => {
                 let target = &mut self.groups[*group];
                 target.supporting_selected_fragments += 1;
+                target.split_events += u64::from(evidence.split_groups.contains(group));
                 for &(start, end) in evidence.target_intervals.get(group).into_iter().flatten() {
                     target
                         .intervals
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn host_confounded_fragment_retains_host_target_split_diagnostic_once() {
+    fn host_confounded_fragment_cannot_create_integration_evidence() {
         let mut accumulator = EvidenceAccumulator::new(&[group()]);
         accumulator.accumulate_group_evidence(FragmentAlignmentEvidence {
             adjudication: FragmentAdjudication::Confounded(BTreeSet::from([0])),
@@ -406,6 +406,25 @@ mod tests {
             discordant_groups: BTreeSet::new(),
         });
         assert_eq!(accumulator.groups[0].host_confounded_fragments, 1);
+        assert_eq!(accumulator.groups[0].supporting_selected_fragments, 0);
+        assert_eq!(accumulator.groups[0].split_events, 0);
+        assert_eq!(
+            accumulator.groups[0].integration_status(),
+            IntegrationStatus::NotObserved
+        );
+    }
+
+    #[test]
+    fn supporting_host_target_split_creates_integration_evidence_once() {
+        let mut accumulator = EvidenceAccumulator::new(&[group()]);
+        accumulator.accumulate_group_evidence(FragmentAlignmentEvidence {
+            adjudication: FragmentAdjudication::Supporting(0),
+            aligned: true,
+            target_intervals: BTreeMap::from([(0, vec![(10, 40)])]),
+            split_groups: BTreeSet::from([0]),
+            discordant_groups: BTreeSet::new(),
+        });
+        assert_eq!(accumulator.groups[0].supporting_selected_fragments, 1);
         assert_eq!(accumulator.groups[0].split_events, 1);
         assert_eq!(
             accumulator.groups[0].integration_status(),
