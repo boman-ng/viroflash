@@ -6,6 +6,20 @@ from phase6_scorer import adjudicate, percentile, performance_hard_gates, wilson
 
 
 class Phase6Tests(unittest.TestCase):
+    @staticmethod
+    def target(representative, evidence_status, attribution_status="RESOLVED_TO_REFERENCE_GROUP"):
+        return {
+            "target_group_id": representative, "representative_id": representative,
+            "member_ids": representative, "evidence_status": evidence_status,
+            "attribution_status": attribution_status,
+            "supporting_selected_fragments": "2", "selected_fragment_denominator": "10",
+            "attributed_fragment_fraction": "0.2", "interval_lower": "0.1",
+            "interval_upper": "0.3", "covered_bases": "20", "coverage_fraction": "0.1",
+            "occupied_windows": "2", "host_confounded_fragments": "0",
+            "cross_group_ambiguous_fragments": "0", "integration_status": "NONE",
+            "split_events": "0", "discordant_fragments": "0",
+        }
+
     def test_wilson_zero_and_complete_counts_are_bounded(self):
         zero = wilson(0, 10)
         complete = wilson(10, 10)
@@ -50,6 +64,37 @@ class Phase6Tests(unittest.TestCase):
         self.assertEqual(decision["classification"], "NOT_EVALUABLE")
         self.assertTrue(decision["expected_observed"])
         self.assertEqual(len(decision["evidence_summary"]), 1)
+
+    def test_any_observed_matching_reference_group_is_concordant(self):
+        run = {
+            "expectation_kind": "EXPECTED_GROUP", "expected_group_key": "EBV",
+            "dataset_id": "internal-68", "evaluability_status": "EVALUABLE",
+        }
+        targets = [
+            self.target("ebv-indeterminate", "INDETERMINATE", "INDETERMINATE"),
+            self.target("ebv-observed", "REFERENCE_SIGNAL_OBSERVED"),
+        ]
+        decision = adjudicate(
+            run, {"targets": targets},
+            {"ebv-indeterminate": "EBV", "ebv-observed": "EBV"},
+        )
+        self.assertEqual(decision["classification"], "LABEL_CONCORDANT_SIGNAL")
+        self.assertTrue(decision["expected_observed"])
+        self.assertEqual(decision["expected_signals"], targets)
+        self.assertEqual(decision["observed_expected_signals"], [targets[1]])
+        self.assertFalse(decision["wrong_group_resolved"])
+
+    def test_mock_signal_is_unexpected_but_not_wrong_group(self):
+        run = {
+            "expectation_kind": "MOCK", "expected_group_key": None,
+            "dataset_id": "external-59", "evaluability_status": "EVALUABLE",
+        }
+        decision = adjudicate(
+            run, {"targets": [self.target("unexpected", "REFERENCE_SIGNAL_OBSERVED")]}, {},
+        )
+        self.assertEqual(decision["classification"], "LABEL_DISCORDANT_WITH_SEQUENCE_EVIDENCE")
+        self.assertEqual(decision["observed_signal_count"], 1)
+        self.assertFalse(decision["wrong_group_resolved"])
 
     def test_performance_false_conditions_surface_in_hard_gates(self):
         performance = {

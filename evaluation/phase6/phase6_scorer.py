@@ -55,18 +55,19 @@ def fasta_labels(path, terms):
     return labels
 
 
-def expected_signal(run, targets, internal_labels):
+def expected_signals(run, targets, internal_labels):
     expected = run.get("expected_group_key")
     if expected is None:
-        return None
+        return []
+    matches = []
     for target in targets:
         members = set(target["member_ids"].split(";")) | {target["representative_id"]}
         if run["dataset_id"] == "internal-68":
             if any(internal_labels.get(member) == expected for member in members):
-                return target
+                matches.append(target)
         elif expected in members:
-            return target
-    return None
+            matches.append(target)
+    return matches
 
 
 def observed(target):
@@ -75,9 +76,11 @@ def observed(target):
 
 def adjudicate(run, parsed, internal_labels):
     targets = parsed["targets"]
-    expected = expected_signal(run, targets, internal_labels)
+    expected_targets = expected_signals(run, targets, internal_labels)
+    expected_group_ids = {target["target_group_id"] for target in expected_targets}
     observed_targets = [target for target in targets if observed(target)]
-    expected_observed = expected is not None and observed(expected)
+    observed_expected = [target for target in expected_targets if observed(target)]
+    expected_observed = bool(observed_expected)
     if run["expectation_kind"] == "MOCK":
         classification = "LABEL_CONCORDANT_NO_SIGNAL" if not observed_targets else "LABEL_DISCORDANT_WITH_SEQUENCE_EVIDENCE"
     elif expected_observed:
@@ -88,8 +91,9 @@ def adjudicate(run, parsed, internal_labels):
         classification = "LABEL_DISCORDANT_UNRESOLVED"
     if run["evaluability_status"] != "EVALUABLE":
         classification = "NOT_EVALUABLE"
-    wrong_resolved = any(
-        target is not expected and target["attribution_status"] == "RESOLVED_TO_REFERENCE_GROUP"
+    wrong_resolved = run["expectation_kind"] == "EXPECTED_GROUP" and any(
+        target["target_group_id"] not in expected_group_ids
+        and target["attribution_status"] == "RESOLVED_TO_REFERENCE_GROUP"
         for target in observed_targets
     )
     ambiguous = any(target["attribution_status"] in {"AMBIGUOUS_WITHIN_GROUP", "UNRESOLVED_ACROSS_GROUPS"} for target in targets)
@@ -111,7 +115,8 @@ def adjudicate(run, parsed, internal_labels):
     return {
         "classification": classification,
         "expected_observed": expected_observed,
-        "expected_signal": expected,
+        "expected_signals": expected_targets,
+        "observed_expected_signals": observed_expected,
         "observed_signal_count": len(observed_targets),
         "wrong_group_resolved": wrong_resolved,
         "ambiguous_attribution": ambiguous,
@@ -279,16 +284,24 @@ def scientific_metrics(records, manifest):
     result = {
         "expected_group_observed": wilson(sum(record["decision"]["expected_observed"] for record in expected), len(expected)),
         "mock_unexpected_signal": wilson(sum(record["decision"]["observed_signal_count"] > 0 for record in mocks), len(mocks)),
-        "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in records), len(records)),
+        "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in expected), len(expected)),
         "ambiguous_attribution": wilson(sum(record["decision"]["ambiguous_attribution"] for record in records), len(records)),
         "not_evaluable": wilson(sum(run["evaluability_status"] != "EVALUABLE" for run in manifest["runs"]), len(manifest["runs"])),
         "classification_counts": dict(sorted(Counter(record["decision"]["classification"] for record in records).items())),
     }
     interval_fields = ("interval_lower", "interval_upper")
-    expected_signals = [record["decision"]["expected_signal"] for record in expected if record["decision"]["expected_observed"]]
+    observed_expected_signals = [
+        signal
+        for record in expected
+        for signal in record["decision"]["observed_expected_signals"]
+    ]
     result["expected_group_interval_summaries"] = {
-        field: summary([float(signal[field]) for signal in expected_signals]) if expected_signals else None
-        for field in interval_fields
+        "unit": "observed matching ReferenceGroup row",
+        "count": len(observed_expected_signals),
+        **{
+            field: summary([float(signal[field]) for signal in observed_expected_signals]) if observed_expected_signals else None
+            for field in interval_fields
+        },
     }
     internal = [record for record in records if record["manifest"]["dataset_id"] == "internal-68"]
     internal_without_ambiguity = [record for record in internal if record["manifest"]["evaluability_status"] == "EVALUABLE"]
@@ -309,7 +322,7 @@ def scientific_metrics(records, manifest):
         result["external_by_cohort"][cohort] = {
             "expected_group_observed": wilson(sum(record["decision"]["expected_observed"] for record in cohort_expected), len(cohort_expected)),
             "mock_unexpected_signal": wilson(sum(record["decision"]["observed_signal_count"] > 0 for record in cohort_mocks), len(cohort_mocks)),
-            "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in cohort_records), len(cohort_records)),
+            "wrong_group_resolved_signal": wilson(sum(record["decision"]["wrong_group_resolved"] for record in cohort_expected), len(cohort_expected)),
             "ambiguous_attribution": wilson(sum(record["decision"]["ambiguous_attribution"] for record in cohort_records), len(cohort_records)),
             "not_evaluable": wilson(sum(record["manifest"]["evaluability_status"] != "EVALUABLE" for record in cohort_records), len(cohort_records)),
         }
