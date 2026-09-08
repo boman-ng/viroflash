@@ -9,12 +9,13 @@ from unittest.mock import patch
 
 from phase6_common import (
     RETROSPECTIVE_PROVENANCE_LIMIT, SCORER_CORRECTIONS, ReportHtmlParser,
-    sample_id_from_path, validate_report_invariants, verify_manifest_identity,
-    verify_scoring_provenance,
+    exact_hypergeometric_interval, load_contract, load_digest_ledger,
+    load_index_report_contract, sample_id_from_path, validate_report_invariants,
+    verify_manifest_identity, verify_scoring_provenance,
 )
 from phase6_scorer import (
     adjudicate, fasta_labels, percentile, performance_hard_gates,
-    verified_internal_labels, wilson,
+    verified_internal_labels, verify_internal_label_audit, wilson,
 )
 
 
@@ -98,13 +99,17 @@ class Phase6Tests(unittest.TestCase):
             "HPV16": ["Human papillomavirus type 16"],
             "HPV18": ["Human papillomavirus type 18", "Human papillomavirus 18"],
         }
-        fasta = """>hbv |Hepatitis B virus isolate human\nA\n>heron |UNVERIFIED: Heron hepatitis B virus isolate 32\nA\n>ebv |Human gammaherpesvirus 4, complete genome\nA\n>hpv16 |Human papillomavirus type 16 isolate x\nA\n>hpv161 |Human papillomavirus type 161 isolate x\nA\n>hpv18 |Human papillomavirus 18 isolate x\nA\n"""
+        fasta = """>hbv |Hepatitis B virus isolate human\nA\n>hbv_unverified |UNVERIFIED: Hepatitis B virus isolate human\nA\n>hbv_mag |MAG UNVERIFIED: Hepatitis B virus isolate human\nA\n>hbv_mutant |Mutant Hepatitis B virus isolate human\nA\n>heron |UNVERIFIED: Heron hepatitis B virus isolate 32\nA\n>ebv |Human gammaherpesvirus 4, complete genome\nA\n>hpv16 |UNVERIFIED: Human papillomavirus type 16 isolate x\nA\n>hpv161 |Human papillomavirus type 161 isolate x\nA\n>hpv18 |Human papillomavirus 18 isolate x\nA\n"""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "target.fa"
             path.write_text(fasta)
             self.assertEqual(
                 fasta_labels(path, terms),
-                {"hbv": "HBV", "ebv": "EBV", "hpv16": "HPV16", "hpv18": "HPV18"},
+                {
+                    "hbv": "HBV", "hbv_unverified": "HBV", "hbv_mag": "HBV",
+                    "hbv_mutant": "HBV", "ebv": "EBV", "hpv16": "HPV16",
+                    "hpv18": "HPV18",
+                },
             )
 
     def test_internal_labels_require_frozen_fasta_bytes_and_digest(self):
@@ -131,27 +136,38 @@ class Phase6Tests(unittest.TestCase):
         }
         target = {
             "target_group_id": "group", "representative_id": "representative",
-            "member_ids": "representative;member", "representative_length": "100",
+            "member_ids": "representative", "representative_length": "100",
             "supporting_selected_fragments": "2", "selected_fragment_denominator": "1000",
-            "attributed_fragment_fraction": "0.002", "interval_lower": "0.001",
-            "interval_upper": "0.003", "interval_level": "0.95",
+            "attributed_fragment_fraction": "0.002", "interval_lower": "0.002",
+            "interval_upper": "0.002", "interval_level": "0.95",
             "interval_method": "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION",
             "estimated_input_supporting_fragments": "2", "covered_bases": "20",
             "coverage_fraction": "0.2", "evidence_status": "REFERENCE_SIGNAL_OBSERVED",
             "attribution_status": "RESOLVED_TO_REFERENCE_GROUP",
             "occupied_windows": "1", "host_confounded_fragments": "0",
             "cross_group_ambiguous_fragments": "0", "split_events": "0",
-            "discordant_fragments": "0",
+            "discordant_fragments": "0", "integration_status": "NOT_OBSERVED",
+            "limitation_codes": "",
         }
         index = {
             "target_family_size": 1,
-            "groups": {"group": {"ordinal": 0, "representative_id": "representative", "member_ids": ["representative", "member"], "representative_length": 100}},
+            "groups": {"group": {"ordinal": 0, "representative_id": "representative", "member_ids": ["representative"], "representative_length": 100}},
         }
         validate_report_invariants(run, [target], index)
+        wrong_interval = copy.deepcopy(target)
+        wrong_interval["interval_lower"] = "0.001"
+        mismatches = []
+        validate_report_invariants(run, [wrong_interval], index, mismatches)
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0]["expected_lower_population_count"], 2)
         cases = (
             ("target membership", target, "target_group_id", "other", "absent from index ledger"),
             ("fraction arithmetic", target, "attributed_fragment_fraction", "0.2", "fraction arithmetic mismatch"),
             ("coverage arithmetic", target, "coverage_fraction", "0.3", "coverage fraction arithmetic mismatch"),
+            ("wrong ordered interval", target, "interval_lower", "0.001", "lower endpoint differs"),
+            ("fabricated evidence enum", target, "evidence_status", "OBSERVEDISH", "unexpected target evidence status"),
+            ("fabricated integration enum", target, "integration_status", "MAYBE", "unexpected target integration status"),
+            ("fabricated attribution enum", target, "attribution_status", "CERTAIN", "unexpected target attribution status"),
             ("status coherence", run, "analysis_status", "CONFORMANT_WITH_LIMITATIONS", "status and run limitations"),
         )
         for name, source, field, value, message in cases:
@@ -162,6 +178,26 @@ class Phase6Tests(unittest.TestCase):
                 destination[field] = value
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_invariants(changed_run, [changed_target], index)
+
+    def test_exact_hypergeometric_oracle_matches_small_integer_enumeration(self):
+        exact_hypergeometric_interval.cache_clear()
+        self.assertEqual(exact_hypergeometric_interval(50, 10, 3, 0.95), (0.08, 0.64))
+        self.assertEqual(exact_hypergeometric_interval(50, 10, 3, 0.95), (0.08, 0.64))
+        self.assertEqual(exact_hypergeometric_interval.cache_info().hits, 1)
+
+    def test_frozen_internal_reference_label_audit(self):
+        manifest, config = load_contract()
+        ledger = load_digest_ledger("../../.tmp/phase6-real-e2e")
+        index = ledger["indexes"]["internal-dna-panel"]
+        contract = load_index_report_contract(index["path"], index)
+        labels = verified_internal_labels(manifest, config)
+        self.assertEqual(
+            verify_internal_label_audit(labels, contract),
+            {
+                "member_counts": {"EBV": 441, "HBV": 8636, "HPV16": 633, "HPV18": 140},
+                "group_counts": {"EBV": 431, "HBV": 8314, "HPV16": 561, "HPV18": 108},
+            },
+        )
 
     def test_non_evaluable_manifest_status_overrides_label_classification(self):
         run = {

@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import os
+import re
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -85,6 +87,13 @@ RETROSPECTIVE_PROVENANCE_LIMIT = (
     "The completed current campaign did not bind scorer/config/manifest inputs before execution. "
     "This ledger was created retrospectively before reviewer-requested rescoring and cannot establish pre-run scoring immutability."
 )
+EVIDENCE_STATUSES = {"REFERENCE_SIGNAL_OBSERVED", "INDETERMINATE_EVIDENCE"}
+ATTRIBUTION_STATUSES = {
+    "RESOLVED_TO_REFERENCE_GROUP", "AMBIGUOUS_WITHIN_GROUP",
+    "UNRESOLVED_ACROSS_GROUPS", "CONFOUNDED_WITH_HOST",
+}
+INTEGRATION_STATUSES = {"NOT_OBSERVED", "DIAGNOSTIC_EVIDENCE_OBSERVED"}
+RUN_LIMITATION = re.compile(r"TARGET_KMER_NOT_EVALUABLE_SELECTED_FRAGMENTS=([1-9][0-9]*)\Z")
 
 
 def require(condition, message):
@@ -271,7 +280,94 @@ def close_float(actual, expected, absolute=1e-15, relative=1e-12):
     return math.isclose(actual, expected, abs_tol=absolute, rel_tol=relative)
 
 
-def validate_report_invariants(csv_run, csv_targets, index_contract):
+def hypergeometric_tail_reaches(population, total_successes, sample, observed, upper_tail, threshold):
+    support_low = max(0, sample - (population - total_successes))
+    support_high = min(sample, total_successes)
+    if upper_tail:
+        if observed <= support_low:
+            return True
+        if observed > support_high:
+            return False
+    else:
+        if observed < support_low:
+            return False
+        if observed >= support_high:
+            return True
+    mode = ((sample + 1) * (total_successes + 1)) // (population + 2)
+    if upper_tail and observed <= mode:
+        return True
+    if not upper_tail and observed >= mode:
+        return True
+    mode = min(max(mode, support_low), support_high)
+    total_terms = [1.0]
+    tail_terms = []
+    weight = 1.0
+    current = mode
+    while current > support_low:
+        numerator = current * (population - total_successes - sample + current)
+        denominator = (total_successes - current + 1) * (sample - current + 1)
+        require(numerator > 0 and denominator > 0, "invalid lower hypergeometric recurrence")
+        weight *= numerator / denominator
+        current -= 1
+        if weight <= 1e-18:
+            break
+        total_terms.append(weight)
+        if not upper_tail and current <= observed:
+            tail_terms.append(weight)
+    weight = 1.0
+    current = mode
+    while current < support_high:
+        numerator = (total_successes - current) * (sample - current)
+        current += 1
+        denominator = current * (population - total_successes - sample + current)
+        require(numerator > 0 and denominator > 0, "invalid upper hypergeometric recurrence")
+        weight *= numerator / denominator
+        if weight <= 1e-18:
+            break
+        total_terms.append(weight)
+        if upper_tail and current >= observed:
+            tail_terms.append(weight)
+    total_weight = math.fsum(total_terms)
+    tail_weight = math.fsum(tail_terms)
+    return tail_weight >= threshold * total_weight
+
+
+@lru_cache(maxsize=None)
+def exact_hypergeometric_interval(population, sample, successes, level):
+    require(0 < population and 0 < sample <= population and 0 <= successes <= sample, "invalid exact interval inputs")
+    require(0 < level < 1, "invalid exact interval level")
+    if sample == population:
+        exact = successes / population
+        return exact, exact
+    tail = (1.0 - level) / 2.0
+    feasible_low = successes
+    feasible_high = population - (sample - successes)
+    if successes == 0:
+        lower = 0
+    else:
+        low, high = feasible_low, feasible_high
+        while low < high:
+            middle = low + (high - low) // 2
+            if hypergeometric_tail_reaches(population, middle, sample, successes, True, tail):
+                high = middle
+            else:
+                low = middle + 1
+        lower = max(feasible_low, low - 1)
+    if successes == sample:
+        upper = population
+    else:
+        low, high = feasible_low, feasible_high
+        while low < high:
+            middle = low + (high - low + 1) // 2
+            if hypergeometric_tail_reaches(population, middle, sample, successes, False, tail):
+                low = middle
+            else:
+                high = middle - 1
+        upper = min(feasible_high, low + 1)
+    return lower / population, upper / population
+
+
+def validate_report_invariants(csv_run, csv_targets, index_contract, interval_mismatches=None):
     input_fragments = int(csv_run["input_fragments"])
     selected_fragments = int(csv_run["selected_fragments"])
     prescreen_fragments = int(csv_run["prescreen_passed_fragments"])
@@ -309,11 +405,38 @@ def validate_report_invariants(csv_run, csv_targets, index_contract):
         upper = float(target["interval_upper"])
         covered_bases = int(target["covered_bases"])
         representative_length = int(target["representative_length"])
+        require(target["evidence_status"] in EVIDENCE_STATUSES, "unexpected target evidence status")
+        require(target["attribution_status"] in ATTRIBUTION_STATUSES, "unexpected target attribution status")
+        require(target["integration_status"] in INTEGRATION_STATUSES, "unexpected target integration status")
         require(denominator == selected_fragments and supporting <= denominator, "target support fraction denominator/count is incoherent")
         require(close_float(attributed_fraction, supporting / denominator), "target attributed fraction arithmetic mismatch")
         require(target["interval_method"] == "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION", "unexpected target interval method")
         require(close_float(float(target["interval_level"]), expected_target_level), "target interval level does not implement familywise allocation")
         require(0 <= lower <= attributed_fraction <= upper <= 1, "target interval bounds are unordered or out of range")
+        expected_lower, expected_upper = exact_hypergeometric_interval(
+            input_fragments, denominator, supporting, expected_target_level,
+        )
+        lower_matches = close_float(lower, expected_lower)
+        upper_matches = close_float(upper, expected_upper)
+        if interval_mismatches is not None and not (lower_matches and upper_matches):
+            interval_mismatches.append({
+                "target_group_id": target["target_group_id"],
+                "input_fragments": input_fragments,
+                "selected_fragments": denominator,
+                "supporting_selected_fragments": supporting,
+                "interval_level": expected_target_level,
+                "reported_lower": lower,
+                "reported_upper": upper,
+                "expected_lower": expected_lower,
+                "expected_upper": expected_upper,
+                "reported_lower_population_count": round(lower * input_fragments),
+                "reported_upper_population_count": round(upper * input_fragments),
+                "expected_lower_population_count": round(expected_lower * input_fragments),
+                "expected_upper_population_count": round(expected_upper * input_fragments),
+            })
+        else:
+            require(lower_matches, "target interval lower endpoint differs from exact inversion")
+            require(upper_matches, "target interval upper endpoint differs from exact inversion")
         require(covered_bases <= representative_length, "covered bases exceed representative length")
         require(close_float(float(target["coverage_fraction"]), covered_bases / representative_length), "target coverage fraction arithmetic mismatch")
         require(close_float(float(target["estimated_input_supporting_fragments"]), attributed_fraction * input_fragments, absolute=1e-9, relative=1e-11), "estimated input support arithmetic mismatch")
@@ -325,15 +448,31 @@ def validate_report_invariants(csv_run, csv_targets, index_contract):
         observed = target["evidence_status"] == "REFERENCE_SIGNAL_OBSERVED"
         require(observed == (supporting > 0), "target evidence status contradicts supporting count")
         if observed:
-            require(target["attribution_status"] in {"RESOLVED_TO_REFERENCE_GROUP", "AMBIGUOUS_WITHIN_GROUP"}, "observed target has incoherent attribution status")
+            expected_attribution = "RESOLVED_TO_REFERENCE_GROUP" if len(group["member_ids"]) == 1 else "AMBIGUOUS_WITHIN_GROUP"
+            require(target["attribution_status"] == expected_attribution, "observed target has incoherent attribution status")
         else:
-            require(target["attribution_status"] in {"CONFOUNDED_WITH_HOST", "UNRESOLVED_ACROSS_GROUPS"}, "indeterminate target has incoherent attribution status")
+            require(int(target["host_confounded_fragments"]) > 0 or int(target["cross_group_ambiguous_fragments"]) > 0, "indeterminate target has no indeterminate evidence")
+            expected_attribution = "UNRESOLVED_ACROSS_GROUPS" if int(target["cross_group_ambiguous_fragments"]) > 0 else "CONFOUNDED_WITH_HOST"
+            require(target["attribution_status"] == expected_attribution, "indeterminate target has incoherent attribution status")
+        integration_observed = supporting > 0 and (
+            int(target["split_events"]) > 0 or int(target["discordant_fragments"]) > 0
+        )
+        expected_integration = "DIAGNOSTIC_EVIDENCE_OBSERVED" if integration_observed else "NOT_OBSERVED"
+        require(target["integration_status"] == expected_integration, "target integration status contradicts diagnostic counts")
+        require(not target["limitation_codes"], "target limitation codes are not defined by the report contract")
     has_run_limitations = bool(csv_run["reason_codes"])
     require((csv_run["analysis_status"] == "CONFORMANT_WITH_LIMITATIONS") == has_run_limitations, "analysis status and run limitations are incoherent")
     require((csv_run["analysis_status"] == "CONFORMANT_COMPLETE") == (not has_run_limitations), "complete analysis status has limitations")
+    if has_run_limitations:
+        match = RUN_LIMITATION.fullmatch(csv_run["reason_codes"])
+        require(match is not None, "unknown or malformed run limitation code")
+        require(int(match.group(1)) <= selected_fragments, "run limitation count exceeds selected fragments")
 
 
-def validate_success_directory(directory, run, expected_profile_digest, expected_index_digest, index_contract):
+def validate_success_directory(
+    directory, run, expected_profile_digest, expected_index_digest, index_contract,
+    interval_mismatches=None,
+):
     directory = Path(directory)
     require(directory.is_dir(), f"missing report directory: {directory}")
     require({entry.name for entry in directory.iterdir()} == REPORT_FILES, f"successful directory does not contain exactly three reports: {directory}")
@@ -359,7 +498,7 @@ def validate_success_directory(directory, run, expected_profile_digest, expected
     require(perf["configured_threads"] == run["planned_threads"], "reported thread count differs from frozen manifest")
     for field in ("input_fragments", "selected_fragments", "prescreen_passed_fragments", "aligned_fragments"):
         require(perf[field] == int(csv_run[field]), f"perf/CSV count mismatch: {field}")
-    validate_report_invariants(csv_run, csv_targets, index_contract)
+    validate_report_invariants(csv_run, csv_targets, index_contract, interval_mismatches)
     return {"run": csv_run, "targets": csv_targets, "perf": perf}
 
 

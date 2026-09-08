@@ -18,6 +18,26 @@ from phase6_common import (
 )
 
 
+DESCRIPTION_METADATA_PREFIXES = (
+    "MAG UNVERIFIED:",
+    "UNVERIFIED:",
+    "MAG:",
+    "Mutant",
+)
+FROZEN_INTERNAL_LABEL_MEMBER_COUNTS = {
+    "EBV": 441,
+    "HBV": 8636,
+    "HPV16": 633,
+    "HPV18": 140,
+}
+FROZEN_INTERNAL_LABEL_GROUP_COUNTS = {
+    "EBV": 431,
+    "HBV": 8314,
+    "HPV16": 561,
+    "HPV18": 108,
+}
+
+
 def wilson(successes, total, confidence=0.95):
     if total == 0:
         return {"successes": 0, "total": 0, "rate": None, "lower": None, "upper": None, "confidence": confidence}
@@ -50,7 +70,12 @@ def fasta_labels(path, terms):
                 continue
             member, separator, description = line[1:].partition(" ")
             require(separator, f"reference header lacks a description: {member}")
-            description = description.lstrip(" |\t").casefold()
+            description = description.lstrip(" |\t")
+            for prefix in DESCRIPTION_METADATA_PREFIXES:
+                if description.casefold().startswith(prefix.casefold() + " "):
+                    description = description[len(prefix):].lstrip()
+                    break
+            description = description.casefold()
             matched = [
                 label
                 for label, patterns in terms.items()
@@ -82,6 +107,25 @@ def verified_internal_labels(manifest, config):
     require(path.is_file() and path.stat().st_size == expected_bytes, "internal target FASTA bytes differ from frozen manifest")
     require(sha256_file(path) == expected_digest, "internal target FASTA digest differs from frozen manifest")
     return fasta_labels(path, config["internal_label_header_terms"])
+
+
+def verify_internal_label_audit(labels, index_contract):
+    member_counts = Counter(labels.values())
+    require(dict(member_counts) == FROZEN_INTERNAL_LABEL_MEMBER_COUNTS, "frozen internal label member counts changed")
+    group_counts = Counter()
+    for group in index_contract["groups"].values():
+        matched = {labels[member] for member in group["member_ids"] if member in labels}
+        require(len(matched) <= 1, "one ReferenceGroup maps to multiple internal labels")
+        if matched:
+            group_counts[next(iter(matched))] += 1
+    require(dict(group_counts) == FROZEN_INTERNAL_LABEL_GROUP_COUNTS, "frozen internal label ReferenceGroup counts changed")
+    require(labels.get("OP514931.1") == "HBV", "metadata-prefixed HBV fixture is unmapped")
+    require(labels.get("MT426088.1") == "HBV", "mutant HBV fixture is unmapped")
+    require(labels.get("ON245425.1") == "HBV", "MAG HBV fixture is unmapped")
+    require(labels.get("OP751552.1") == "HPV16", "metadata-prefixed HPV16 fixture is unmapped")
+    require("KT345708.1" not in labels, "Heron hepatitis B virus mapped as human HBV")
+    require("NC_038522.1" not in labels, "HPV161 mapped as HPV16")
+    return {"member_counts": dict(member_counts), "group_counts": dict(group_counts)}
 
 
 def expected_signals(run, targets, internal_labels):
@@ -253,16 +297,28 @@ def score(campaign_dir):
     require(set(starts) == expected_keys and set(terminals) == expected_keys, "campaign ledger does not contain exactly 127 started and terminal runs")
     reproducibility = reproducibility_summary(campaign_dir / "reproducibility/repro-ledger.jsonl", config)
     internal_labels = verified_internal_labels(manifest, config)
+    internal_label_audit = verify_internal_label_audit(
+        internal_labels, index_contracts["internal-dna-panel"],
+    )
     require(all(any(label == expected for label in internal_labels.values()) for expected in config["internal_label_header_terms"]), "an internal expected label maps to no frozen reference")
     records = []
     failures = []
+    report_validation_failures = []
     for run in manifest["runs"]:
         key = (run["dataset_id"], run["run_id"])
         terminal = terminals[key]
         directory = output_dir(campaign_dir, run)
         if terminal["status"] == "SUCCESS":
             index = digest_ledger["indexes"][index_id_for(run, config)]
-            parsed = validate_success_directory(directory, run, digest_ledger["profile"]["sha256"], index["index_digest"], index_contracts[index_id_for(run, config)])
+            interval_mismatches = []
+            parsed = validate_success_directory(
+                directory, run, digest_ledger["profile"]["sha256"], index["index_digest"],
+                index_contracts[index_id_for(run, config)], interval_mismatches,
+            )
+            report_validation_failures.extend(
+                {"dataset_id": run["dataset_id"], "cohort": run["cohort"], "run_id": run["run_id"], **mismatch}
+                for mismatch in interval_mismatches
+            )
             decision = adjudicate(run, parsed, internal_labels)
             records.append({"manifest": run, "parsed": parsed, "decision": decision, "terminal": terminal})
         else:
@@ -274,10 +330,22 @@ def score(campaign_dir):
     performance, paired = performance_metrics(records, config, digest_ledger, starts, terminals, internal_labels)
     adjudication_rows = [record for record in records if record["decision"]["classification"].startswith("LABEL_DISCORDANT") or record["decision"]["classification"] == "NOT_EVALUABLE"]
     performance_gates = performance_hard_gates(performance)
+    rejected_report_keys = {
+        (failure["dataset_id"], failure["run_id"])
+        for failure in report_validation_failures
+    }
     evidence_dir.mkdir()
     write_adjudication(evidence_dir / "adjudication.tsv", adjudication_rows)
     write_run_table(evidence_dir / "run-results.tsv", records, failures)
     write_paired(evidence_dir / "old-system-paired.tsv", paired)
+    atomic_json(evidence_dir / "report-validation.json", {
+        "schema_id": "viroflash.phase6.report-validation.v1",
+        "oracle": "stdlib mode-normalized integer-ratio exact hypergeometric inversion",
+        "validated_target_rows": sum(len(record["parsed"]["targets"]) for record in records),
+        "rejected_reports": len(rejected_report_keys),
+        "interval_mismatch_rows": len(report_validation_failures),
+        "failures": report_validation_failures,
+    })
     summary_value = {
         "contract_id": config["contract_id"],
         "scored_at": datetime.now(timezone.utc).isoformat(),
@@ -288,11 +356,20 @@ def score(campaign_dir):
             "prior_evaluation_only_corrections": list(SCORER_CORRECTIONS),
             "limitation": scoring_provenance["provenance_limitation"],
         },
+        "internal_label_audit": internal_label_audit,
+        "report_validation": {
+            "validated_target_rows": sum(len(record["parsed"]["targets"]) for record in records),
+            "accepted_reports": len(records) - len(rejected_report_keys),
+            "rejected_reports": len(rejected_report_keys),
+            "interval_mismatch_rows": len(report_validation_failures),
+            "failure_evidence": str(evidence_dir / "report-validation.json"),
+        },
         "terminal": {"total": 127, "success": len(records), "failure": len(failures)},
         "hard_gates": {
             "exactly_127_started_once": len(starts) == 127,
             "exactly_127_terminal": len(terminals) == 127,
-            "all_success_directories_exact": not failures,
+            "all_success_directories_exact": not failures and not report_validation_failures,
+            "all_reported_intervals_match_exact_hypergeometric_inversion": not report_validation_failures,
             "binary_profile_index_manifest_scoring_input_digests_reverified": True,
             "pass1_pass2_counts_ids_input_digest": "ENFORCED_BY_VERIFIED_BINARY_BEFORE_SUCCESS_REPORT",
             "reproducibility_report_csv_byte_identical": reproducibility["runs"] == reproducibility["report_csv_byte_identical"],
