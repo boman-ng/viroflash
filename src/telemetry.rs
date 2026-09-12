@@ -1,5 +1,4 @@
-use std::fs::OpenOptions;
-use std::io::Write;
+use crate::output::atomic_write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -155,24 +154,7 @@ pub fn write_perf_json(path: &Path, report: &PerformanceReport) -> Result<(), St
     let mut bytes = serde_json::to_vec_pretty(report)
         .map_err(|error| format!("Cannot serialize perf.json: {error}"))?;
     bytes.push(b'\n');
-    let temporary = path.with_extension(format!("json.part.{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| format!("Cannot create {}: {error}", temporary.display()))?;
-    let result = file
-        .write_all(&bytes)
-        .and_then(|_| file.flush())
-        .map_err(|error| format!("Cannot write {}: {error}", temporary.display()))
-        .and_then(|_| {
-            std::fs::rename(&temporary, path)
-                .map_err(|error| format!("Cannot finalize {}: {error}", path.display()))
-        });
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    atomic_write(path, &bytes)
 }
 
 pub fn stage_start() -> Instant {

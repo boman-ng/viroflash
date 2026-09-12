@@ -4,6 +4,7 @@ mod fastq;
 mod gate;
 mod index;
 mod integration_evidence;
+mod output;
 mod pipeline;
 mod profile;
 mod report;
