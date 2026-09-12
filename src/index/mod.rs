@@ -217,8 +217,11 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     }
     verify_digest(&directory.join(MMI), &manifest.mmi_digest)?;
     verify_digest(&directory.join(LEDGER), &manifest.ledger_digest)?;
-    verify_digest(&directory.join(BLOOM), &manifest.bloom_digest)?;
-    let bloom = TargetKmerBloom::read(&directory.join(BLOOM), profile.kmer_length)?;
+    let bloom = TargetKmerBloom::read(
+        &directory.join(BLOOM),
+        profile.kmer_length,
+        &manifest.bloom_digest,
+    )?;
     let actual_bloom_summary = bloom.summary();
     if !bloom_summary_matches_serialized(&manifest.bloom, &actual_bloom_summary)? {
         return Err(format!(

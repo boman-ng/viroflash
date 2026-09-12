@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::alignment::align_fragments_bounded;
+use crate::alignment::{align_fragments_bounded, CompetitiveAligner};
 use crate::evidence::EvidenceAccumulator;
 use crate::fastq::{census_fastq, FragmentReader};
 use crate::gate::{GateEvaluation, GateScratch};
@@ -49,6 +49,8 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
         std::fs::create_dir(&staging)
             .map_err(|error| format!("Cannot create {}: {error}", staging.display()))?;
         let profile = AnalysisProfile::FROZEN;
+        let (minimum_hits, minimum_covered_bases) =
+            CompetitiveAligner::short_read_chain_requirements(profile.kmer_length)?;
         let index = load_index(&options.index_dir)?;
 
         let started = stage_start();
@@ -84,6 +86,8 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
                 match index.bloom.evaluate_fragment(
                     &fragment.r1,
                     fragment.r2.as_deref(),
+                    minimum_hits,
+                    minimum_covered_bases,
                     &mut gate_scratch,
                 ) {
                     GateEvaluation::Pass => {
@@ -254,13 +258,19 @@ mod tests {
         let mut reader = FragmentReader::open(fastq, None).unwrap();
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
         let mut gate_scratch = GateScratch::default();
+        let (minimum_hits, minimum_covered_bases) =
+            CompetitiveAligner::short_read_chain_requirements(AnalysisProfile::FROZEN.kmer_length)
+                .unwrap();
         let mut submitted = 0;
         while let Some(fragment) = reader.next_fragment().unwrap() {
             if !exhaustive
-                && index
-                    .bloom
-                    .evaluate_fragment(&fragment.r1, None, &mut gate_scratch)
-                    != GateEvaluation::Pass
+                && index.bloom.evaluate_fragment(
+                    &fragment.r1,
+                    None,
+                    minimum_hits,
+                    minimum_covered_bases,
+                    &mut gate_scratch,
+                ) != GateEvaluation::Pass
             {
                 continue;
             }

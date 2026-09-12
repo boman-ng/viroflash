@@ -54,6 +54,24 @@ pub struct CompetitiveAligner {
 }
 
 impl CompetitiveAligner {
+    pub(crate) fn short_read_chain_requirements(
+        expected_kmer_length: usize,
+    ) -> Result<(usize, usize), String> {
+        let aligner = Aligner::builder().sr();
+        let kmer_length = usize::try_from(aligner.idxopt.k)
+            .map_err(|_| "minimap2 short-read k-mer length is invalid".to_string())?;
+        if kmer_length != expected_kmer_length {
+            return Err(format!(
+                "minimap2 short-read k-mer length {kmer_length} does not match target Bloom k-mer length {expected_kmer_length}"
+            ));
+        }
+        let minimum_hits = usize::try_from(aligner.mapopt.min_cnt)
+            .map_err(|_| "minimap2 short-read minimum chain count is invalid".to_string())?;
+        let minimum_covered_bases = usize::try_from(aligner.mapopt.min_chain_score)
+            .map_err(|_| "minimap2 short-read minimum chain score is invalid".to_string())?;
+        Ok((minimum_hits, minimum_covered_bases))
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         let mut aligner = Aligner::builder()
             .sr()
