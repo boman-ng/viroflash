@@ -1,1 +1,12 @@
-!.local/
+# Keep generated artifacts out of searches, including with --no-ignore-vcs.
+# Match .gitignore; use rg --hidden --no-ignore on a specific artifact directory.
+/target/
+/dist/
+*.sif
+/.local/
+/.tmp/
+/evaluation/
+*.work/
+.impeccable/
+__pycache__/
+*.py[cod]

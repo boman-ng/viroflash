@@ -1,7 +1,13 @@
 .git
 .github
 .local
+.tmp
+.impeccable
+evaluation
+dist
 target
 synthetic.work
 *.work
 *.sif
+__pycache__
+*.py[cod]
