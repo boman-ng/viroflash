@@ -534,6 +534,7 @@ mod tests {
 
     fn group() -> ReferenceGroup {
         ReferenceGroup {
+            representative_description: String::new(),
             ordinal: 0,
             target_group_id: "sha256:group".into(),
             representative_id: "target".into(),

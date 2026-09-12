@@ -56,6 +56,7 @@ struct IndexManifest {
     target_fasta_sha256: String,
     bloom: BloomSummary,
     contigs: Vec<ReferenceContig>,
+    target_descriptions: Vec<String>,
 }
 
 pub struct ReferenceIndex {
@@ -143,6 +144,14 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
         .flush()
         .map_err(|error| format!("Failed to write {}: {error}", composite.display()))?;
 
+    let bloom = TargetKmerBloom::build(&target_records, profile.kmer_length);
+    bloom.write(&directory.join(BLOOM))?;
+    let bloom_summary = bloom.summary();
+    drop(bloom);
+    drop(by_id);
+    drop(host_records);
+    drop(target_records);
+
     let mmi = directory.join(MMI);
     let mmi_text = mmi
         .to_str()
@@ -156,8 +165,7 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
         return Err("minimap2 produced a multi-part index".into());
     }
 
-    let bloom = TargetKmerBloom::build(&target_records, profile.kmer_length);
-    bloom.write(&directory.join(BLOOM))?;
+    drop(built);
     let target_digest = file_digest(&options.target_fa)?;
     let host_digest = file_digest(&options.host_fa)?;
     let ledger_bytes = ledger_bytes(&groups, &target_digest, &profile.digest());
@@ -174,8 +182,12 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
         kmer_length: profile.kmer_length,
         host_fasta_sha256: host_digest,
         target_fasta_sha256: target_digest,
-        bloom: bloom.summary(),
+        bloom: bloom_summary,
         contigs,
+        target_descriptions: groups
+            .iter()
+            .map(|group| group.representative_description.clone())
+            .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("Cannot serialize index manifest: {error}"))?;
@@ -204,8 +216,8 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
         return Err("Index was not built for the frozen AnalysisProfile; rebuild it".into());
     }
     verify_digest(&directory.join(MMI), &manifest.mmi_digest)?;
-    verify_digest(&directory.join(BLOOM), &manifest.bloom_digest)?;
     verify_digest(&directory.join(LEDGER), &manifest.ledger_digest)?;
+    verify_digest(&directory.join(BLOOM), &manifest.bloom_digest)?;
     let bloom = TargetKmerBloom::read(&directory.join(BLOOM), profile.kmer_length)?;
     let actual_bloom_summary = bloom.summary();
     if !bloom_summary_matches_serialized(&manifest.bloom, &actual_bloom_summary)? {
@@ -216,11 +228,19 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     }
     let ledger_bytes = std::fs::read(directory.join(LEDGER))
         .map_err(|error| format!("Cannot read ReferenceGroup ledger: {error}"))?;
-    let target_groups = parse_ledger(
+    let mut target_groups = parse_ledger(
         &ledger_bytes,
         &manifest.target_fasta_sha256,
         &manifest.profile_digest,
     )?;
+    if manifest.target_descriptions.len() != target_groups.len() {
+        return Err(
+            "Index target descriptions do not match the reference groups; rebuild it".into(),
+        );
+    }
+    for (group, description) in target_groups.iter_mut().zip(manifest.target_descriptions) {
+        group.representative_description = description;
+    }
     let contigs = validate_contigs(manifest.contigs, target_groups.len())?;
     let expected_reference_set_digest = reference_set_digest(
         &manifest.host_fasta_sha256,
@@ -307,6 +327,7 @@ fn parse_ledger(
                 ordinal: group_ordinal,
                 target_group_id: fields[1].to_string(),
                 representative_id: fields[2].to_string(),
+                representative_description: String::new(),
                 member_ids: vec![fields[4].to_string()],
                 representative_length,
                 contig_name: format!("target_{group_ordinal}"),

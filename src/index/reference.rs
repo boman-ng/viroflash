@@ -12,6 +12,7 @@ const IUPAC_DNA: &[u8] = b"ACGTMRWSYKVHDBN";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastaRecord {
     pub id: String,
+    pub description: String,
     pub sequence: Vec<u8>,
 }
 
@@ -20,6 +21,7 @@ pub struct ReferenceGroup {
     pub ordinal: usize,
     pub target_group_id: String,
     pub representative_id: String,
+    pub representative_description: String,
     pub member_ids: Vec<String>,
     pub representative_length: u64,
     pub contig_name: String,
@@ -31,13 +33,14 @@ pub fn parse_fasta(path: &Path) -> Result<Vec<FastaRecord>, String> {
     let mut records = Vec::new();
     let mut ids = HashSet::new();
     let mut current_id: Option<String> = None;
+    let mut description = String::new();
     let mut sequence = Vec::new();
 
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
         if let Some(header) = line.strip_prefix('>') {
             if let Some(id) = current_id.take() {
-                push_record(path, id, &mut sequence, &mut records)?;
+                push_record(path, id, &mut description, &mut sequence, &mut records)?;
             }
             let id = header
                 .split_ascii_whitespace()
@@ -57,6 +60,11 @@ pub fn parse_fasta(path: &Path) -> Result<Vec<FastaRecord>, String> {
                     path.display()
                 ));
             }
+            description = header.trim_ascii_start()[id.len()..]
+                .trim_ascii()
+                .trim_start_matches('|')
+                .trim_ascii()
+                .to_string();
             current_id = Some(id);
         } else {
             if current_id.is_none() && !line.trim().is_empty() {
@@ -81,7 +89,7 @@ pub fn parse_fasta(path: &Path) -> Result<Vec<FastaRecord>, String> {
         }
     }
     if let Some(id) = current_id {
-        push_record(path, id, &mut sequence, &mut records)?;
+        push_record(path, id, &mut description, &mut sequence, &mut records)?;
     }
     if records.is_empty() {
         return Err(format!("{} contains no FASTA records", path.display()));
@@ -92,6 +100,7 @@ pub fn parse_fasta(path: &Path) -> Result<Vec<FastaRecord>, String> {
 fn push_record(
     path: &Path,
     id: String,
+    description: &mut String,
     sequence: &mut Vec<u8>,
     records: &mut Vec<FastaRecord>,
 ) -> Result<(), String> {
@@ -103,6 +112,7 @@ fn push_record(
     }
     records.push(FastaRecord {
         id,
+        description: std::mem::take(description),
         sequence: std::mem::take(sequence),
     });
     Ok(())
@@ -152,6 +162,7 @@ pub fn build_reference_groups(records: &[FastaRecord]) -> Vec<ReferenceGroup> {
                 ordinal: 0,
                 target_group_id: format!("sha256:{}", hex_sha256(&canonical)),
                 representative_id: members[0].id.clone(),
+                representative_description: members[0].description.clone(),
                 member_ids: members.iter().map(|member| member.id.clone()).collect(),
                 representative_length: canonical.len() as u64,
                 contig_name: String::new(),
@@ -175,14 +186,17 @@ mod tests {
     fn groups_only_exact_sequences_and_reverse_complements() {
         let records = vec![
             FastaRecord {
+                description: String::new(),
                 id: "b".into(),
                 sequence: b"ACGMRN".to_vec(),
             },
             FastaRecord {
+                description: String::new(),
                 id: "a".into(),
                 sequence: reverse_complement(b"ACGMRN"),
             },
             FastaRecord {
+                description: String::new(),
                 id: "c".into(),
                 sequence: b"ACGMRR".to_vec(),
             },

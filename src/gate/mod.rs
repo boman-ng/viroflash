@@ -544,6 +544,7 @@ mod tests {
     #[test]
     fn any_target_kmer_opens_gate_for_whole_fragment() {
         let records = [FastaRecord {
+            description: String::new(),
             id: "target".into(),
             sequence: b"AGTCGATCCTAGGCTAACGTA".to_vec(),
         }];
@@ -566,6 +567,7 @@ mod tests {
     #[test]
     fn exact_iupac_target_kmer_opens_gate() {
         let records = [FastaRecord {
+            description: String::new(),
             id: "target".into(),
             sequence: b"ACGTMRWSYKVHDBNACGTMR".to_vec(),
         }];
@@ -581,6 +583,7 @@ mod tests {
     fn short_invalid_and_fully_masked_fragments_are_not_evaluable() {
         let bloom = TargetKmerBloom::build(
             &[FastaRecord {
+                description: String::new(),
                 id: "target".into(),
                 sequence: vec![b'A'; 100],
             }],
@@ -637,6 +640,7 @@ mod tests {
     #[test]
     fn bloom_has_no_false_negatives_for_encoded_target_kmers() {
         let records = [FastaRecord {
+            description: String::new(),
             id: "target".into(),
             sequence: b"AGTCGATCCTAGGCTAACGTATGCAGTACCGATGCTAGCATCGATCGTACGAT".to_vec(),
         }];
