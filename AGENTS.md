@@ -1,56 +1,41 @@
-# Repository Guidelines
+# Working on Viroflash
 
-## Project Structure
+Viroflash is a Rust CLI. Keep the user path simple: install a prebuilt package, build a reference index, run a sample, open its report.
 
-`viroflash` is a Rust 2021 command-line application. `src/main.rs` owns the strict `index` and
-`run` CLI, `src/lib.rs` exposes only supported entry points, and `src/pipeline.rs` orchestrates
-analysis. `analysis_profile.rs`, `fastq_input.rs`, and `sampling_design.rs` own the frozen profile
-and two FASTQ passes. `reference_group.rs` and `reference_index.rs` build and load reusable
-HOST+TARGET indexes. `kmer_gate.rs`, `competitive_alignment.rs`, `evidence.rs`, and
-`integration_evidence.rs` own fragment evidence. `report.rs` writes `report.csv` and visible
-`report.html`; `performance_report.rs` writes telemetry-only `perf.json`.
+## Where changes belong
 
-Integration coverage is in `tests/smoke.rs`; focused unit tests live beside their modules. Never
-commit local datasets, indexes, reports, `.local/`, `target/`, `.tmp/`, or `*.work/` directories.
+- `src/main.rs`: CLI; `pipeline.rs`: orchestration.
+- `profile.rs` and `analysis-profile.json`: frozen base profile and index identity. Run precision and sampling population are recorded separately. Preserve the JSON bytes and digest when relocating files.
+- `fastq.rs`, `candidates.rs`, `sampling.rs`, and `evidence.rs`: input, candidate spooling, selection, and evidence aggregation.
+- `alignment/`: mapper and attribution; `src/workers.rs`: shared bounded execution for prescreen and alignment. `gate/`: Bloom prescreen; `sdust.rs`: low-complexity masking.
+- `index/`: reusable HOST+TARGET indexes and reference grouping. HOST is the only background competitor; there is no separate decoy input.
+- `report/`: research values and embedded HTML/CSS; `telemetry.rs`: performance; `output.rs`: shared atomic writes. `tests/fixtures/output-fields.tsv` records the output contract.
+- `.github/workflows/`: Rust CI and prebuilt releases; `.github/scripts/create-smoke-fixture.rs`: release fixture.
 
-## Build and Test
+## Contracts to preserve
 
-Use the committed lockfile:
+- One SE read or PE pair is one fragment; deterministic selection and attribution must agree across worker counts and FASTQ compression formats.
+- A fragment supports at most one reference group. Library ppm estimates candidate support over all original input fragments; target share uses all attributed target fragments. Preserve exact intervals and outward rounding.
+- Analysis consumes a reusable index, including its reference descriptions. Invalid indexes fail explicitly; do not infer missing metadata or rebuild automatically.
+- Successful output is exactly `report.csv`, `report.html`, and `perf.json`; failure may leave only error telemetry. Preserve atomic writes.
+- CSV has 23 ordered columns with BOM and CRLF. HTML shares those research values and retains full evidence. Keep the interface English, script-free, and standalone, including embedded CSV download; preserve source descriptions.
+- Use existing dependencies, bounded streaming, explicit errors, and 0-based half-open coordinates. Only `--precision fast|standard|sensitive` changes sampling sensitivity; presets use the candidate population. Keep other scientific constants fixed.
+
+## Verify the changed behavior
+
+Use the pinned toolchain and lockfile. Tests are Rust and need no Python, JavaScript, or local datasets. Run focused tests first; for Rust or shared pipeline changes:
 
 ```bash
 cargo fmt --all -- --check
-cargo check --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --locked
-cargo test --release --locked
-cargo build --release --locked
-python3 evaluation/phase0/verify.py
+cargo test --release --test smoke --locked
 ```
 
-Run the narrowest relevant test first, such as `cargo test sampling_design::tests --locked`, then
-broaden checks for shared pipeline changes.
+Keep tests that catch distinct failures: malformed or changed input, index reuse, attribution, sampling/interval correctness, report parity, and bounded concurrency. Avoid duplicate assertions and Cartesian test matrices. CI runs formatting, Clippy, and core tests; release preparation tests the installed static binary and compares SIF/OCI reports. UI changes need fresh desktop/mobile reports and interaction checks. Documentation-only changes need link/contract checks and `git diff --check`.
 
-## Coding Conventions
+## Local work and change control
 
-Follow default `rustfmt`: four-space indentation, `snake_case` functions and modules, and
-`CamelCase` types. Stable scientific constants belong to `analysis_profile.rs`; do not create
-unsupported runtime choices. Production input paths return `Result<T, String>` and must not panic
-or hide errors. Prefer the standard library and existing dependencies. Preserve deterministic
-fragment selection, report column order, atomic output writes, and 0-based half-open coordinates.
+`evaluation/`, `.local/`, `.tmp/`, `target/`, `dist/`, `*.work/`, and generated images are local artifacts. Keep them out of Git, default searches, and container build contexts. Build and test must work without `evaluation/`; preserve existing local results. Use scoped `rg --hidden --no-ignore` when inspecting them.
 
-## Testing Contract
-
-Add unit tests near changed logic and end-to-end behavior to `tests/smoke.rs`. Cover success and
-error paths for CLI or parser changes. Reporting changes require strict CSV column-order checks and
-comparison of every visible HTML field against CSV. Concurrency and sampling changes must verify
-deterministic output across thread counts. Index changes must exercise reusable `index` followed by
-`run --index`; analysis always consumes a reusable index.
-
-Successful runs must produce exactly `report.csv`, `report.html`, and `perf.json`. Failed runs may
-leave only an error-shaped `perf.json`.
-
-## Change Control
-
-Use focused Conventional Commits such as `fix(evidence): ...`, `fix(index): ...`, or
-`docs: align release guidance`. Review the complete staged diff before committing. Do not push, tag, rewrite
-history, modify remotes, or change package/schema versions without explicit authorization.
+Preserve unrelated work. Review the complete diff before a focused Conventional Commit. Pushes, tags, releases, history/remote changes, and package/schema version changes require explicit authorization.
