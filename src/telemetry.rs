@@ -7,8 +7,10 @@ use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StageTimes {
-    pub pass1_count: u64,
-    pub pass2_sample_prescreen_align: u64,
+    pub index_load_ms: u64,
+    pub full_prescreen_ms: u64,
+    pub candidate_sample_align_ms: u64,
+    pub candidate_spool_bytes: u64,
     pub report_write: u64,
 }
 
@@ -23,8 +25,10 @@ pub struct PerformanceReport {
     pub peak_rss_bytes: u64,
     pub read_bytes: u64,
     pub written_bytes: u64,
-    pub pass1_count: u64,
-    pub pass2_sample_prescreen_align: u64,
+    pub index_load_ms: u64,
+    pub full_prescreen_ms: u64,
+    pub candidate_sample_align_ms: u64,
+    pub candidate_spool_bytes: u64,
     pub report_write: u64,
     pub input_fragments: u64,
     pub selected_fragments: u64,
@@ -89,8 +93,10 @@ impl PerformanceMonitor {
             peak_rss_bytes: self.peak_rss,
             read_bytes: read.saturating_sub(self.read_started),
             written_bytes: write.saturating_sub(self.write_started),
-            pass1_count: stages.pass1_count,
-            pass2_sample_prescreen_align: stages.pass2_sample_prescreen_align,
+            index_load_ms: stages.index_load_ms,
+            full_prescreen_ms: stages.full_prescreen_ms,
+            candidate_sample_align_ms: stages.candidate_sample_align_ms,
+            candidate_spool_bytes: stages.candidate_spool_bytes,
             report_write: stages.report_write,
             input_fragments: counts.0,
             selected_fragments: counts.1,
@@ -155,10 +161,6 @@ pub fn write_perf_json(path: &Path, report: &PerformanceReport) -> Result<(), St
         .map_err(|error| format!("Cannot serialize perf.json: {error}"))?;
     bytes.push(b'\n');
     atomic_write(path, &bytes)
-}
-
-pub fn stage_start() -> Instant {
-    Instant::now()
 }
 
 #[cfg(all(test, target_os = "linux"))]

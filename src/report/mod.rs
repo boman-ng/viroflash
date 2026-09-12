@@ -33,6 +33,8 @@ pub struct RunEvidence {
     pub input_mode: String,
     pub input_fragments: u64,
     pub selected_fragments: u64,
+    pub precision: &'static str,
+    pub sampling_population: &'static str,
     pub selection_probability: f64,
     pub minimum_relevant_fraction: f64,
     pub familywise_miss_probability: f64,
@@ -105,13 +107,15 @@ pub fn build_evidence_report(
         .filter(|evidence| evidence.observed_or_indeterminate())
     {
         let interval = finite_population_interval(
-            inputs.census.fragments,
+            inputs.design.candidate_fragments,
             inputs.selected_fragments,
             evidence.supporting_selected_fragments,
             per_group_alpha,
         )?;
-        let fraction =
-            evidence.supporting_selected_fragments as f64 / inputs.selected_fragments as f64;
+        let fraction = evidence.supporting_selected_fragments as f64
+            / inputs.selected_fragments as f64
+            * inputs.design.candidate_fragments as f64
+            / inputs.census.fragments as f64;
         let covered_bases = evidence.covered_bases();
         target_signals.push(TargetSignal {
             target_group_id: evidence.group.target_group_id.clone(),
@@ -122,8 +126,8 @@ pub fn build_evidence_report(
             supporting_selected_fragments: evidence.supporting_selected_fragments,
             selected_fragment_denominator: inputs.selected_fragments,
             attributed_fragment_fraction: fraction,
-            interval_lower: interval.lower,
-            interval_upper: interval.upper,
+            interval_lower: interval.lower_count as f64 / inputs.census.fragments as f64,
+            interval_upper: interval.upper_count as f64 / inputs.census.fragments as f64,
             interval_level: interval.level,
             interval_method: INTERVAL_METHOD,
             estimated_input_supporting_fragments: fraction * inputs.census.fragments as f64,
@@ -142,7 +146,7 @@ pub fn build_evidence_report(
     let reason_codes = (inputs.unevaluable_fragments > 0)
         .then(|| {
             format!(
-                "TARGET_KMER_NOT_EVALUABLE_SELECTED_FRAGMENTS={}",
+                "TARGET_KMER_NOT_EVALUABLE_INPUT_FRAGMENTS={}",
                 inputs.unevaluable_fragments
             )
         })
@@ -161,8 +165,10 @@ pub fn build_evidence_report(
             input_mode: inputs.census.input_mode.into(),
             input_fragments: inputs.census.fragments,
             selected_fragments: inputs.selected_fragments,
+            precision: inputs.design.precision.as_str(),
+            sampling_population: "bloom_candidates",
             selection_probability: inputs.design.selection_probability,
-            minimum_relevant_fraction: inputs.profile.minimum_relevant_fraction,
+            minimum_relevant_fraction: inputs.design.precision.minimum_fraction(),
             familywise_miss_probability: inputs.profile.familywise_miss_probability,
             interval_level: 1.0 - inputs.profile.familywise_interval_error,
             target_family_size: family_size,
@@ -187,6 +193,8 @@ const HEADER: &[&str] = &[
     "input_mode",
     "input_fragments",
     "selected_fragments",
+    "precision",
+    "sampling_population",
     "selection_probability",
     "minimum_relevant_fraction",
     "familywise_miss_probability",
@@ -276,6 +284,8 @@ fn run_fields(report: &EvidenceReport) -> Vec<(&'static str, String)> {
         ("input_mode", run.input_mode.clone()),
         ("input_fragments", run.input_fragments.to_string()),
         ("selected_fragments", run.selected_fragments.to_string()),
+        ("precision", run.precision.into()),
+        ("sampling_population", run.sampling_population.into()),
         (
             "selection_probability",
             format_float(run.selection_probability),

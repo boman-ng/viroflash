@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use viroflash::{build_index, run_pipeline, IndexOptions, RunOptions};
+use viroflash::{build_index, run_pipeline, IndexOptions, Precision, RunOptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -68,13 +68,26 @@ fn parse_index(args: &[String]) -> Result<IndexOptions, String> {
 }
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
-    let values = parse_flags(args, &["--r1", "--r2", "--index", "--out", "--threads"])?;
+    let values = parse_flags(
+        args,
+        &[
+            "--r1",
+            "--r2",
+            "--index",
+            "--out",
+            "--threads",
+            "--precision",
+        ],
+    )?;
     Ok(RunOptions {
         r1: required(&values, "--r1")?.into(),
         r2: values.get("--r2").map(PathBuf::from),
         index_dir: required(&values, "--index")?.into(),
         out_dir: required(&values, "--out")?.into(),
         threads: parse_threads(values.get("--threads"))?,
+        precision: values
+            .get("--precision")
+            .map_or(Ok(Precision::Standard), |value| value.parse())?,
     })
 }
 
@@ -129,7 +142,7 @@ fn parse_threads(value: Option<&&str>) -> Result<usize, String> {
 }
 
 fn print_usage() {
-    println!("Viroflash {}\n\nUSAGE:\n  viroflash index --host-fa HOST.fa --target-fa TARGET.fa --out INDEX_DIR [--threads N]\n  viroflash run --r1 SAMPLE_R1.fastq.gz [--r2 SAMPLE_R2.fastq.gz] --index INDEX_DIR --out SAMPLE_REPORT_DIR [--threads N]\n\nThe frozen profile measures profile-attributed fragment fraction using two-pass deterministic fragment sampling, a target-only 21-mer workload gate, and HOST+TARGET competitive alignment. Successful runs write exactly report.csv, report.html, and perf.json.", env!("CARGO_PKG_VERSION"));
+    println!("Viroflash {}\n\nUSAGE:\n  viroflash index --host-fa HOST.fa --target-fa TARGET.fa --out INDEX_DIR [--threads N]\n  viroflash run --r1 SAMPLE_R1.fastq.gz [--r2 SAMPLE_R2.fastq.gz] --index INDEX_DIR --out SAMPLE_REPORT_DIR [--threads N] [--precision fast|standard|sensitive]\n\nAll fragments pass through a target-only 21-mer prescreen. Candidate fragments are sampled deterministically before HOST+TARGET competitive alignment. Precision controls the minimum relevant candidate fraction: fast 100 ppm, standard 10 ppm (default), sensitive 1 ppm. Reports estimate detectable target abundance in the original input with simultaneous 95% intervals. Successful runs write exactly report.csv, report.html, and perf.json.", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -159,6 +172,27 @@ mod tests {
             ])),
             Ok(Command::Run(_))
         ));
+        for (preset, expected) in [
+            ("fast", Precision::Fast),
+            ("standard", Precision::Standard),
+            ("sensitive", Precision::Sensitive),
+        ] {
+            let Command::Run(options) = parse_args(&strings(&[
+                "run",
+                "--r1",
+                "r",
+                "--index",
+                "i",
+                "--out",
+                "o",
+                "--precision",
+                preset,
+            ]))
+            .unwrap() else {
+                panic!("run command")
+            };
+            assert_eq!(options.precision, expected);
+        }
         assert!(parse_args(&strings(&[
             "run",
             "--r1",
@@ -167,9 +201,15 @@ mod tests {
             "i",
             "--out",
             "o",
-            "--unexpected",
-            "x"
+            "--precision",
+            "0.05"
         ]))
         .is_err());
+        for command in ["index", "run"] {
+            let error = parse_args(&strings(&[command, "--decoy", "decoy.fa"]))
+                .err()
+                .unwrap();
+            assert!(error.contains("Unknown argument: --decoy"), "{error}");
+        }
     }
 }

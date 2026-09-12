@@ -62,7 +62,6 @@ struct IndexManifest {
 pub struct ReferenceIndex {
     pub mmi_path: PathBuf,
     pub bloom: TargetKmerBloom,
-    pub bloom_summary: BloomSummary,
     pub contigs: HashMap<String, ReferenceContig>,
     pub target_groups: Vec<ReferenceGroup>,
     pub profile_digest: String,
@@ -256,7 +255,6 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     Ok(ReferenceIndex {
         mmi_path: directory.join(MMI),
         bloom,
-        bloom_summary: manifest.bloom,
         contigs,
         target_groups,
         profile_digest: manifest.profile_digest,

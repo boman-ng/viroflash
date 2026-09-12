@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use crate::alignment::{align_fragments_bounded, CompetitiveAligner};
+use crate::alignment::{align_fragments_bounded, AnalysisWorkerConfig, CompetitiveAligner};
+use crate::candidates::{prescreen, CandidateReader};
 use crate::evidence::EvidenceAccumulator;
-use crate::fastq::{census_fastq, FragmentReader};
-use crate::gate::{GateEvaluation, GateScratch};
+use crate::fastq::FragmentReader;
 use crate::index::load_index;
 use crate::profile::AnalysisProfile;
 use crate::report::{build_evidence_report, write_report_csv, write_report_html, ReportInputs};
-use crate::sampling::{derive_sampling_design, fragment_selection_key, include_fragment};
-use crate::telemetry::{stage_start, write_perf_json, PerformanceMonitor, StageTimes};
+use crate::sampling::{derive_sampling_design, FragmentSelector, Precision};
+use crate::telemetry::{write_perf_json, PerformanceMonitor, StageTimes};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -17,6 +18,7 @@ pub struct RunOptions {
     pub index_dir: PathBuf,
     pub out_dir: PathBuf,
     pub threads: usize,
+    pub precision: Precision,
 }
 
 #[derive(Debug, Clone)]
@@ -45,76 +47,69 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
     let mut stages = StageTimes::default();
     let mut counts = (0, 0, 0, 0);
     let mut unevaluable_fragments = 0;
-    let result = (|| {
+    let result: Result<_, String> = (|| {
         std::fs::create_dir(&staging)
             .map_err(|error| format!("Cannot create {}: {error}", staging.display()))?;
         let profile = AnalysisProfile::FROZEN;
+        let started = Instant::now();
+        let index = load_index(&options.index_dir)?;
+        stages.index_load_ms = started.elapsed().as_millis() as u64;
         let (minimum_hits, minimum_covered_bases) =
             CompetitiveAligner::short_read_chain_requirements(profile.kmer_length)?;
-        let index = load_index(&options.index_dir)?;
-
-        let started = stage_start();
-        let census = census_fastq(&options.r1, options.r2.as_deref())?;
-        stages.pass1_count = started.elapsed().as_millis() as u64;
-        counts.0 = census.fragments;
-        let design = derive_sampling_design(&census, index.target_groups.len(), profile)?;
-
-        let started = stage_start();
-        let mut fragments = FragmentReader::open(&options.r1, options.r2.as_deref())?;
-        let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
-        let mut gate_scratch = GateScratch::default();
-        let mut pass2_fragments = 0;
-        align_fragments_bounded(
-            &index.mmi_path,
-            &index.contigs,
+        let started = Instant::now();
+        let spool = staging.join("candidates.bin");
+        let mut reader = FragmentReader::open(&options.r1, options.r2.as_deref())?;
+        let screened = prescreen(
+            &mut reader,
+            &spool,
+            &index.bloom,
+            minimum_hits,
+            minimum_covered_bases,
             options.threads,
-            || loop {
-                let Some(fragment) = fragments.next_fragment()? else {
-                    return Ok(None);
-                };
-                pass2_fragments += 1;
-                let key = fragment_selection_key(
-                    &index.profile_digest,
-                    &census.input_digest,
-                    &fragment.id,
-                    fragment.ordinal,
-                );
-                if !include_fragment(key, design.selection_probability) {
-                    continue;
-                }
-                counts.1 += 1;
-                match index.bloom.evaluate_fragment(
-                    &fragment.r1,
-                    fragment.r2.as_deref(),
-                    minimum_hits,
-                    minimum_covered_bases,
-                    &mut gate_scratch,
-                ) {
-                    GateEvaluation::Pass => {
-                        counts.2 += 1;
-                        return Ok(Some(fragment));
-                    }
-                    GateEvaluation::Negative => continue,
-                    GateEvaluation::NotEvaluable => {
-                        unevaluable_fragments += 1;
-                        continue;
-                    }
-                }
-            },
-            |evidence| accumulator.accumulate_group_evidence(evidence),
+            options.r2.is_some(),
         )?;
-        if pass2_fragments != census.fragments {
-            return Err(format!("FASTQ changed between passes: pass 1 counted {} fragments, pass 2 counted {pass2_fragments}", census.fragments));
+        let census = screened.input;
+        counts.0 = census.fragments;
+        counts.2 = screened.candidates;
+        unevaluable_fragments = screened.unevaluable;
+        stages.candidate_spool_bytes = screened.spool_bytes;
+        stages.full_prescreen_ms = started.elapsed().as_millis() as u64;
+        let design = derive_sampling_design(
+            screened.candidates,
+            index.target_groups.len(),
+            profile,
+            options.precision,
+        )?;
+        let started = Instant::now();
+        drop(index.bloom);
+        drop(reader);
+        let mut fragments =
+            CandidateReader::open(&spool, screened.candidates, options.r2.is_some())?;
+        let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
+        let selector = FragmentSelector::new(
+            &index.profile_digest,
+            &census.input_digest,
+            design.selection_probability,
+        );
+        if screened.candidates > 0 {
+            let analysis_counts = align_fragments_bounded(
+                AnalysisWorkerConfig {
+                    index_path: &index.mmi_path,
+                    contigs: &index.contigs,
+                    threads: options.threads,
+                    selector: &selector,
+                },
+                || fragments.next_batch(),
+                |evidence| accumulator.accumulate_group_evidence(evidence),
+            )?;
+            counts.1 = analysis_counts.selected_fragments;
         }
-        if fragments.input_digest() != census.input_digest {
-            return Err("FASTQ bytes changed between pass 1 and pass 2".into());
-        }
-        if fragments.compressed_artifact_digest() != census.compressed_artifact_digest {
-            return Err("Compressed FASTQ artifacts changed between pass 1 and pass 2".into());
-        }
+        drop(fragments);
+        std::fs::remove_file(&spool).map_err(|e| format!("Cannot remove candidate spool: {e}"))?;
         counts.3 = accumulator.aligned_fragments;
-        stages.pass2_sample_prescreen_align = started.elapsed().as_millis() as u64;
+        stages.candidate_sample_align_ms = started.elapsed().as_millis() as u64;
 
+        let started = Instant::now();
         let report = build_evidence_report(
             ReportInputs {
                 sample_id: sample_id.clone(),
@@ -128,7 +123,6 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
             },
             accumulator,
         )?;
-        let started = stage_start();
         write_report_csv(&staging.join("report.csv"), &report)?;
         write_report_html(&staging.join("report.html"), &report)?;
         stages.report_write = started.elapsed().as_millis() as u64;
@@ -225,6 +219,7 @@ mod tests {
     use crate::alignment::CompetitiveAligner;
     use crate::evidence::EvidenceAccumulator;
     use crate::fastq::{census_fastq, FragmentReader};
+    use crate::gate::{GateEvaluation, GateScratch};
     use crate::index::{build_index, IndexOptions};
     use crate::report::{build_evidence_report, EvidenceReport, ReportInputs};
     use crate::sampling::SamplingDesign;
@@ -262,30 +257,35 @@ mod tests {
             CompetitiveAligner::short_read_chain_requirements(AnalysisProfile::FROZEN.kmer_length)
                 .unwrap();
         let mut submitted = 0;
-        while let Some(fragment) = reader.next_fragment().unwrap() {
-            if !exhaustive
-                && index.bloom.evaluate_fragment(
-                    &fragment.r1,
-                    None,
-                    minimum_hits,
-                    minimum_covered_bases,
-                    &mut gate_scratch,
-                ) != GateEvaluation::Pass
-            {
-                continue;
+        while let Some(batch) = reader.next_batch().unwrap() {
+            for fragment in batch.fragments() {
+                let fragment = fragment.unwrap();
+                if !exhaustive
+                    && index.bloom.evaluate_fragment(
+                        fragment.r1,
+                        None,
+                        minimum_hits,
+                        minimum_covered_bases,
+                        &mut gate_scratch,
+                    ) != GateEvaluation::Pass
+                {
+                    continue;
+                }
+                submitted += 1;
+                accumulator.accumulate_group_evidence(
+                    aligner
+                        .align_fragment_competitively(&fragment, &index.contigs)
+                        .unwrap(),
+                );
             }
-            submitted += 1;
-            accumulator.accumulate_group_evidence(
-                aligner
-                    .align_fragment_competitively(&fragment, &index.contigs)
-                    .unwrap(),
-            );
         }
         build_evidence_report(
             ReportInputs {
-                sample_id: "phase5-gate-counterfactual".into(),
+                sample_id: "gate-counterfactual".into(),
                 census: &census,
                 design: SamplingDesign {
+                    precision: Precision::Standard,
+                    candidate_fragments: census.fragments,
                     selection_probability: 1.0,
                     minimum_relevant_fragments: 1,
                 },
@@ -301,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn phase5_gate_counterfactual_quantifies_exhaustive_evidence_difference() {
+    fn gate_counterfactual_quantifies_exhaustive_evidence_difference() {
         let root = std::env::temp_dir().join(format!(
-            "viroflash-phase5-gate-{}-{}",
+            "viroflash-gate-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

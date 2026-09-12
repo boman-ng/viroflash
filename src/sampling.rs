@@ -1,21 +1,75 @@
-use crate::fastq::InputCensus;
 use crate::profile::AnalysisProfile;
+
+/// The minimum relevant fraction is measured within the Bloom candidate pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Precision {
+    Fast,
+    #[default]
+    Standard,
+    Sensitive,
+}
+
+impl Precision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Standard => "standard",
+            Self::Sensitive => "sensitive",
+        }
+    }
+
+    pub fn denominator(self) -> u64 {
+        match self {
+            Self::Fast => 10_000,
+            Self::Standard => 100_000,
+            Self::Sensitive => 1_000_000,
+        }
+    }
+
+    pub fn minimum_fraction(self) -> f64 {
+        1.0 / self.denominator() as f64
+    }
+}
+
+impl std::str::FromStr for Precision {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "standard" => Ok(Self::Standard),
+            "sensitive" => Ok(Self::Sensitive),
+            _ => Err("--precision must be fast, standard, or sensitive".into()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingDesign {
+    pub precision: Precision,
+    pub candidate_fragments: u64,
     pub selection_probability: f64,
     pub minimum_relevant_fragments: u64,
 }
 
 pub fn derive_sampling_design(
-    census: &InputCensus,
+    candidate_fragments: u64,
     target_family_size: usize,
     profile: AnalysisProfile,
+    precision: Precision,
 ) -> Result<SamplingDesign, String> {
     if target_family_size == 0 {
         return Err("Reference index contains no target groups".into());
     }
-    let minimum_relevant_fragments = profile.minimum_relevant_fragments(census.fragments);
+    let minimum_relevant_fragments = candidate_fragments.div_ceil(precision.denominator());
+    if candidate_fragments == 0 {
+        return Ok(SamplingDesign {
+            precision,
+            candidate_fragments,
+            selection_probability: 0.0,
+            minimum_relevant_fragments: 0,
+        });
+    }
     let group_miss = profile.familywise_miss_probability / target_family_size as f64;
     let conservative_group_miss = group_miss.next_down();
     let mut probability =
@@ -25,39 +79,44 @@ pub fn derive_sampling_design(
     {
         probability = probability.next_up();
     }
-    assert!(
-        miss_probability_upper_bound(probability, minimum_relevant_fragments)
-            <= conservative_group_miss,
-        "rounded sampling probability exceeds the frozen miss budget"
-    );
     Ok(SamplingDesign {
+        precision,
+        candidate_fragments,
         selection_probability: probability,
         minimum_relevant_fragments,
     })
 }
 
-pub fn fragment_selection_key(
-    profile_digest: &str,
-    input_digest: &str,
-    fragment_id: &str,
-    ordinal: u64,
-) -> [u8; 16] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"viroflash-fragment-selection-v1\0");
-    hasher.update(profile_digest.as_bytes());
-    hasher.update(input_digest.as_bytes());
-    hasher.update(&(fragment_id.len() as u64).to_be_bytes());
-    hasher.update(fragment_id.as_bytes());
-    hasher.update(&ordinal.to_be_bytes());
-    let mut key = [0; 16];
-    key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    key
+/// The probability and input identity are fixed once the census has completed.
+#[derive(Clone)]
+pub(crate) struct FragmentSelector {
+    prefix: blake3::Hasher,
+    threshold: Option<u128>,
 }
 
-pub fn include_fragment(key: [u8; 16], probability: f64) -> bool {
-    match inclusion_threshold(probability) {
-        None => true,
-        Some(threshold) => u128::from_be_bytes(key) < threshold,
+impl FragmentSelector {
+    pub fn new(profile_digest: &str, input_digest: &str, probability: f64) -> Self {
+        let mut prefix = blake3::Hasher::new();
+        prefix.update(b"viroflash-fragment-selection-v1\0");
+        prefix.update(profile_digest.as_bytes());
+        prefix.update(input_digest.as_bytes());
+        Self {
+            prefix,
+            threshold: inclusion_threshold(probability),
+        }
+    }
+
+    pub fn includes(&self, fragment_id: &str, ordinal: u64) -> bool {
+        let Some(threshold) = self.threshold else {
+            return true;
+        };
+        let mut hasher = self.prefix.clone();
+        hasher.update(&(fragment_id.len() as u64).to_be_bytes());
+        hasher.update(fragment_id.as_bytes());
+        hasher.update(&ordinal.to_be_bytes());
+        let mut key = [0; 16];
+        key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        u128::from_be_bytes(key) < threshold
     }
 }
 
@@ -196,29 +255,8 @@ mod tests {
         }
     }
 
-    fn census(n: u64) -> InputCensus {
-        InputCensus {
-            input_mode: "SE",
-            fragments: n,
-            input_digest: "i".repeat(64),
-            compressed_artifact_digest: "a".repeat(64),
-            read_ends_per_fragment: 1,
-        }
-    }
-
     #[test]
-    fn probability_obeys_formula_and_boundaries() {
-        let design =
-            derive_sampling_design(&census(1_000_000), 20, AnalysisProfile::FROZEN).unwrap();
-        let expected = 1.0 - (0.05_f64 / 20.0).powf(1.0 / 10.0);
-        assert!(design.selection_probability >= expected);
-        let census_design = derive_sampling_design(&census(1), 1, AnalysisProfile::FROZEN).unwrap();
-        assert!(census_design.selection_probability >= 0.95);
-        assert!(1.0 - census_design.selection_probability <= 0.05);
-    }
-
-    #[test]
-    fn phase5_production_probability_meets_exact_rational_miss_budget() {
+    fn sampling_probability_meets_exact_rational_miss_budget() {
         for (population, family_size) in [
             (1, 1),
             (100_000, 1),
@@ -226,9 +264,13 @@ mod tests {
             (1_000_000, 20_560),
             (66_500_000, 1),
         ] {
-            let design =
-                derive_sampling_design(&census(population), family_size, AnalysisProfile::FROZEN)
-                    .unwrap();
+            let design = derive_sampling_design(
+                population,
+                family_size,
+                AnalysisProfile::FROZEN,
+                Precision::Standard,
+            )
+            .unwrap();
             let threshold = inclusion_threshold(design.selection_probability).unwrap();
             let excluded = u128::MAX - threshold + 1;
             let mut miss_numerator = ExactNatural::from_u128(1);
@@ -247,45 +289,56 @@ mod tests {
     }
 
     #[test]
-    fn phase5_bernoulli_selection_conditioned_on_realized_n_is_uniform() {
-        let design =
-            derive_sampling_design(&census(1_000_000), 20_560, AnalysisProfile::FROZEN).unwrap();
-        let threshold = inclusion_threshold(design.selection_probability).unwrap();
-        let excluded = u128::MAX - threshold + 1;
-        for realized_sample in 0..=8 {
-            let mut first_weight = None;
-            for selected_positions in 0_u16..(1 << 8) {
-                if selected_positions.count_ones() as usize != realized_sample {
-                    continue;
-                }
-                let mut weight = ExactNatural::from_u128(1);
-                for position in 0..8 {
-                    weight.multiply_u128(if selected_positions & (1 << position) != 0 {
-                        threshold
-                    } else {
-                        excluded
-                    });
-                }
-                if let Some(expected) = &first_weight {
-                    assert_eq!(weight.0, *expected, "realized n={realized_sample}");
-                } else {
-                    first_weight = Some(weight.0);
-                }
-            }
+    fn precision_uses_candidate_population_and_nested_selection() {
+        assert_eq!(
+            Precision::Standard.minimum_fraction(),
+            AnalysisProfile::FROZEN.minimum_relevant_fraction
+        );
+        let mut previous = std::collections::BTreeSet::new();
+        for precision in [Precision::Fast, Precision::Standard, Precision::Sensitive] {
+            let design =
+                derive_sampling_design(10_000_000, 20_560, AnalysisProfile::FROZEN, precision)
+                    .unwrap();
+            assert_eq!(
+                design.minimum_relevant_fragments,
+                10_000_000_u64.div_ceil(precision.denominator())
+            );
+            assert!(
+                miss_probability_upper_bound(
+                    design.selection_probability,
+                    design.minimum_relevant_fragments
+                ) <= (0.05 / 20_560.0_f64).next_down()
+            );
+            let selector = FragmentSelector::new("profile", "input", design.selection_probability);
+            let selected: std::collections::BTreeSet<_> = (0..10_000)
+                .filter(|&ordinal| selector.includes("repeated", ordinal))
+                .collect();
+            assert!(previous.is_subset(&selected));
+            previous = selected;
         }
+        let empty = derive_sampling_design(0, 20_560, AnalysisProfile::FROZEN, Precision::Standard)
+            .unwrap();
+        assert_eq!(empty.selection_probability, 0.0);
+        assert_eq!(empty.minimum_relevant_fragments, 0);
     }
 
     #[test]
-    fn selection_is_deterministic_and_fragment_owned() {
-        let key = fragment_selection_key("p", "i", "pair", 7);
-        assert_eq!(key, fragment_selection_key("p", "i", "pair", 7));
-        assert_eq!(include_fragment(key, 0.5), include_fragment(key, 0.5));
-        assert!(include_fragment(key, 1.0));
-        let probability = derive_sampling_design(&census(66_500_000), 1, AnalysisProfile::FROZEN)
-            .unwrap()
-            .selection_probability;
-        let threshold = inclusion_threshold(probability).unwrap();
-        assert!(include_fragment((threshold - 1).to_be_bytes(), probability));
-        assert!(!include_fragment(threshold.to_be_bytes(), probability));
+    fn selection_preserves_fragment_identity() {
+        // Frozen outputs of the v1 key contract, including UTF-8 IDs and repeated names.
+        let selector = FragmentSelector::new("profile-digest", "input-digest", 0.5);
+        let selected = (0..64)
+            .filter(|&ordinal| selector.includes(&format!("read-{}-α", ordinal % 37), ordinal))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [
+                3, 6, 8, 9, 10, 11, 12, 13, 15, 16, 19, 20, 21, 24, 27, 28, 29, 30, 31, 32, 34, 35,
+                37, 41, 48, 55, 56, 57, 58, 61, 63
+            ]
+        );
+        assert!(!FragmentSelector::new("p", "i", 0.0).includes("read", 0));
+        assert!(FragmentSelector::new("p", "i", 1.0).includes("read", 0));
+        assert_eq!(inclusion_threshold(0.5), Some(1_u128 << 127));
+        assert_eq!(inclusion_threshold(f64::from_bits(1)), Some(1));
     }
 }

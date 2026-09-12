@@ -1,0 +1,72 @@
+artifact	record_type	field	cardinality	contract
+report.csv	RUN	schema_id	exactly one	Report schema identity.
+report.csv	RUN	record_type	exactly one	Literal RUN.
+report.csv	RUN	sample_id	exactly one	Run sample identifier.
+report.csv	RUN	analysis_status	exactly one	Run completion state.
+report.csv	RUN	reason_codes	exactly one	Ordered reason-code list; empty is allowed.
+report.csv	RUN	input_mode	exactly one	SE or PE.
+report.csv	RUN	input_fragments	exactly one	Finite-population fragment count.
+report.csv	RUN	selected_fragments	exactly one	Included fragment count.
+report.csv	RUN	precision	exactly one	Frozen-design Bernoulli inclusion probability.
+report.csv	RUN	sampling_population	exactly one	Frozen-design Bernoulli inclusion probability.
+report.csv	RUN	selection_probability	exactly one	Frozen-design Bernoulli inclusion probability.
+report.csv	RUN	minimum_relevant_fraction	exactly one	AnalysisProfile δ.
+report.csv	RUN	familywise_miss_probability	exactly one	AnalysisProfile β.
+report.csv	RUN	interval_level	exactly one	Simultaneous familywise interval level.
+report.csv	RUN	target_family_size	exactly one	ReferenceGroup ledger group count.
+report.csv	RUN	prescreen_passed_fragments	exactly one	Fragments passing the target k-mer gate.
+report.csv	RUN	aligned_fragments	exactly one	Fragments competitively aligned.
+report.csv	RUN	unassigned_fragments	exactly one	Aligned fragments not assigned to a target group.
+report.csv	RUN	profile_digest	exactly one	Frozen profile digest.
+report.csv	RUN	index_digest	exactly one	Index digest.
+report.csv	RUN	input_digest	exactly one	Validated input digest.
+report.csv	RUN	read_ends_per_fragment	exactly one	One for SE and two for PE.
+report.csv	TARGET_SIGNAL	target_group_id	exactly one	ReferenceGroup identifier.
+report.csv	TARGET_SIGNAL	record_type	exactly one	Literal TARGET_SIGNAL.
+report.csv	TARGET_SIGNAL	representative_id	exactly one	Ledger representative identifier.
+report.csv	TARGET_SIGNAL	member_ids	exactly one	Ordered ledger member list.
+report.csv	TARGET_SIGNAL	evidence_status	exactly one	Evidence axis.
+report.csv	TARGET_SIGNAL	attribution_status	exactly one	Attribution axis.
+report.csv	TARGET_SIGNAL	supporting_selected_fragments	exactly one	Selected fragments supporting the group.
+report.csv	TARGET_SIGNAL	selected_fragment_denominator	exactly one	Selected fragment denominator.
+report.csv	TARGET_SIGNAL	attributed_fragment_fraction	exactly one	Profile-attributed fragment fraction.
+report.csv	TARGET_SIGNAL	interval_lower	exactly one	Finite-population interval lower bound.
+report.csv	TARGET_SIGNAL	interval_upper	exactly one	Finite-population interval upper bound.
+report.csv	TARGET_SIGNAL	interval_level	exactly one	Simultaneous interval level.
+report.csv	TARGET_SIGNAL	interval_method	exactly one	Finite-population interval method.
+report.csv	TARGET_SIGNAL	estimated_input_supporting_fragments	exactly one	Estimated supporting fragments in the input population.
+report.csv	TARGET_SIGNAL	covered_bases	exactly one	Representative covered bases diagnostic.
+report.csv	TARGET_SIGNAL	representative_length	exactly one	Ledger representative length.
+report.csv	TARGET_SIGNAL	coverage_fraction	exactly one	Representative breadth diagnostic.
+report.csv	TARGET_SIGNAL	occupied_windows	exactly one	Occupied-window diagnostic.
+report.csv	TARGET_SIGNAL	host_confounded_fragments	exactly one	Host-confounded fragment count.
+report.csv	TARGET_SIGNAL	cross_group_ambiguous_fragments	exactly one	Cross-group ambiguous fragment count.
+report.csv	TARGET_SIGNAL	integration_status	exactly one	Integration evidence state.
+report.csv	TARGET_SIGNAL	split_events	exactly one	Split-alignment event count.
+report.csv	TARGET_SIGNAL	discordant_fragments	exactly one	Discordant fragment count.
+report.csv	TARGET_SIGNAL	limitation_codes	exactly one	Ordered limitation-code list; empty is allowed.
+report.html	DOCUMENT	interpretation_boundary	exactly one	States profile-attributed fragment fraction and excludes clinical interpretation.
+report.html	DOCUMENT	run_integrity	exactly one	Statuses, digests, input fragments, and sampling design.
+report.html	DOCUMENT	observed_target_signals	exactly one	All report-model target rows without recomputation.
+report.html	DOCUMENT	evidence_detail	exactly one	Ambiguity, host conflict, coverage, windows, and integration diagnostics.
+report.html	DOCUMENT	methods_and_limitations	exactly one	Two-pass design, gate role, competitive alignment, and identifiability limits.
+perf.json	RUN	schema_id	exactly one	Telemetry schema identity.
+perf.json	RUN	status	exactly one	Execution status.
+perf.json	RUN	sample_id	exactly one	Run sample identifier.
+perf.json	RUN	wall_time_ms	exactly one	Total elapsed milliseconds.
+perf.json	RUN	configured_threads	exactly one	Configured worker threads.
+perf.json	RUN	process_cpu_time_ms	exactly one	Process CPU milliseconds.
+perf.json	RUN	peak_rss_bytes	exactly one	Peak resident bytes.
+perf.json	RUN	read_bytes	exactly one	Input bytes read.
+perf.json	RUN	written_bytes	exactly one	Output bytes written.
+perf.json	RUN	index_load_ms	exactly one	Pass 1 stage wall time.
+perf.json	RUN	candidate_spool_bytes	exactly one	Pass 1 stage wall time.
+perf.json	RUN	full_prescreen_ms	exactly one	Pass 1 stage wall time.
+perf.json	RUN	candidate_sample_align_ms	exactly one	Pass 2 through alignment stage wall time.
+perf.json	RUN	report_write	exactly one	Report write stage wall time.
+perf.json	RUN	input_fragments	exactly one	Input fragment count.
+perf.json	RUN	selected_fragments	exactly one	Selected fragment count.
+perf.json	RUN	prescreen_passed_fragments	exactly one	Gate-passing fragment count.
+perf.json	RUN	aligned_fragments	exactly one	Aligned fragment count.
+perf.json	RUN	telemetry_status	exactly one	Telemetry completeness state.
+perf.json	RUN	sample_errors	exactly one	Ordered execution error list; empty is allowed.
