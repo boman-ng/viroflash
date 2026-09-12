@@ -1,15 +1,14 @@
-mod analysis_profile;
-mod competitive_alignment;
+mod alignment;
 mod evidence;
-mod fastq_input;
+mod fastq;
+mod gate;
+mod index;
 mod integration_evidence;
-mod kmer_gate;
-mod performance_report;
 mod pipeline;
-mod reference_group;
-mod reference_index;
+mod profile;
 mod report;
-mod sampling_design;
+mod sampling;
+mod telemetry;
 
+pub use index::{build_index, IndexOptions};
 pub use pipeline::{run_pipeline, RunOptions, RunSummary};
-pub use reference_index::{build_index, IndexOptions};

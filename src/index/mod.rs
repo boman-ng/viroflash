@@ -1,3 +1,5 @@
+pub(crate) mod reference;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
@@ -7,9 +9,9 @@ use minimap2::Aligner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::analysis_profile::{hex_sha256, AnalysisProfile};
-use crate::kmer_gate::{BloomSummary, TargetKmerBloom};
-use crate::reference_group::{build_reference_groups, parse_fasta, ReferenceGroup};
+use crate::gate::{BloomSummary, TargetKmerBloom};
+use crate::index::reference::{build_reference_groups, parse_fasta, ReferenceGroup};
+use crate::profile::{hex_sha256, AnalysisProfile};
 
 const INDEX_CONTRACT: &str = "viroflash.reference-index.profile-bound";
 const MANIFEST: &str = "manifest.json";

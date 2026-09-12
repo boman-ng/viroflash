@@ -2,13 +2,13 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use crate::analysis_profile::AnalysisProfile;
 use crate::evidence::{
     finite_population_interval, AttributionStatus, EvidenceAccumulator, EvidenceStatus,
     INTERVAL_METHOD,
 };
-use crate::fastq_input::InputCensus;
-use crate::sampling_design::SamplingDesign;
+use crate::fastq::InputCensus;
+use crate::profile::AnalysisProfile;
+use crate::sampling::SamplingDesign;
 
 pub const REPORT_SCHEMA: &str = "viroflash.evidence-report.v1";
 

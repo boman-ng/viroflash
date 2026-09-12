@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use crate::analysis_profile::AnalysisProfile;
-use crate::competitive_alignment::align_fragments_bounded;
+use crate::alignment::align_fragments_bounded;
 use crate::evidence::EvidenceAccumulator;
-use crate::fastq_input::{census_fastq, FragmentReader};
-use crate::kmer_gate::{GateEvaluation, GateScratch};
-use crate::performance_report::{stage_start, write_perf_json, PerformanceMonitor, StageTimes};
-use crate::reference_index::load_index;
+use crate::fastq::{census_fastq, FragmentReader};
+use crate::gate::{GateEvaluation, GateScratch};
+use crate::index::load_index;
+use crate::profile::AnalysisProfile;
 use crate::report::{build_evidence_report, write_report_csv, write_report_html, ReportInputs};
-use crate::sampling_design::{derive_sampling_design, fragment_selection_key, include_fragment};
+use crate::sampling::{derive_sampling_design, fragment_selection_key, include_fragment};
+use crate::telemetry::{stage_start, write_perf_json, PerformanceMonitor, StageTimes};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -218,12 +218,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::competitive_alignment::CompetitiveAligner;
+    use crate::alignment::CompetitiveAligner;
     use crate::evidence::EvidenceAccumulator;
-    use crate::fastq_input::{census_fastq, FragmentReader};
-    use crate::reference_index::{build_index, IndexOptions};
+    use crate::fastq::{census_fastq, FragmentReader};
+    use crate::index::{build_index, IndexOptions};
     use crate::report::{build_evidence_report, EvidenceReport, ReportInputs};
-    use crate::sampling_design::SamplingDesign;
+    use crate::sampling::SamplingDesign;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -246,7 +246,7 @@ mod tests {
 
     fn gate_counterfactual_report(
         fastq: &Path,
-        index: &crate::reference_index::ReferenceIndex,
+        index: &crate::index::ReferenceIndex,
         exhaustive: bool,
     ) -> EvidenceReport {
         let census = census_fastq(fastq, None).unwrap();

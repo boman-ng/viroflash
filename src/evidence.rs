@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::competitive_alignment::{FragmentAdjudication, FragmentAlignmentEvidence};
+use crate::alignment::{FragmentAdjudication, FragmentAlignmentEvidence};
+use crate::index::reference::ReferenceGroup;
 use crate::integration_evidence::IntegrationStatus;
-use crate::reference_group::ReferenceGroup;
 
 pub const INTERVAL_METHOD: &str = "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION";
 

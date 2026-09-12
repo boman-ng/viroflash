@@ -5,8 +5,8 @@ use std::sync::{mpsc::sync_channel, Arc};
 
 use minimap2::{Aligner, Built, Mapping, Strand};
 
-use crate::fastq_input::Fragment;
-use crate::reference_index::{ReferenceContig, ReferenceRole};
+use crate::fastq::Fragment;
+use crate::index::{ReferenceContig, ReferenceRole};
 
 const ALIGNMENT_QUEUE_FRAGMENTS_PER_THREAD: usize = 1;
 
@@ -457,7 +457,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use super::*;
-    use crate::reference_index::{build_index, IndexOptions};
+    use crate::index::{build_index, IndexOptions};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -489,7 +489,7 @@ mod tests {
         stats.into_inner()
     }
 
-    fn fixture() -> (std::path::PathBuf, crate::reference_index::ReferenceIndex) {
+    fn fixture() -> (std::path::PathBuf, crate::index::ReferenceIndex) {
         let root = std::env::temp_dir().join(format!(
             "viroflash-phase5-retention-{}-{}",
             std::process::id(),

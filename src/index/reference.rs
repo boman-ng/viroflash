@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::analysis_profile::hex_sha256;
+use crate::profile::hex_sha256;
 
 const IUPAC_DNA: &[u8] = b"ACGTMRWSYKVHDBN";
 

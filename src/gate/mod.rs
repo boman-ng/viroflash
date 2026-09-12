@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::analysis_profile::{SDUST_THRESHOLD, SDUST_WINDOW};
-use crate::reference_group::FastaRecord;
+use crate::index::reference::FastaRecord;
+use crate::profile::{SDUST_THRESHOLD, SDUST_WINDOW};
 
 const HASH_COUNT: u32 = 4;
 const BITS_PER_KMER: usize = 16;

@@ -1,5 +1,5 @@
-use crate::analysis_profile::AnalysisProfile;
-use crate::fastq_input::InputCensus;
+use crate::fastq::InputCensus;
+use crate::profile::AnalysisProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingDesign {
@@ -208,8 +208,7 @@ mod tests {
 
     #[test]
     fn probability_obeys_formula_and_boundaries() {
-        let design =
-            derive_sampling_design(&census(1_000_000), 20, AnalysisProfile::FROZEN).unwrap();
+        let design = derive_sampling_design(&census(1_000_000), 20, AnalysisProfile::FROZEN).unwrap();
         let expected = 1.0 - (0.05_f64 / 20.0).powf(1.0 / 10.0);
         assert!(design.selection_probability >= expected);
         let census_design = derive_sampling_design(&census(1), 1, AnalysisProfile::FROZEN).unwrap();
@@ -227,8 +226,7 @@ mod tests {
             (66_500_000, 1),
         ] {
             let design =
-                derive_sampling_design(&census(population), family_size, AnalysisProfile::FROZEN)
-                    .unwrap();
+                derive_sampling_design(&census(population), family_size, AnalysisProfile::FROZEN).unwrap();
             let threshold = inclusion_threshold(design.selection_probability).unwrap();
             let excluded = u128::MAX - threshold + 1;
             let mut miss_numerator = ExactNatural::from_u128(1);
@@ -248,8 +246,7 @@ mod tests {
 
     #[test]
     fn phase5_bernoulli_selection_conditioned_on_realized_n_is_uniform() {
-        let design =
-            derive_sampling_design(&census(1_000_000), 20_560, AnalysisProfile::FROZEN).unwrap();
+        let design = derive_sampling_design(&census(1_000_000), 20_560, AnalysisProfile::FROZEN).unwrap();
         let threshold = inclusion_threshold(design.selection_probability).unwrap();
         let excluded = u128::MAX - threshold + 1;
         for realized_sample in 0..=8 {

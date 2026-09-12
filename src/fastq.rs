@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
 
-use crate::analysis_profile::hex_sha256;
+use crate::profile::hex_sha256;
 
 const FASTQ_READER_BUFFER_BYTES: usize = 1 << 20;
 
