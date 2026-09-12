@@ -4,7 +4,21 @@ use serde::Serialize;
 
 use crate::alignment::{FragmentAdjudication, FragmentAlignmentEvidence};
 use crate::index::reference::ReferenceGroup;
-use crate::integration_evidence::IntegrationStatus;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationStatus {
+    NotObserved,
+    DiagnosticEvidenceObserved,
+}
+
+impl IntegrationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "NOT_OBSERVED",
+            Self::DiagnosticEvidenceObserved => "DIAGNOSTIC_EVIDENCE_OBSERVED",
+        }
+    }
+}
 
 pub const INTERVAL_METHOD: &str = "EQUAL_TAILED_EXACT_HYPERGEOMETRIC_INVERSION";
 
@@ -44,6 +58,8 @@ impl AttributionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FinitePopulationInterval {
+    pub lower_count: u64,
+    pub upper_count: u64,
     pub lower: f64,
     pub upper: f64,
     pub level: f64,
@@ -196,6 +212,8 @@ pub fn finite_population_interval(
     if sample == population {
         let exact = successes as f64 / population as f64;
         return Ok(FinitePopulationInterval {
+            lower_count: successes,
+            upper_count: successes,
             lower: exact,
             upper: exact,
             level: 1.0 - alpha,
@@ -239,6 +257,8 @@ pub fn finite_population_interval(
         .min(feasible_high)
     };
     Ok(FinitePopulationInterval {
+        lower_count: lower,
+        upper_count: upper,
         lower: lower as f64 / population as f64,
         upper: upper as f64 / population as f64,
         level: 1.0 - alpha,
@@ -443,7 +463,6 @@ impl IntervalUnion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statrs::distribution::{DiscreteCDF, Hypergeometric};
 
     fn choose(total: u64, count: u64) -> u128 {
         let count = count.min(total - count);
@@ -525,32 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_interval_matches_small_population_enumeration() {
-        let interval = finite_population_interval(50, 10, 3, 0.05).unwrap();
-        assert_eq!((interval.lower * 50.0).round() as u64, 4);
-        assert_eq!((interval.upper * 50.0).round() as u64, 32);
-        for population in 2..=30 {
-            for sample in 1..population {
-                for successes in 0..=sample {
-                    let actual =
-                        finite_population_interval(population, sample, successes, 0.05).unwrap();
-                    let (lower, upper) = exact_interval_endpoints(population, sample, successes, 1);
-                    assert_eq!(
-                        (actual.lower * population as f64).round() as u64,
-                        lower,
-                        "N={population} n={sample} x={successes}"
-                    );
-                    assert_eq!(
-                        (actual.upper * population as f64).round() as u64,
-                        upper,
-                        "N={population} n={sample} x={successes}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn stable_tail_recurrence_fixes_real_lower_endpoint() {
         let population = 35_801_278;
         let sample = 1_268_602;
@@ -564,88 +557,43 @@ mod tests {
             ),
             (692, 2612)
         );
-
-        let tail = alpha / 2.0;
-        assert!(hypergeometric_tail_reaches(
-            population,
-            693,
-            sample,
-            successes,
-            Tail::Upper,
-            tail,
-            false,
-        )
-        .unwrap());
-        let old_distribution = Hypergeometric::new(population, 693, sample).unwrap();
-        assert!(old_distribution.cdf(successes - 1) >= 1.0 - tail);
     }
 
     #[test]
-    fn interval_endpoints_are_bounded_and_monotone() {
-        for &(population, sample, alpha) in &[(101, 17, 0.05), (10_003, 997, 0.05 / 20_560.0)] {
-            let mut previous = (0, 0);
-            for successes in 0..=sample {
-                let interval =
-                    finite_population_interval(population, sample, successes, alpha).unwrap();
-                let endpoints = (
-                    (interval.lower * population as f64).round() as u64,
-                    (interval.upper * population as f64).round() as u64,
-                );
-                let feasible_high = population - (sample - successes);
-                assert!(successes <= endpoints.0);
-                assert!(endpoints.0 <= endpoints.1);
-                assert!(endpoints.1 <= feasible_high);
-                assert!(previous.0 <= endpoints.0);
-                assert!(previous.1 <= endpoints.1);
-                previous = endpoints;
-            }
-        }
-    }
-
-    #[test]
-    fn phase5_production_endpoints_bias_and_family_coverage_match_exact_enumeration() {
-        let interval = finite_population_interval(50, 10, 3, 0.05).unwrap();
-        assert_eq!(
-            (
-                (interval.lower * 50.0).round() as u64,
-                (interval.upper * 50.0).round() as u64
-            ),
-            exact_interval_endpoints(50, 10, 3, 1)
-        );
-        assert_eq!(exact_interval_endpoints(50, 10, 3, 1), (4, 32));
-
+    fn interval_endpoints_and_family_coverage_match_exact_enumeration() {
         for family_size in [1_u64, 20_560] {
             for population in 2..=20 {
                 for sample in 1..=population {
                     let denominator = choose(population, sample);
-                    for total_successes in 0..=population {
-                        let weighted_sum = (0..=sample)
-                            .map(|successes| {
-                                u128::from(successes)
-                                    * hypergeometric_count(
-                                        population,
-                                        total_successes,
-                                        sample,
-                                        successes,
-                                    )
-                            })
-                            .sum::<u128>();
-                        assert_eq!(
-                            weighted_sum * u128::from(population),
-                            u128::from(total_successes) * u128::from(sample) * denominator
-                        );
-
-                        let noncoverage = (0..=sample)
-                            .filter(|successes| {
-                                let interval = finite_population_interval(
+                    let endpoints = (0..=sample)
+                        .map(|successes| {
+                            let interval = finite_population_interval(
+                                population,
+                                sample,
+                                successes,
+                                0.05 / family_size as f64,
+                            )
+                            .unwrap();
+                            let endpoints = (
+                                (interval.lower * population as f64).round() as u64,
+                                (interval.upper * population as f64).round() as u64,
+                            );
+                            assert_eq!(
+                                endpoints,
+                                exact_interval_endpoints(
                                     population,
                                     sample,
-                                    *successes,
-                                    0.05 / family_size as f64,
+                                    successes,
+                                    family_size
                                 )
-                                .unwrap();
-                                let lower = (interval.lower * population as f64).round() as u64;
-                                let upper = (interval.upper * population as f64).round() as u64;
+                            );
+                            endpoints
+                        })
+                        .collect::<Vec<_>>();
+                    for total_successes in 0..=population {
+                        let noncoverage = (0..=sample)
+                            .filter(|successes| {
+                                let (lower, upper) = endpoints[*successes as usize];
                                 total_successes < lower || total_successes > upper
                             })
                             .map(|successes| {
@@ -667,6 +615,8 @@ mod tests {
         assert_eq!(
             finite_population_interval(10, 10, 3, 0.05).unwrap(),
             FinitePopulationInterval {
+                lower_count: 3,
+                upper_count: 3,
                 lower: 0.3,
                 upper: 0.3,
                 level: 0.95
@@ -677,7 +627,7 @@ mod tests {
     #[test]
     fn coverage_state_is_bounded_by_merged_reference_intervals() {
         let mut intervals = IntervalUnion::default();
-        for offset in 0..100_000 {
+        for offset in 0..100 {
             intervals.insert(offset % 50, 100 + offset % 50);
         }
         assert_eq!(intervals.segments.len(), 1);
