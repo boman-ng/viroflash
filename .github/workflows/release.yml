@@ -2,11 +2,14 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -15,19 +18,15 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  validate:
-    name: Validate release tag
-    runs-on: ubuntu-24.04
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
-      revision: ${{ steps.version.outputs.revision }}
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      packages: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate tag and package version
-        id: version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -41,197 +40,82 @@ jobs:
             echo "Tag ${RELEASE_TAG} does not match Cargo package version ${package_version}" >&2
             exit 1
           fi
-          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "REVISION=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
 
-  binary:
-    name: Linux binary
-    needs: validate
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    steps:
-      - name: Check out release tag
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.validate.outputs.tag }}
-
-      - name: Cache Cargo data
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-release-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            target/release
+            target/x86_64-unknown-linux-musl
+          key: cargo-musl-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
 
-      - name: Install static Linux toolchain
+      - name: Install build tools
+        env:
+          APPTAINER_VERSION: 1.5.3
         run: |
+          package="apptainer_${APPTAINER_VERSION}_amd64.deb"
+          curl --fail --location --silent --show-error \
+            "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/${package}" \
+            --output "${RUNNER_TEMP}/${package}"
           sudo apt-get update
-          sudo apt-get install --yes musl-tools
+          sudo apt-get install --yes musl-tools "${RUNNER_TEMP}/${package}"
           rustup target add x86_64-unknown-linux-musl
 
-      - name: Build and inspect static Linux binary
+      - name: Build and inspect static binary
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker
         run: |
           binary=target/x86_64-unknown-linux-musl/release/viroflash
           cargo build --release --locked --target x86_64-unknown-linux-musl
-          "${binary}" --help
           file "${binary}" | grep -q 'x86-64'
-          if readelf --program-headers "${binary}" | grep -q INTERP; then
-            echo "Release binary requires a runtime loader" >&2
-            exit 1
-          fi
-          if readelf --dynamic "${binary}" | grep -q '(NEEDED)'; then
-            echo "Release binary has dynamic runtime dependencies" >&2
+          if readelf --program-headers "${binary}" | grep -q INTERP || readelf --dynamic "${binary}" | grep -q '(NEEDED)'; then
+            echo "Release binary requires a runtime loader or shared libraries" >&2
             exit 1
           fi
 
-      - name: Package binary
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Package and test installed binary
         run: |
           package="viroflash-${VERSION}-linux-x86_64"
-          mkdir -p "dist/${package}"
-          install -m 0755 target/x86_64-unknown-linux-musl/release/viroflash "dist/${package}/viroflash"
-          install -m 0644 README.md "dist/${package}/README.md"
-          tar --create --gzip --directory dist --file "dist/${package}.tar.gz" "${package}"
-          cd dist
-          sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
-
-      - name: Test unpacked release
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          package="viroflash-${VERSION}-linux-x86_64"
-          unpacked="${RUNNER_TEMP}/viroflash-unpacked"
-          data="${RUNNER_TEMP}/viroflash-release-test"
-          mkdir -p "${unpacked}"
-          tar --extract --gzip --file "dist/${package}.tar.gz" --directory "${unpacked}"
-          "${unpacked}/${package}/viroflash" --help
+          mkdir -p "dist/${package}" "${RUNNER_TEMP}/unpacked"
+          install -m755 target/x86_64-unknown-linux-musl/release/viroflash "dist/${package}/viroflash"
+          cp README.md "dist/${package}/README.md"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+          tar -xzf "dist/${package}.tar.gz" -C "${RUNNER_TEMP}/unpacked"
+          install -Dm755 "${RUNNER_TEMP}/unpacked/${package}/viroflash" "${RUNNER_TEMP}/bin/viroflash"
           rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
+          data="${RUNNER_TEMP}/release-test"
           "${RUNNER_TEMP}/create-fixture" "${data}"
-          "${unpacked}/${package}/viroflash" index \
-            --host-fa "${data}/host.fa" \
-            --target-fa "${data}/target.fa" \
-            --threads 2 \
-            --out "${data}/index"
-          "${unpacked}/${package}/viroflash" run \
-            --r1 "${data}/sample.fastq" \
-            --index "${data}/index" \
-            --threads 2 \
-            --out "${data}/result"
-          expected="$(printf '%s\n' perf.json report.csv report.html)"
-          actual="$(find "${data}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
-          test "${actual}" = "${expected}"
-          test -s "${data}/result/report.csv"
-          test -s "${data}/result/report.html"
-          test -s "${data}/result/perf.json"
+          "${RUNNER_TEMP}/bin/viroflash" index --host-fa "${data}/host.fa" --target-fa "${data}/target.fa" --out "${data}/index" --threads 2
+          "${RUNNER_TEMP}/bin/viroflash" run --r1 "${data}/sample.fastq" --index "${data}/index" --out "${data}/result" --threads 2
+          test "$(ls "${data}/result")" = "$(printf '%s\n' perf.json report.csv report.html)"
+          jq -e '.status == "SUCCESS" and .input_fragments == 20 and .prescreen_passed_fragments == 20 and .selected_fragments == 19 and .aligned_fragments == 19' "${data}/result/perf.json"
+          test "$(wc -l < "${data}/result/report.csv")" -eq 2
+          awk -F, 'NR == 2 {exit !($3 == "target" && $5 == 19 && $6 == 1000000)}' "${data}/result/report.csv"
 
-      - name: Upload binary archive
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: binary
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-          if-no-files-found: error
-
-  apptainer:
-    name: Apptainer SIF
-    needs: [validate, binary]
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    steps:
-      - name: Check out release tag
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.validate.outputs.tag }}
-
-      - name: Download binary archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: binary
-          path: dist
-
-      - name: Stage Linux binary
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Build and test SIF
         run: |
-          tar --extract --gzip --file "dist/viroflash-${VERSION}-linux-x86_64.tar.gz" --directory dist
-          mkdir -p target/release
-          cp "dist/viroflash-${VERSION}-linux-x86_64/viroflash" target/release/viroflash
+          image="dist/viroflash-${VERSION}-x86_64.sif"
+          # Replace the base image's inherited version label with the release version.
+          apptainer build --force --build-arg "VERSION=${VERSION}" --build-arg "REVISION=${REVISION}" "${image}" Apptainer.def
+          metadata="$(apptainer inspect --json "${image}")"
+          jq -e --arg version "${VERSION}" --arg revision "${REVISION}" '.data.attributes.labels | .["org.opencontainers.image.version"] == $version and .["org.opencontainers.image.revision"] == $revision' <<<"${metadata}"
+          data="${RUNNER_TEMP}/release-test"
+          apptainer run --bind "${data}:/work" --pwd /work "${image}" index --host-fa /work/host.fa --target-fa /work/target.fa --out /work/sif-index --threads 2
+          apptainer run --bind "${data}:/work" --pwd /work "${image}" run --r1 /work/sample.fastq --index /work/sif-index --out /work/sif-result --threads 2
+          for report in report.csv report.html; do cmp "${data}/result/${report}" "${data}/sif-result/${report}"; done
 
-      - name: Install Apptainer
-        uses: ./.github/actions/setup-apptainer
-        with:
-          version: 1.5.3
-
-      - name: Build and test SIF image
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
-          REVISION: ${{ needs.validate.outputs.revision }}
+      - name: Build and test OCI image
         run: |
-          image="viroflash-${VERSION}-x86_64.sif"
-          apptainer build --force \
-            --build-arg "VERSION=${VERSION}" \
-            --build-arg "REVISION=${REVISION}" \
-            "dist/${image}" Apptainer.def
-          metadata="$(apptainer inspect --json "dist/${image}")"
-          jq -e --arg expected "${VERSION}" '.data.attributes.labels["org.opencontainers.image.version"] == $expected' <<<"${metadata}"
-          jq -e --arg expected "${REVISION}" '.data.attributes.labels["org.opencontainers.image.revision"] == $expected' <<<"${metadata}"
-          jq -e '.data.attributes.labels["org.opencontainers.image.description"] == "Reference-group fragment evidence command-line tool"' <<<"${metadata}"
-          apptainer run "dist/${image}" --help
-          data="${RUNNER_TEMP}/viroflash-sif-test"
-          rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
-          "${RUNNER_TEMP}/create-fixture" "${data}"
-          apptainer run --bind "${data}:/work" --pwd /work "dist/${image}" index \
-            --host-fa /work/host.fa \
-            --target-fa /work/target.fa \
-            --threads 2 \
-            --out /work/index
-          apptainer run --bind "${data}:/work" --pwd /work "dist/${image}" run \
-            --r1 /work/sample.fastq \
-            --index /work/index \
-            --threads 2 \
-            --out /work/result
-          expected="$(printf '%s\n' perf.json report.csv report.html)"
-          actual="$(find "${data}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
-          test "${actual}" = "${expected}"
-          test -s "${data}/result/report.csv"
-          test -s "${data}/result/report.html"
-          test -s "${data}/result/perf.json"
-          cd dist
-          sha256sum "${image}" > "${image}.sha256"
-
-      - name: Upload SIF image
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: apptainer
-          path: |
-            dist/*.sif
-            dist/*.sif.sha256
-          if-no-files-found: error
-
-  container:
-    name: AMD64 OCI image
-    needs: [validate, binary, apptainer]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Check out release tag
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.validate.outputs.tag }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+          docker build --file Dockerfile --tag viroflash:release-test \
+            --build-arg "VERSION=${VERSION}" --build-arg "VCS_REF=${REVISION}" "dist/viroflash-${VERSION}-linux-x86_64"
+          data="${RUNNER_TEMP}/release-test"
+          docker run --rm --network none --user "$(id -u):$(id -g)" --volume "${data}:/work" viroflash:release-test index --host-fa host.fa --target-fa target.fa --out oci-index --threads 2
+          docker run --rm --network none --user "$(id -u):$(id -g)" --volume "${data}:/work" viroflash:release-test run --r1 sample.fastq --index oci-index --out oci-result --threads 2
+          for report in report.csv report.html; do cmp "${data}/result/${report}" "${data}/oci-result/${report}"; done
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -240,65 +124,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }},enable=${{ !contains(needs.validate.outputs.version, '-') }}
-            type=raw,value=latest,enable=${{ !contains(needs.validate.outputs.version, '-') }}
-
-      - name: Refuse to replace a versioned image
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Publish OCI tags
         run: |
-          if docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
+          image="${REGISTRY}/${IMAGE_NAME,,}"
+          if docker manifest inspect "${image}:${VERSION}" >/dev/null 2>&1; then
             echo "Versioned OCI tag ${VERSION} already exists and is immutable" >&2
             exit 1
           fi
+          tags=("${VERSION}")
+          if [[ "${VERSION}" != *-* ]]; then tags+=("${VERSION%.*}" latest); fi
+          for tag in "${tags[@]}"; do
+            docker tag viroflash:release-test "${image}:${tag}"
+            docker push "${image}:${tag}"
+          done
 
-      - name: Build and push image
-        id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.validate.outputs.version }}
-            VCS_REF=${{ needs.validate.outputs.revision }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  publish:
-    name: Publish GitHub release
-    needs: [validate, binary, apptainer, container]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Download release assets
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: "{binary,apptainer}"
-          path: release
-          merge-multiple: true
-
-      - name: Verify checksums
-        working-directory: release
-        run: sha256sum --check *.sha256
-
-      - name: Publish release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${RELEASE_TAG}" release/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --generate-notes \
-            --title "Viroflash ${RELEASE_TAG}"
+          cd dist
+          for asset in *.tar.gz *.sif; do sha256sum "${asset}" > "${asset}.sha256"; done
+          gh release create "${RELEASE_TAG}" ./*.tar.gz ./*.sif ./*.sha256 \
+            --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes --title "Viroflash ${RELEASE_TAG}"

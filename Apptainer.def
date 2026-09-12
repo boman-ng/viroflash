@@ -6,13 +6,9 @@ From: ubuntu:22.04
     REVISION=unknown
 
 %files
-    target/release/viroflash /usr/local/bin/viroflash
+    target/x86_64-unknown-linux-musl/release/viroflash /usr/local/bin/viroflash
 
 %post
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install --no-install-recommends --yes libgcc-s1 zlib1g
-    rm -rf /var/lib/apt/lists/*
     chmod 0755 /usr/local/bin/viroflash
     mkdir -p /work
 

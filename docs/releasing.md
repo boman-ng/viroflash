@@ -1,75 +1,39 @@
-# CI and Release Strategy
+# Packaging and releases
 
-## Continuous Integration
+End users install the prebuilt Linux x86_64 archive or use a SIF/OCI image. Building is a maintainer task. The GitHub repository is private; users need repository access or an administrator-supplied package.
 
-The `CI` workflow runs formatting, type checks, Clippy with warnings denied, debug and release
-tests, and the Phase 0 verifier with the committed lockfile. Its Docker and Apptainer jobs build a
-deterministic HOST/TARGET fixture, create a reusable index, run analysis through `--index`, and
-assert that the output directory contains exactly:
+## Build a local package
 
-```text
-perf.json
-report.csv
-report.html
-```
-
-The Docker smoke runs as UID/GID `65532`; the mounted fixture directory must be writable by that
-identity. The Apptainer smoke runs as the invoking host user.
-
-## Tagged Releases
-
-Releases are immutable and tag-driven. A release tag must be `vMAJOR.MINOR.PATCH`, optionally with
-a SemVer prerelease suffix, and must match the package version already reviewed in `Cargo.toml`.
-Changing that package version requires explicit authorization and a separate reviewed change.
-
-The release workflow:
-
-1. validates the tag against `Cargo.toml`;
-2. builds and inspects the static Linux amd64 binary;
-3. unpacks that binary and exercises the current `index` then `run --index` contract;
-4. builds and smoke-tests the Apptainer image through the same contract;
-5. publishes the amd64 OCI image only if its versioned tag does not already exist;
-6. verifies checksums before creating the GitHub release.
-
-Published assets are the Linux amd64 archive and checksum, the amd64 SIF and checksum, and OCI
-tags for the exact version plus stable convenience tags. Do not replace versioned assets or OCI
-tags. Repair a released defect with a newly authorized patch release.
-
-## Local Docker Check
+Use the pinned Rust toolchain, the committed lockfile, and a musl C toolchain:
 
 ```bash
-test_dir="$(mktemp -d)"
-python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
-chmod -R a+rwX "${test_dir}"
-docker build --tag viroflash:local .
-docker run --rm viroflash:local --help
-docker run --rm --volume "${test_dir}:/work" viroflash:local index \
-  --host-fa /work/host.fa --target-fa /work/target.fa --threads 2 --out /work/index
-docker run --rm --volume "${test_dir}:/work" viroflash:local run \
-  --r1 /work/sample.fastq --index /work/index --threads 2 --out /work/result
-find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+rustup target add x86_64-unknown-linux-musl
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-Wl,--no-dynamic-linker' \
+cargo build --release --locked --target x86_64-unknown-linux-musl
+version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+package="viroflash-${version}-linux-x86_64"
+mkdir -p "dist/${package}"
+install -m755 target/x86_64-unknown-linux-musl/release/viroflash "dist/${package}/viroflash"
+cp README.md "dist/${package}/README.md"
+tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 ```
 
-## Local Apptainer Check
+The archive contains the static executable and README. Extract it, install with the system `install` command, then exercise `index` and `run` using the installed binary. Release checks verify that the binary needs no runtime loader or shared libraries. Builds and tests do not need `evaluation/`.
 
-Build the release binary first, then the image:
+Build each container from the same static executable, without recompiling Rust:
 
 ```bash
-cargo build --release --locked
-apptainer build --force viroflash.sif Apptainer.def
-metadata="$(apptainer inspect --json viroflash.sif)"
-jq -e '.data.attributes.labels["org.opencontainers.image.version"] == "dev"' <<<"${metadata}"
-jq -e '.data.attributes.labels["org.opencontainers.image.revision"] == "unknown"' <<<"${metadata}"
-jq -e '.data.attributes.labels["org.opencontainers.image.description"] == "Reference-group fragment evidence command-line tool"' <<<"${metadata}"
-test_dir="$(mktemp -d)"
-python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
-apptainer run viroflash.sif --help
-apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif index \
-  --host-fa /work/host.fa --target-fa /work/target.fa --threads 2 --out /work/index
-apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif run \
-  --r1 /work/sample.fastq --index /work/index --threads 2 --out /work/result
-find "${test_dir}/result" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+docker build -f Dockerfile --build-arg VERSION="$version" -t viroflash:local "dist/$package"
+apptainer build --force --build-arg VERSION="$version" "dist/viroflash-${version}-x86_64.sif" Apptainer.def
 ```
 
-The listed result must be exactly the three successful artifacts above. Verify downloaded release
-assets with `sha256sum --check` before use.
+Docker uses the unpacked package as its build context. Apptainer reads the musl executable from `target/x86_64-unknown-linux-musl/release/`; `--force` replaces the base image's inherited version label and any existing local SIF. Container validation belongs to release preparation; ordinary CI runs Rust formatting, Clippy, and core tests in one build profile.
+
+## Publish only when authorized
+
+A release tag must be `vMAJOR.MINOR.PATCH` (optionally with a SemVer prerelease suffix), matching `Cargo.toml`. Package/schema version changes and publishing require explicit authorization. Never replace an existing versioned asset or image tag.
+
+The release workflow uses one job and one Rust release build. It validates the tag, installs and tests the archive, builds SIF and OCI images from that binary, and compares their CSV/HTML against the installed executable. After those checks, it publishes the OCI tags and creates the GitHub release with archive/SIF checksums. Stable releases also update the minor-version and `latest` image tags. No intermediate artifact uploads or downloads are needed.
+
+Local packages built from uncommitted work are unpublished artifacts. Do not present them as an existing GitHub release or point users to an older release as if it contained the current implementation.
