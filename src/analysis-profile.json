@@ -1,0 +1,44 @@
+{
+  "contract_id": "viroflash.analysis-profile.phase0",
+  "decision_status": "FROZEN",
+  "frozen_on": "2026-09-08",
+  "decision_authority": {
+    "actor": "user",
+    "authorized_on": "2026-09-08",
+    "authorized_parameters": [
+      "minimum_relevant_fraction",
+      "familywise_miss_probability",
+      "familywise_interval_error"
+    ]
+  },
+  "index_and_alignment": {
+    "kmer_length": 21,
+    "minimap2_preset": "sr",
+    "reference_group_equivalence": "uppercase full sequence equals another member or its reverse complement",
+    "fasta_record_id": "first whitespace-delimited header token, UTF-8 and unique within the file",
+    "sequence_normalization": "remove ASCII whitespace between FASTA headers, then uppercase",
+    "iupac_dna_alphabet": "ACGTMRWSYKVHDBN",
+    "invalid_sequence_symbol": "reject the reference file without dropping or replacing the symbol",
+    "canonical_kmer_encoding": "rolling 4-bit ACGTMRWSYKVHDBN code, minimum of forward and reverse-complement codes",
+    "low_complexity_masking": "minimap2 symmetric DUST (sdust.c)",
+    "sdust_window": 64,
+    "sdust_threshold": 20,
+    "alignment_acceptance": "all emitted chains with CIGAR and positive query length",
+    "alignment_role_margin": 0,
+    "occupied_window_bins": 10
+  },
+  "parameters": {
+    "minimum_relevant_fraction": {
+      "symbol": "δ",
+      "value": 0.00001
+    },
+    "familywise_interval_error": {
+      "symbol": "α",
+      "value": 0.05
+    },
+    "familywise_miss_probability": {
+      "symbol": "β",
+      "value": 0.05
+    }
+  }
+}

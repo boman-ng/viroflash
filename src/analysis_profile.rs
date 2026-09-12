@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const PROFILE_BYTES: &[u8] = include_bytes!("../evaluation/phase0/analysis-profile.json");
+pub const PROFILE_BYTES: &[u8] = include_bytes!("analysis-profile.json");
 pub const MINIMUM_RELEVANT_FRACTION_NUMERATOR: u64 = 1;
 pub const MINIMUM_RELEVANT_FRACTION_DENOMINATOR: u64 = 100_000;
 pub const SDUST_WINDOW: usize = 64;
