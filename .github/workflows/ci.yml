@@ -86,7 +86,8 @@ jobs:
         run: |
           docker run --rm viroflash:ci --help
           test_dir="${RUNNER_TEMP}/viroflash-docker-test"
-          python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
+          rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
+          "${RUNNER_TEMP}/create-fixture" "${test_dir}"
           chmod -R a+rwX "${test_dir}"
           docker run --rm \
             --volume "${test_dir}:/work" \
@@ -144,7 +145,8 @@ jobs:
           jq -e '.data.attributes.labels["org.opencontainers.image.description"] == "Reference-group fragment evidence command-line tool"' <<<"${metadata}"
           apptainer run viroflash.sif --help
           test_dir="${RUNNER_TEMP}/viroflash-apptainer-test"
-          python3 .github/scripts/create-smoke-fixture.py "${test_dir}"
+          rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
+          "${RUNNER_TEMP}/create-fixture" "${test_dir}"
           apptainer run --bind "${test_dir}:/work" --pwd /work viroflash.sif index \
             --host-fa /work/host.fa \
             --target-fa /work/target.fa \

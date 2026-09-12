@@ -112,7 +112,8 @@ jobs:
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${package}.tar.gz" --directory "${unpacked}"
           "${unpacked}/${package}/viroflash" --help
-          python3 .github/scripts/create-smoke-fixture.py "${data}"
+          rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
+          "${RUNNER_TEMP}/create-fixture" "${data}"
           "${unpacked}/${package}/viroflash" index \
             --host-fa "${data}/host.fa" \
             --target-fa "${data}/target.fa" \
@@ -186,7 +187,8 @@ jobs:
           jq -e '.data.attributes.labels["org.opencontainers.image.description"] == "Reference-group fragment evidence command-line tool"' <<<"${metadata}"
           apptainer run "dist/${image}" --help
           data="${RUNNER_TEMP}/viroflash-sif-test"
-          python3 .github/scripts/create-smoke-fixture.py "${data}"
+          rustc --edition 2021 .github/scripts/create-smoke-fixture.rs -o "${RUNNER_TEMP}/create-fixture"
+          "${RUNNER_TEMP}/create-fixture" "${data}"
           apptainer run --bind "${data}:/work" --pwd /work "dist/${image}" index \
             --host-fa /work/host.fa \
             --target-fa /work/target.fa \
