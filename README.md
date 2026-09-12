@@ -1,87 +1,60 @@
 # Viroflash
 
-Viroflash is a Rust command-line tool that measures **profile-attributed fragment fraction** for a frozen family of target reference groups. It is a library-fragment measurement under a defined software profile, not viral load, absolute quantitation, or a clinical positive/negative result.
+Viroflash analyzes FASTQ files for viral reference signals and reports their abundance, coverage, and sampling intervals. It estimates detectable viral fragments in the original library; it does not report viral load or clinical positive/negative status.
 
-## Build
+## Install
 
-```bash
-cargo build --release --locked
-```
+Use the **Linux x86_64 prebuilt package** supplied by your administrator or downloaded from [Releases](https://github.com/boman-ng/viroflash/releases). No Rust, compiler, or root access is needed. This repository is private; GitHub downloads require access.
 
-The binary remains version `0.3.0`.
-
-## Commands
-
-Build a reusable HOST+TARGET index:
+From the download directory, replace `VERSION` with the package version:
 
 ```bash
-viroflash index \
-  --host-fa HOST.fa \
-  --target-fa TARGET.fa \
-  --out INDEX_DIR \
-  [--threads N]
+tar -xzf viroflash-VERSION-linux-x86_64.tar.gz
+cd viroflash-VERSION-linux-x86_64
+install -Dm755 viroflash "$HOME/.local/bin/viroflash"
+export PATH="$HOME/.local/bin:$PATH"
+viroflash --help
 ```
 
-Analyze single-end or paired-end FASTQ:
+The executable can also run directly after extraction as `./viroflash`. Add the PATH line to your shell startup file once. Installation and analysis work offline. Older releases may use a different CLI; use a package built from this revision for the commands below.
+
+## Run
+
+Create an index once for your host and viral reference FASTA files. The host is the sole background competitor; no separate decoy genome is needed:
 
 ```bash
-viroflash run \
-  --r1 SAMPLE_R1.fastq.gz \
-  [--r2 SAMPLE_R2.fastq.gz] \
-  --index INDEX_DIR \
-  --out SAMPLE_REPORT_DIR \
-  [--threads N]
+viroflash index --host-fa host.fa --target-fa viruses.fa --out virus-index --threads 8
 ```
 
-`--out` must not already exist. A successful run creates exactly:
-
-```text
-report.csv
-report.html
-perf.json
-```
-
-`report.csv` is the machine-readable scientific artifact. `report.html` renders the same immutable `EvidenceReport`; it does not recompute statistics. `perf.json` contains execution telemetry, not biological conclusions. A failed analysis may create only an error-shaped `perf.json`.
-
-## Analysis Contract
-
-The only production `AnalysisProfile` freezes:
-
-- minimum relevant fraction δ = `1e-5`;
-- familywise miss probability β = `0.05`;
-- familywise interval error α = `0.05`;
-- target k-mer length `21`, minimap2 `sr` with all-chain enumeration, and ten diagnostic windows.
-
-The profile digest is the lowercase SHA-256 of the exact committed `evaluation/phase0/analysis-profile.json` bytes. Scientific parameters are not CLI options.
-
-Target records are grouped during indexing only when their complete uppercase IUPAC sequence is byte-identical, directly or after reverse complementation. Invalid symbols reject the FASTA. Each target record belongs to exactly one fixed `ReferenceGroup`.
-
-FASTQ analysis has two streaming passes:
-
-1. validate every record and PE identifier, count fragments exactly, compute the decoded FASTQ content identity reported as `input_digest`, and independently retain the compressed-file artifact digest;
-2. repeat validation and both digests on the analysis stream, reject decoded-content or compressed-artifact changes, apply deterministic BLAKE3 Bernoulli inclusion, then run a target-only 21-mer Bloom workload gate and HOST+TARGET competitive alignment through a bounded worker queue.
-
-For `N` input fragments and `m` fixed target groups:
-
-```text
-M_min = ceil(δN)
-π = min(1, 1 - (β/m)^(1/M_min))
-```
-
-PE ends share one selection key and one attribution. A fragment contributes at most once to one group. Host ties or advantages are confounded; cross-group ties remain unresolved; multiple exact-equivalent members within one group retain group-level support. A split diagnostic requires disjoint HOST and TARGET chains on one read end with a supplementary alignment; TARGET alternatives alone are not split evidence.
-
-Selected fragments shorter than 21 bases or without an encodable 21-mer are counted explicitly and produce `CONFORMANT_WITH_LIMITATIONS`; they are not silently treated as target-negative.
-
-The point estimate is `x/n`. Simultaneous intervals use Bonferroni `α/m` and equal-tailed exact hypergeometric inversion conditional on the realized `n`. Census intervals collapse to the exact fraction. The implementation follows the finite-population inversion in [samplingbook `Sprop`](https://rdrr.io/cran/samplingbook/src/R/Sprop.R); distribution evaluation uses the maintained Rust `statrs` implementation. Coverage, windows, split, discordant, and integration fields are diagnostics only.
-
-## Verification
+Analyze a sample using that index:
 
 ```bash
-cargo fmt --all -- --check
-cargo check --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --locked
-cargo test --release --locked
-cargo build --release --locked
-python3 evaluation/phase0/verify.py
+viroflash run --r1 sample_R1.fastq.gz --r2 sample_R2.fastq.gz \
+  --index virus-index --out sample-results --threads 8
 ```
+
+Omit `--r2` for single-end data. Plain FASTQ and gzip are supported. Output directories must be new. `--threads` defaults to `1`; choose a worker count appropriate for your machine. Indexes from before reference descriptions were stored must be rebuilt.
+
+All input fragments undergo Bloom prescreening once. Viroflash then samples the retained candidates deterministically and aligns them against the host and viral references. Temporary candidate data are removed when processing finishes; allow disk space for retained IDs and sequences beside the output directory.
+
+Use `--precision fast|standard|sensitive` to select the minimum relevant **candidate-pool** fraction: 100, 10 (default), or 1 ppm. Each preset limits the probability of completely missing a signal at or above that fraction to 5% across the reference family. More sensitive presets usually align more candidates. This controls sampling loss, not clinical sensitivity or interval width.
+
+## Read the results
+
+Open `sample-results/report.html` in a browser. The English report has expandable details and an embedded CSV download. Use your browser to find text or print; signals are ranked by support.
+
+| File | Purpose |
+|---|---|
+| `report.html` | Browse reference signals and review methods and full evidence. |
+| `report.csv` | Analyze the same research values in a spreadsheet: 23 columns, ranked by supporting fragments. |
+| `perf.json` | Inspect elapsed time, CPU usage, memory, and I/O. |
+
+Start with the reference name, supporting fragments, **library abundance (ppm)**, coverage, and **target share (%)**. Library abundance scales candidate-sample support back to the original input and displays a simultaneous 95% interval; target share divides observed support by all attributed target fragments. One paired-end read pair counts as one fragment. Reference groups are not species counts.
+
+A sample without attributed targets retains a sample-only CSV row. Interval bounds describe candidate sampling uncertainty and do not correct prescreen or attribution losses; coverage and split/discordant counts provide supporting context. The HTML file is fully standalone: viewing and CSV download need no neighboring files or JavaScript.
+
+## Containers and development
+
+HPC users can run a supplied SIF with `apptainer run viroflash-VERSION-x86_64.sif --help`; pass the same `index` and `run` arguments and bind input/output directories as needed.
+
+See [analysis methods](docs/analysis-contract.md), [contributor instructions](AGENTS.md), and [packaging and releases](docs/releasing.md) for details beyond normal use.
