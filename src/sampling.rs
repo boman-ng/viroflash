@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::fastq::{Fragment, FragmentBatch, FASTQ_BATCH_RECORDS};
@@ -136,66 +135,54 @@ impl FragmentKeys {
 }
 
 struct StoredFragment {
-    key: u128,
     ordinal: u64,
-    id: String,
-    r1: Vec<u8>,
-    r2: Option<Vec<u8>>,
+    id_end: usize,
+    r1_end: usize,
+    data: Vec<u8>,
 }
 impl StoredFragment {
-    fn new(key: u128, f: Fragment<'_>) -> Self {
-        Self {
-            key,
-            ordinal: f.ordinal,
-            id: f.id.into(),
-            r1: f.r1.into(),
-            r2: f.r2.map(Vec::from),
-        }
+    fn new(f: Fragment<'_>) -> Self {
+        let mut stored = Self {
+            ordinal: 0,
+            id_end: 0,
+            r1_end: 0,
+            data: Vec::with_capacity(f.id.len() + f.r1.len() + f.r2.map_or(0, <[u8]>::len)),
+        };
+        stored.replace(f);
+        stored
     }
-    fn replace(&mut self, key: u128, f: Fragment<'_>) {
-        self.key = key;
+    fn replace(&mut self, f: Fragment<'_>) {
         self.ordinal = f.ordinal;
-        self.id.clear();
-        self.id.push_str(f.id);
-        self.r1.clear();
-        self.r1.extend_from_slice(f.r1);
-        match (self.r2.as_mut(), f.r2) {
-            (Some(buffer), Some(read)) => {
-                buffer.clear();
-                buffer.extend_from_slice(read);
-            }
-            (_, read) => self.r2 = read.map(Vec::from),
+        self.id_end = f.id.len();
+        self.r1_end = self.id_end + f.r1.len();
+        self.data.clear();
+        self.data.extend_from_slice(f.id.as_bytes());
+        self.data.extend_from_slice(f.r1);
+        if let Some(read) = f.r2 {
+            self.data.extend_from_slice(read);
         }
     }
-    fn fragment(&self) -> Fragment<'_> {
+    fn fragment(&self, paired: bool) -> Fragment<'_> {
         Fragment {
             ordinal: self.ordinal,
-            id: &self.id,
-            r1: &self.r1,
-            r2: self.r2.as_deref(),
+            id: std::str::from_utf8(&self.data[..self.id_end]).expect("canonical FASTQ ID"),
+            r1: &self.data[self.id_end..self.r1_end],
+            r2: paired.then_some(&self.data[self.r1_end..]),
         }
     }
 }
-impl PartialEq for StoredFragment {
-    fn eq(&self, other: &Self) -> bool {
-        (self.key, self.ordinal) == (other.key, other.ordinal)
-    }
-}
-impl Eq for StoredFragment {}
-impl PartialOrd for StoredFragment {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for StoredFragment {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.key, self.ordinal).cmp(&(other.key, other.ordinal))
-    }
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct SampleKey {
+    key: u128,
+    ordinal: u64,
+    slot: usize,
 }
 
 pub(crate) struct BottomKSampler {
     capacity: usize,
-    heap: BinaryHeap<StoredFragment>,
+    heap: BinaryHeap<SampleKey>,
+    fragments: Vec<StoredFragment>,
     paired: bool,
 }
 impl BottomKSampler {
@@ -203,15 +190,23 @@ impl BottomKSampler {
         Self {
             capacity,
             heap: BinaryHeap::with_capacity(capacity),
+            fragments: Vec::with_capacity(capacity),
             paired,
         }
     }
     pub fn consider(&mut self, key: u128, f: Fragment<'_>) {
         if self.heap.len() < self.capacity {
-            self.heap.push(StoredFragment::new(key, f));
+            self.heap.push(SampleKey {
+                key,
+                ordinal: f.ordinal,
+                slot: self.fragments.len(),
+            });
+            self.fragments.push(StoredFragment::new(f));
         } else if let Some(mut largest) = self.heap.peek_mut() {
             if (key, f.ordinal) < (largest.key, largest.ordinal) {
-                largest.replace(key, f);
+                self.fragments[largest.slot].replace(f);
+                largest.key = key;
+                largest.ordinal = f.ordinal;
             }
         }
     }
@@ -219,7 +214,8 @@ impl BottomKSampler {
         self.heap.len()
     }
     pub fn finish(self) -> SelectedFragments {
-        let mut retained = self.heap.into_vec();
+        drop(self.heap);
+        let mut retained = self.fragments;
         retained.sort_unstable_by_key(|f| f.ordinal);
         SelectedFragments {
             fragments: retained.into_iter(),
@@ -236,7 +232,7 @@ impl SelectedFragments {
     pub fn next_batch(&mut self) -> Option<FragmentBatch> {
         let mut batch = FragmentBatch::new(self.paired);
         for f in self.fragments.by_ref().take(FASTQ_BATCH_RECORDS) {
-            batch.push(f.fragment());
+            batch.push(f.fragment(self.paired));
         }
         (batch.len() > 0).then_some(batch)
     }
@@ -283,8 +279,8 @@ mod tests {
                 Fragment {
                     ordinal,
                     id: &id,
-                    r1: b"ACGT",
-                    r2: Some(b"TGCA"),
+                    r1: &b"ACGTN"[..ordinal as usize % 6],
+                    r2: Some(&b"TGCA"[..ordinal as usize % 5]),
                 },
             );
             assert!(sampler.len() <= capacity);
@@ -294,7 +290,9 @@ mod tests {
         while let Some(batch) = sample.next_batch() {
             for f in batch.fragments() {
                 let f = f.unwrap();
-                assert_eq!(f.r2, Some(b"TGCA".as_slice()));
+                assert_eq!(f.id, format!("pair-{}", f.ordinal % 7));
+                assert_eq!(f.r1, &b"ACGTN"[..f.ordinal as usize % 6]);
+                assert_eq!(f.r2, Some(&b"TGCA"[..f.ordinal as usize % 5]));
                 result.insert(f.ordinal);
             }
         }
