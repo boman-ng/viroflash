@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use viroflash::{build_index, run_pipeline, IndexOptions, Precision, RunOptions};
+use viroflash::{build_index, run_pipeline, IndexOptions, Precision, RunMode, RunOptions};
 
 fn main() -> ExitCode {
     match run() {
@@ -77,6 +77,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--out",
             "--threads",
             "--precision",
+            "--mode",
         ],
     )?;
     Ok(RunOptions {
@@ -88,6 +89,9 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         precision: values
             .get("--precision")
             .map_or(Ok(Precision::Standard), |value| value.parse())?,
+        mode: values
+            .get("--mode")
+            .map_or(Ok(RunMode::Screen), |value| value.parse())?,
     })
 }
 
@@ -142,7 +146,7 @@ fn parse_threads(value: Option<&&str>) -> Result<usize, String> {
 }
 
 fn print_usage() {
-    println!("Viroflash {}\n\nUSAGE:\n  viroflash index --host-fa HOST.fa --target-fa TARGET.fa --out INDEX_DIR [--threads N]\n  viroflash run --r1 SAMPLE_R1.fastq.gz [--r2 SAMPLE_R2.fastq.gz] --index INDEX_DIR --out SAMPLE_REPORT_DIR [--threads N] [--precision fast|standard|sensitive]\n\nAll fragments pass through a target-only 21-mer prescreen. Candidate fragments are sampled deterministically before HOST+TARGET competitive alignment. Precision controls the minimum relevant candidate fraction: fast 100 ppm, standard 10 ppm (default), sensitive 1 ppm. Reports estimate detectable target abundance in the original input with simultaneous 95% intervals. Successful runs write exactly report.csv, report.html, and perf.json.", env!("CARGO_PKG_VERSION"));
+    println!("Viroflash {}\n\nUSAGE:\n  viroflash index --host-fa HOST.fa --target-fa TARGET.fa --out INDEX_DIR [--threads N]\n  viroflash run --r1 SAMPLE_R1.fastq.gz [--r2 SAMPLE_R2.fastq.gz] --index INDEX_DIR --out SAMPLE_REPORT_DIR [--threads N] [--mode full|screen] [--precision fast|standard|sensitive]\n\nScreen mode (default): sample input fragments, then Bloom-screen and competitively align against HOST+TARGET.\nFull mode: Bloom-screen all fragments, then sample and competitively align candidates.\nBoth modes use deterministic bottom-k sampling with a capacity derived from precision and panel size. No candidate files are written.\nPrecision: fast 100 ppm, standard 10 ppm (default), sensitive 1 ppm. Reports show original-library abundance percentages, sampling intervals and a score relative to the selected ppm target.\nSuccessful runs write report.csv, report.html and perf.json. HTML shows the top 20 supported reference groups and embeds the complete CSV.", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -206,10 +210,42 @@ mod tests {
         ]))
         .is_err());
         for command in ["index", "run"] {
-            let error = parse_args(&strings(&[command, "--decoy", "decoy.fa"]))
+            let error = parse_args(&strings(&[command, "--unknown", "unknown.fa"]))
                 .err()
                 .unwrap();
-            assert!(error.contains("Unknown argument: --decoy"), "{error}");
+            assert!(error.contains("Unknown argument: --unknown"), "{error}");
         }
+        let Command::Run(defaults) = parse_args(&strings(&[
+            "run", "--r1", "r", "--index", "i", "--out", "o",
+        ]))
+        .unwrap() else {
+            panic!("run command")
+        };
+        assert_eq!(defaults.mode, RunMode::Screen);
+        assert_eq!(defaults.precision, Precision::Standard);
+        for mode in ["full", "screen"] {
+            let Command::Run(options) = parse_args(&strings(&[
+                "run",
+                "--r1",
+                "r",
+                "--index",
+                "i",
+                "--out",
+                "o",
+                "--mode",
+                mode,
+                "--precision",
+                "fast",
+            ]))
+            .unwrap() else {
+                panic!("run command");
+            };
+            assert_eq!(options.mode.as_str(), mode);
+            assert_eq!(options.precision, Precision::Fast);
+        }
+        assert!(parse_args(&strings(&[
+            "run", "--r1", "r", "--index", "i", "--out", "o", "--mode", "standard"
+        ]))
+        .is_err());
     }
 }

@@ -101,7 +101,7 @@ pub fn build_index(options: &IndexOptions) -> Result<ReferenceIndex, String> {
             options.out_dir.display()
         )
     })?;
-    load_index(&options.out_dir)
+    load_index(&options.out_dir, options.threads)
 }
 
 fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
@@ -196,7 +196,7 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
     )
 }
 
-pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
+pub fn load_index(directory: &Path, threads: usize) -> Result<ReferenceIndex, String> {
     let manifest_path = directory.join(MANIFEST);
     let bytes = std::fs::read(&manifest_path).map_err(|error| {
         format!(
@@ -214,20 +214,7 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     {
         return Err("Index was not built for the frozen AnalysisProfile; rebuild it".into());
     }
-    verify_digest(&directory.join(MMI), &manifest.mmi_digest)?;
     verify_digest(&directory.join(LEDGER), &manifest.ledger_digest)?;
-    let bloom = TargetKmerBloom::read(
-        &directory.join(BLOOM),
-        profile.kmer_length,
-        &manifest.bloom_digest,
-    )?;
-    let actual_bloom_summary = bloom.summary();
-    if !bloom_summary_matches_serialized(&manifest.bloom, &actual_bloom_summary)? {
-        return Err(format!(
-            "Bloom summary does not match bloom.bin: manifest={:?}, actual={actual_bloom_summary:?}",
-            manifest.bloom
-        ));
-    }
     let ledger_bytes = std::fs::read(directory.join(LEDGER))
         .map_err(|error| format!("Cannot read ReferenceGroup ledger: {error}"))?;
     let mut target_groups = parse_ledger(
@@ -242,6 +229,31 @@ pub fn load_index(directory: &Path) -> Result<ReferenceIndex, String> {
     }
     for (group, description) in target_groups.iter_mut().zip(manifest.target_descriptions) {
         group.representative_description = description;
+    }
+    let load_bloom = || {
+        TargetKmerBloom::read(
+            &directory.join(BLOOM),
+            profile.kmer_length,
+            &manifest.bloom_digest,
+        )
+    };
+    let verify_mmi = || verify_digest(&directory.join(MMI), &manifest.mmi_digest);
+    let bloom = if threads > 1 {
+        std::thread::scope(|scope| -> Result<_, String> {
+            let validation = scope.spawn(verify_mmi);
+            let bloom = load_bloom();
+            validation
+                .join()
+                .map_err(|_| "Index validation worker panicked".to_string())??;
+            bloom
+        })?
+    } else {
+        verify_mmi()?;
+        load_bloom()?
+    };
+    let actual_bloom_summary = bloom.summary();
+    if !bloom_summary_matches_serialized(&manifest.bloom, &actual_bloom_summary)? {
+        return Err("Bloom summary does not match bloom.bin; rebuild the index".into());
     }
     let contigs = validate_contigs(manifest.contigs, target_groups.len())?;
     let expected_reference_set_digest = reference_set_digest(

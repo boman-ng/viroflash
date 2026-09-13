@@ -92,9 +92,9 @@ jobs:
           "${RUNNER_TEMP}/bin/viroflash" index --host-fa "${data}/host.fa" --target-fa "${data}/target.fa" --out "${data}/index" --threads 2
           "${RUNNER_TEMP}/bin/viroflash" run --r1 "${data}/sample.fastq" --index "${data}/index" --out "${data}/result" --threads 2
           test "$(ls "${data}/result")" = "$(printf '%s\n' perf.json report.csv report.html)"
-          jq -e '.status == "SUCCESS" and .input_fragments == 20 and .prescreen_passed_fragments == 20 and .selected_fragments == 19 and .aligned_fragments == 19' "${data}/result/perf.json"
+          jq -e '.status == "SUCCESS" and .input_fragments == 20 and .prescreen_passed_fragments == 20 and .selected_fragments == 20 and .aligned_fragments == 20' "${data}/result/perf.json"
           test "$(wc -l < "${data}/result/report.csv")" -eq 2
-          awk -F, 'NR == 2 {exit !($3 == "target" && $5 == 19 && $6 == 1000000)}' "${data}/result/report.csv"
+          awk -F, 'NR == 2 {exit !($3 == "target" && $5 == 20 && $6 == 100)}' "${data}/result/report.csv"
 
       - name: Build and test SIF
         run: |

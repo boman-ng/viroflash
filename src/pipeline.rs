@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::alignment::{align_fragments_bounded, AnalysisWorkerConfig, CompetitiveAligner};
-use crate::candidates::{prescreen, CandidateReader};
+use crate::candidates::{sample_input, SamplingConfig};
 use crate::evidence::EvidenceAccumulator;
 use crate::fastq::FragmentReader;
 use crate::index::load_index;
 use crate::profile::AnalysisProfile;
 use crate::report::{build_evidence_report, write_report_csv, write_report_html, ReportInputs};
-use crate::sampling::{derive_sampling_design, FragmentSelector, Precision};
+use crate::sampling::{sample_capacity, FragmentKeys, Precision, RunMode, SamplingDesign};
 use crate::telemetry::{write_perf_json, PerformanceMonitor, StageTimes};
 
 #[derive(Debug, Clone)]
@@ -19,6 +19,7 @@ pub struct RunOptions {
     pub out_dir: PathBuf,
     pub threads: usize,
     pub precision: Precision,
+    pub mode: RunMode,
 }
 
 #[derive(Debug, Clone)]
@@ -52,63 +53,73 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
             .map_err(|error| format!("Cannot create {}: {error}", staging.display()))?;
         let profile = AnalysisProfile::FROZEN;
         let started = Instant::now();
-        let index = load_index(&options.index_dir)?;
+        let index = load_index(&options.index_dir, options.threads)?;
         stages.index_load_ms = started.elapsed().as_millis() as u64;
+        let capacity = sample_capacity(index.target_groups.len(), profile, options.precision)?;
         let (minimum_hits, minimum_covered_bases) =
             CompetitiveAligner::short_read_chain_requirements(profile.kmer_length)?;
+        let keys = FragmentKeys::new(&index.profile_digest, &index.index_digest);
         let started = Instant::now();
-        let spool = staging.join("candidates.bin");
         let mut reader = FragmentReader::open(&options.r1, options.r2.as_deref())?;
-        let screened = prescreen(
+        let mut sampled = sample_input(
             &mut reader,
-            &spool,
-            &index.bloom,
-            minimum_hits,
-            minimum_covered_bases,
-            options.threads,
-            options.r2.is_some(),
+            SamplingConfig {
+                mode: options.mode,
+                bloom: &index.bloom,
+                keys: &keys,
+                minimum_hits,
+                minimum_covered_bases,
+                threads: options.threads,
+                paired: options.r2.is_some(),
+                capacity,
+            },
         )?;
-        let census = screened.input;
-        counts.0 = census.fragments;
-        counts.2 = screened.candidates;
-        unevaluable_fragments = screened.unevaluable;
-        stages.candidate_spool_bytes = screened.spool_bytes;
-        stages.full_prescreen_ms = started.elapsed().as_millis() as u64;
-        let design = derive_sampling_design(
-            screened.candidates,
-            index.target_groups.len(),
-            profile,
-            options.precision,
-        )?;
-        let started = Instant::now();
-        drop(index.bloom);
         drop(reader);
-        let mut fragments =
-            CandidateReader::open(&spool, screened.candidates, options.r2.is_some())?;
+        stages.scan_sample_ms = started.elapsed().as_millis() as u64;
+        stages.sampling_peak_buffered_fragments = sampled.selected_fragments;
+        let census = sampled.input;
+        counts.0 = census.fragments;
+        counts.1 = sampled.selected_fragments;
+        unevaluable_fragments = sampled.unevaluable;
+        let design = SamplingDesign {
+            precision: options.precision,
+            population_fragments: sampled.population_fragments,
+            selection_probability: if sampled.population_fragments == 0 {
+                0.0
+            } else {
+                counts.1 as f64 / sampled.population_fragments as f64
+            },
+            sample_capacity: capacity as u64,
+        };
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
-        let selector = FragmentSelector::new(
-            &index.profile_digest,
-            &census.input_digest,
-            design.selection_probability,
-        );
-        if screened.candidates > 0 {
-            let analysis_counts = align_fragments_bounded(
-                AnalysisWorkerConfig {
-                    index_path: &index.mmi_path,
-                    contigs: &index.contigs,
-                    threads: options.threads,
-                    selector: &selector,
-                },
-                || fragments.next_batch(),
-                |evidence| accumulator.accumulate_group_evidence(evidence),
-            )?;
-            counts.1 = analysis_counts.selected_fragments;
-        }
-        drop(fragments);
-        std::fs::remove_file(&spool).map_err(|e| format!("Cannot remove candidate spool: {e}"))?;
+        let started = Instant::now();
+        let bloom = if options.mode == RunMode::Screen {
+            Some(index.bloom)
+        } else {
+            drop(index.bloom);
+            None
+        };
+        let analyzed = align_fragments_bounded(
+            AnalysisWorkerConfig {
+                index_path: &index.mmi_path,
+                contigs: &index.contigs,
+                threads: options.threads,
+                bloom: bloom.as_ref(),
+                minimum_hits,
+                minimum_covered_bases,
+            },
+            || Ok(sampled.selected.next_batch()),
+            |evidence| accumulator.accumulate_group_evidence(evidence),
+        )?;
+        drop(bloom);
+        unevaluable_fragments += analyzed.unevaluable_fragments;
+        counts.2 = if options.mode == RunMode::Full {
+            sampled.population_fragments
+        } else {
+            analyzed.passed_fragments
+        };
         counts.3 = accumulator.aligned_fragments;
-        stages.candidate_sample_align_ms = started.elapsed().as_millis() as u64;
-
+        stages.selected_analysis_ms = started.elapsed().as_millis() as u64;
         let started = Instant::now();
         let report = build_evidence_report(
             ReportInputs {
@@ -120,6 +131,7 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
                 profile,
                 index_digest: index.index_digest,
                 unevaluable_fragments,
+                mode: options.mode,
             },
             accumulator,
         )?;
@@ -131,7 +143,11 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
 
     match result {
         Ok((census, report)) => {
-            let target_signal_rows = report.target_signals.len();
+            let target_signal_rows = report
+                .research_rows
+                .iter()
+                .filter(|row| !row[2].is_empty())
+                .count();
             let perf = monitor.finish(
                 "SUCCESS",
                 sample_id,
@@ -285,15 +301,16 @@ mod tests {
                 census: &census,
                 design: SamplingDesign {
                     precision: Precision::Standard,
-                    candidate_fragments: census.fragments,
+                    population_fragments: census.fragments,
                     selection_probability: 1.0,
-                    minimum_relevant_fragments: 1,
+                    sample_capacity: census.fragments,
                 },
                 selected_fragments: census.fragments,
                 prescreen_passed_fragments: submitted,
                 profile: AnalysisProfile::FROZEN,
                 index_digest: index.index_digest.clone(),
                 unevaluable_fragments: 0,
+                mode: RunMode::Full,
             },
             accumulator,
         )

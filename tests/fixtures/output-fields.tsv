@@ -4,24 +4,25 @@ report.csv	RESEARCH	reference_description	one per supported group; sample-only r
 report.csv	RESEARCH	reference_id	one per supported group; sample-only row when none	Representative accession or FASTA ID.
 report.csv	RESEARCH	support_rank	one per supported group; sample-only row when none	One-based support-descending rank, ties ordered by reference ID.
 report.csv	RESEARCH	support_fragments	one per supported group; sample-only row when none	Observed supporting fragments; PE mates count once.
-report.csv	RESEARCH	support_ppm	one per supported group; sample-only row when none	Estimated detectable target fragments per million original input fragments.
+report.csv	RESEARCH	support_pct	one per supported group; sample-only row when none	Estimated detectable target fragments as a percentage of all original input fragments.
 report.csv	RESEARCH	target_support_share_pct	one per supported group; sample-only row when none	Percentage of all attributed target fragments assigned to this group.
 report.csv	RESEARCH	coverage_pct	one per supported group; sample-only row when none	Covered percentage of the representative sequence.
 report.csv	RESEARCH	covered_bp	one per supported group; sample-only row when none	Union of covered reference bases.
 report.csv	RESEARCH	reference_length_bp	one per supported group; sample-only row when none	Representative sequence length in bases.
 report.csv	RESEARCH	occupied_windows	one per supported group; sample-only row when none	Number of occupied equal-length reference windows.
 report.csv	RESEARCH	window_count	one per supported group; sample-only row when none	Total number of reference windows.
-report.csv	RESEARCH	support_ci_lower_ppm	one per supported group; sample-only row when none	Simultaneous finite-population interval lower endpoint in ppm, rounded outward.
-report.csv	RESEARCH	support_ci_upper_ppm	one per supported group; sample-only row when none	Simultaneous finite-population interval upper endpoint in ppm, rounded outward.
+report.csv	RESEARCH	support_ci_lower_pct	one per supported group; sample-only row when none	Simultaneous finite-population interval lower endpoint in percentage units, rounded outward.
+report.csv	RESEARCH	support_ci_upper_pct	one per supported group; sample-only row when none	Simultaneous finite-population interval upper endpoint in percentage units, rounded outward.
 report.csv	RESEARCH	split_support_fragments	one per supported group; sample-only row when none	Supporting fragments with a same-end host-target split alignment.
 report.csv	RESEARCH	discordant_fragments	one per supported group; sample-only row when none	Target-supporting fragments with a host-aligned opposite mate.
 report.csv	RESEARCH	reference_member_count	one per supported group; sample-only row when none	Number of exact-equivalent reference members.
 report.csv	RESEARCH	reference_member_ids	one per supported group; sample-only row when none	Ordered semicolon-separated equivalent member IDs.
 report.csv	RESEARCH	input_mode	one per supported group; sample-only row when none	SE or PE fragment mode.
 report.csv	RESEARCH	input_fragments	one per supported group; sample-only row when none	Full input-library fragment count.
-report.csv	RESEARCH	selected_fragments	one per supported group; sample-only row when none	Selected fragment count from the full Bloom candidate pool.
+report.csv	RESEARCH	selected_fragments	one per supported group; sample-only row when none	Selected candidates in full mode; selected input fragments including Bloom negatives in screen mode.
 report.csv	RESEARCH	total_target_support_fragments	one per supported group; sample-only row when none	Sum of supporting fragments over all target groups.
 report.csv	RESEARCH	supported_reference_groups	one per supported group; sample-only row when none	Number of reference groups with supporting fragments, not species count.
+report.csv	RESEARCH	sampling_target_score	one per supported group; empty in sample-only row	(Estimated whole-library fraction - precision target) / (estimated fraction + precision target); empty in sample-only CSV rows.
 report.html	RUN	schema_id	exactly one	Report schema identity.
 report.html	RUN	record_type	exactly one	Literal RUN.
 report.html	RUN	sample_id	exactly one	Run sample identifier.
@@ -30,10 +31,11 @@ report.html	RUN	reason_codes	exactly one	Ordered reason-code list; empty is allo
 report.html	RUN	input_mode	exactly one	SE or PE.
 report.html	RUN	input_fragments	exactly one	Finite-population fragment count.
 report.html	RUN	selected_fragments	exactly one	Included fragment count.
-report.html	RUN	precision	exactly one	Candidate-pool detection preset.
-report.html	RUN	sampling_population	exactly one	Sampling population is bloom_candidates.
-report.html	RUN	selection_probability	exactly one	Frozen-design Bernoulli inclusion probability.
-report.html	RUN	minimum_relevant_fraction	exactly one	AnalysisProfile δ.
+report.html	RUN	precision	exactly one	Relative-abundance preset used to derive both modes sampling capacity.
+report.html	RUN	mode	exactly one	full or screen; determines the sampling population.
+report.html	RUN	sampling_population	exactly one	bloom_candidates in full mode or input_fragments in screen mode.
+report.html	RUN	selection_probability	exactly one	Selected count divided by the sampling population size.
+report.html	RUN	minimum_relevant_fraction	exactly one	Relative detection target δ of the run's precision preset.
 report.html	RUN	familywise_miss_probability	exactly one	AnalysisProfile β.
 report.html	RUN	interval_level	exactly one	Simultaneous familywise interval level.
 report.html	RUN	target_family_size	exactly one	ReferenceGroup ledger group count.
@@ -69,11 +71,12 @@ report.html	TARGET_SIGNAL	integration_status	exactly one	Integration evidence st
 report.html	TARGET_SIGNAL	split_events	exactly one	Split-alignment event count.
 report.html	TARGET_SIGNAL	discordant_fragments	exactly one	Discordant fragment count.
 report.html	TARGET_SIGNAL	limitation_codes	exactly one	Ordered limitation-code list; empty is allowed.
-report.html	DOCUMENT	interpretation_boundary	exactly one	States profile-attributed fragment fraction and excludes clinical interpretation.
+report.html	TARGET_SIGNAL	sampling_target_score	exactly one	(Estimated whole-library fraction - precision target) / (estimated fraction + precision target); empty in sample-only CSV rows.
+report.html	DOCUMENT	interpretation_boundary	exactly one	Defines original-library abundance and sampling uncertainty.
 report.html	DOCUMENT	run_integrity	exactly one	Statuses, digests, input fragments, and sampling design.
-report.html	DOCUMENT	observed_target_signals	exactly one	All report-model target rows without recomputation.
+report.html	DOCUMENT	observed_target_signals	exactly one	Details for the top 20 supported groups.
 report.html	DOCUMENT	evidence_detail	exactly one	Ambiguity, host conflict, coverage, windows, and integration diagnostics.
-report.html	DOCUMENT	methods_and_limitations	exactly one	Full-input prescreen, candidate sampling, competitive alignment, and identifiability limits.
+report.html	DOCUMENT	methods_and_limitations	exactly one	Current sampling, competitive alignment and measurement definitions.
 perf.json	RUN	schema_id	exactly one	Telemetry schema identity.
 perf.json	RUN	status	exactly one	Execution status.
 perf.json	RUN	sample_id	exactly one	Run sample identifier.
@@ -81,17 +84,20 @@ perf.json	RUN	wall_time_ms	exactly one	Total elapsed milliseconds.
 perf.json	RUN	configured_threads	exactly one	Configured worker threads.
 perf.json	RUN	process_cpu_time_ms	exactly one	Process CPU milliseconds.
 perf.json	RUN	peak_rss_bytes	exactly one	Peak resident bytes.
-perf.json	RUN	read_bytes	exactly one	OS-accounted storage bytes read, including index and candidate data; affected by caching.
-perf.json	RUN	written_bytes	exactly one	OS-accounted storage bytes written, including candidate data; affected by caching.
+perf.json	RUN	read_bytes	exactly one	OS-accounted storage bytes read, including index data; affected by caching.
+perf.json	RUN	written_bytes	exactly one	OS-accounted storage bytes written; affected by caching.
 perf.json	RUN	index_load_ms	exactly one	Index validation and Bloom loading wall time.
-perf.json	RUN	full_prescreen_ms	exactly one	Full FASTQ census, Bloom prescreen and candidate spooling wall time.
-perf.json	RUN	candidate_spool_bytes	exactly one	Candidate spool length in bytes; written once and read once.
-perf.json	RUN	candidate_sample_align_ms	exactly one	Candidate sampling, mapper loading and alignment wall time.
+perf.json	RUN	scan_sample_ms	exactly one	FASTQ reading, full-mode Bloom, and in-memory bottom-k selection wall time.
+perf.json	RUN	selected_analysis_ms	exactly one	Final sample analysis, including screen-mode Bloom and competitive alignment.
 perf.json	RUN	report_write	exactly one	Report construction, interval calculation, and write stage wall time.
+perf.json	RUN	sampling_peak_buffered_fragments	exactly one	Peak number of retained fragments in the shared bottom-k reservoir.
 perf.json	RUN	input_fragments	exactly one	Input fragment count.
 perf.json	RUN	selected_fragments	exactly one	Selected fragment count.
 perf.json	RUN	prescreen_passed_fragments	exactly one	Gate-passing fragment count.
 perf.json	RUN	aligned_fragments	exactly one	Aligned fragment count.
 perf.json	RUN	telemetry_status	exactly one	Telemetry completeness state.
 perf.json	RUN	sample_errors	exactly one	Ordered execution error list; empty is allowed.
-report.html	DOCUMENT	research_data	exactly one	Research rows with an embedded CSV download; every CSV field is visible on expansion.
+report.html	DOCUMENT	research_data	exactly one	Displayed groups expose every CSV field on expansion; the embedded download preserves all attributed CSV rows.
+report.html	RUN	sample_capacity	exactly one	Precision-derived bottom-k capacity.
+report.html	RUN	sampling_population_fragments	exactly one	Original fragment count in screen; Bloom candidate count in full.
+report.html	RUN	sampling_expected_support	exactly one; empty without selected fragments	Expected selected support at the precision target in the original library.

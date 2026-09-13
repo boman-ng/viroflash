@@ -31,7 +31,7 @@ impl AlignmentRetention {
             .max(self.pending_sequence_bytes);
         self.maximum_fragment_bytes = self.maximum_fragment_bytes.max(maximum_fragment_bytes);
         self.total_sequence_bytes += sequence_bytes;
-        let maximum_pending_fragments = threads.saturating_mul(FASTQ_BATCH_RECORDS);
+        let maximum_pending_fragments = (threads + 1).saturating_mul(FASTQ_BATCH_RECORDS);
         assert!(self.pending_fragments <= maximum_pending_fragments);
         assert!(
             self.pending_sequence_bytes
@@ -64,7 +64,7 @@ pub(crate) fn process_batches_bounded<N, F, W, S, R>(
 where
     N: FnMut() -> Result<Option<FragmentBatch>, String>,
     F: Fn() -> W,
-    W: FnMut(&FragmentBatch) -> Result<R, String> + Send,
+    W: FnMut(FragmentBatch) -> Result<R, String> + Send,
     S: FnMut(R) -> Result<(), String>,
     R: Send,
 {
@@ -86,8 +86,7 @@ where
                 #[cfg(test)]
                 let sequence_bytes = batch.sequence_bytes();
                 let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(&batch)));
-                drop(batch);
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(batch)));
                 let panicked = result.is_err();
                 let result = result.unwrap_or_else(|_| Err("Batch worker panicked".into()));
                 if result_sender
@@ -135,13 +134,7 @@ where
                     .recv()
                     .map_err(|_| "Batch worker result queue closed".to_string())?;
                 active -= 1;
-                #[cfg(test)]
-                {
-                    retention.release(completed.fragment_count, completed.sequence_bytes);
-                    observe_retention(retention);
-                }
                 let analysis = completed.result?;
-                sink(analysis)?;
                 if let Some(batch) = next_batch()? {
                     #[cfg(test)]
                     {
@@ -159,6 +152,12 @@ where
                         .send(batch)
                         .map_err(|_| "Batch worker queue closed".to_string())?;
                     active += 1;
+                }
+                sink(analysis)?;
+                #[cfg(test)]
+                {
+                    retention.release(completed.fragment_count, completed.sequence_bytes);
+                    observe_retention(retention);
                 }
             }
             #[cfg(test)]
@@ -185,7 +184,7 @@ mod tests {
     use crate::fastq::Fragment;
 
     #[test]
-    fn sink_failure_joins_workers_without_waiting_for_more_input() {
+    fn sink_failure_stops_after_at_most_one_refill() {
         let mut emitted = 0;
         let error = process_batches_bounded(
             4,
@@ -198,12 +197,12 @@ mod tests {
                     r2: None,
                 }])))
             },
-            || |_: &FragmentBatch| Ok(()),
-            &mut |_| Err("candidate write failed".into()),
+            || |_: FragmentBatch| Ok(()),
+            &mut |_| Err("aggregation failed".into()),
             |_| {},
         )
         .unwrap_err();
-        assert_eq!(error, "candidate write failed");
-        assert_eq!(emitted, 4);
+        assert_eq!(error, "aggregation failed");
+        assert_eq!(emitted, 5);
     }
 }

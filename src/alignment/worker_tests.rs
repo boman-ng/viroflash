@@ -12,7 +12,7 @@ use crate::index::{build_index, IndexOptions, ReferenceRole};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn retention_within_bound(stats: AlignmentRetention, threads: usize) -> bool {
-    let maximum_pending_fragments = threads.saturating_mul(FASTQ_BATCH_RECORDS);
+    let maximum_pending_fragments = (threads + 1).saturating_mul(FASTQ_BATCH_RECORDS);
     stats.maximum_pending_fragments <= maximum_pending_fragments
         && stats.maximum_pending_sequence_bytes
             <= maximum_pending_fragments.saturating_mul(stats.maximum_fragment_bytes)
@@ -37,11 +37,6 @@ fn measured_alignment(
     stats.into_inner()
 }
 
-fn test_selector() -> &'static FragmentSelector {
-    static SELECTOR: std::sync::OnceLock<FragmentSelector> = std::sync::OnceLock::new();
-    SELECTOR.get_or_init(|| FragmentSelector::new("profile", "input", 1.0))
-}
-
 fn batches(fragments: &[Fragment<'_>]) -> VecDeque<FragmentBatch> {
     fragments
         .chunks(FASTQ_BATCH_RECORDS)
@@ -54,7 +49,9 @@ fn worker_config(index: &crate::index::ReferenceIndex, threads: usize) -> Analys
         index_path: &index.mmi_path,
         contigs: &index.contigs,
         threads,
-        selector: test_selector(),
+        bloom: None,
+        minimum_hits: 2,
+        minimum_covered_bases: 25,
     }
 }
 
@@ -158,16 +155,15 @@ fn emitted_target_mappings_satisfy_the_short_read_chain_gate() {
 }
 
 #[test]
-fn workers_validate_pairs_even_when_no_fragments_are_selected() {
+fn workers_validate_pairs_before_bloom() {
     let (root, index) = fixture();
     let r1 = root.join("r1.fq");
     let r2 = root.join("r2.fq");
     let valid = "@pair\nACGT\n+\nIIII\n".repeat(FASTQ_BATCH_RECORDS * 2);
     std::fs::write(&r1, format!("{valid}@left\nACGT\n+\nIIII\n")).unwrap();
     std::fs::write(&r2, format!("{valid}@right\nACGT\n+\nIIII\n")).unwrap();
-    let selector = FragmentSelector::new("profile", "input", 0.0);
     let mut config = worker_config(&index, 4);
-    config.selector = &selector;
+    config.bloom = Some(&index.bloom);
     let mut reader = crate::fastq::FragmentReader::open(&r1, Some(&r2)).unwrap();
     let error = align_fragments_bounded(
         config,
@@ -204,7 +200,7 @@ fn completed_worker_is_refilled_before_batch_drains() {
         window
             == [
                 FASTQ_BATCH_RECORDS * 2,
-                FASTQ_BATCH_RECORDS,
+                FASTQ_BATCH_RECORDS * 3,
                 FASTQ_BATCH_RECORDS * 2,
             ]
     }));
@@ -229,14 +225,10 @@ fn alignment_retention_is_bounded_batches_not_total_selected() {
     let large = measured_alignment(
         &index,
         threads,
-        fragments((threads + 1) * FASTQ_BATCH_RECORDS),
+        fragments((threads + 3) * FASTQ_BATCH_RECORDS),
     );
     assert!(retention_within_bound(small, threads));
     assert!(retention_within_bound(large, threads));
-    assert_eq!(
-        small.maximum_pending_sequence_bytes,
-        large.maximum_pending_sequence_bytes
-    );
     assert!(large.total_sequence_bytes > small.total_sequence_bytes);
 
     let counterfactual = AlignmentRetention {

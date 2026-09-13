@@ -12,32 +12,31 @@
 <div class="page">
 <header class="report-header">
 <div class="masthead"><a class="wordmark" href="#top" aria-label="Viroflash report overview">Viroflash<span class="brand-dot" aria-hidden="true"></span></a><div class="actions"><a class="button primary" href="{{CSV_DOWNLOAD}}" download="{{SAMPLE}}.csv">Download CSV</a></div></div>
-<div id="top" class="heading"><h1>Viral reference signals</h1><p class="sample-name">{{SAMPLE}}</p><p class="intro">Explore library abundance, reference coverage, and the composition of attributed target fragments.</p></div>
+<div id="top" class="heading"><h1>Viral reference signals</h1><p class="sample-name">{{SAMPLE}}</p><p class="intro">Whole-library abundance, reference coverage, and support relative to the selected ppm target.</p></div>
 <dl class="sample-stats" aria-label="Sample overview">
 <div><dt>Input fragments <span>{{INPUT_MODE}}</span></dt><dd>{{INPUT_COUNT}}</dd></div>
-<div><dt>Sampled candidates</dt><dd>{{SELECTED_COUNT}}</dd></div>
+<div><dt>{{SAMPLED_LABEL}}</dt><dd>{{SELECTED_COUNT}}</dd></div>
 <div><dt>Attributed target fragments</dt><dd>{{TOTAL_SUPPORT}}</dd></div>
-<div><dt>Supported reference groups</dt><dd>{{GROUP_COUNT}}</dd></div>
+<div><dt>Displayed reference groups</dt><dd>{{GROUP_COUNT}}</dd></div>
 </dl>
 </header>
 <main>
 <section id="results" aria-labelledby="results-title">
-<div class="section-heading"><div><h2 id="results-title">Reference signals</h2><p>Ranked by supporting fragments. Expand a row to explore all 23 research fields.</p></div><span class="result-count">{{GROUP_COUNT}} reference groups</span></div>
-<div class="column-head" aria-hidden="true"><span>Rank</span><span>Reference / accession</span><span>Fragments</span><span>Library interval · ppm</span><span>Coverage</span><span>Target share</span><span></span></div>
+<div class="section-heading"><div><h2 id="results-title">Reference signals</h2><p>Showing the top {{GROUP_COUNT}} of {{ALL_GROUP_COUNT}} attributed groups by supporting fragments. Download CSV for all groups. Expand a row for its 24 research fields.</p></div><span class="result-count">{{GROUP_COUNT}} reference groups</span></div>
+<div class="column-head" aria-hidden="true"><span>Rank</span><span>Reference / accession</span><span>Fragments</span><span>Library interval · %</span><span>Coverage</span><span>Target score</span><span></span></div>
 <div id="signal-list">{{RESULT_LIST}}</div>
-<div class="reading-notes"><p><strong>Library abundance</strong> estimates detectable viral fragments per million original input fragments. The range is a simultaneous 95% interval; the point estimate appears below it. <strong>Target share</strong> uses all attributed target fragments. Reference group counts are not species counts.</p><p>Coverage bars show breadth, not genomic position or distribution. One fragment is one SE read or one PE read pair.</p></div>
+<div class="reading-notes"><p><strong>Library abundance</strong> estimates detectable support as a percentage of all original input fragments, with a simultaneous 95% sampling interval. <strong>Target score</strong> is (estimated fraction − target fraction) / (estimated fraction + target fraction): negative below the selected ppm target, zero at the target, positive above it. It describes relative abundance, not confidence.</p><p>Coverage is the fraction of reference bases covered. One fragment is one SE read or one PE pair. Each group contains identical or reverse-complement reference sequences.</p></div>
 </section>
 <details class="methods" id="analysis-details">
-<summary>Methods and full evidence<span>For further review</span></summary>
+<summary>Methods and reference details<span>Sampling and analysis data</span></summary>
 <div class="methods-content">
-<section><h3>Measurement definitions</h3><p>This report measures profile-attributed fragment fractions, not viral load or clinical positive/negative status. Reference descriptions come from the indexed FASTA. Exact-equivalent members within a group cannot be distinguished.</p><p>Intervals use simultaneous equal-tailed exact hypergeometric inversion with 95% familywise coverage across the complete fixed target family. They describe candidate sampling uncertainty only and do not correct for signals missed by the prescreen or attribution. Split and discordant fragment counts are not confirmed integration event counts.</p></section>
+<section><h3>Analysis method</h3><p>{{METHOD}} Both modes read FASTQ once and keep the sample in memory. The same precision-derived capacity applies to the input population in screen mode and the candidate population in full mode.</p><p>Abundance intervals use exact hypergeometric inversion and cover sampling uncertainty under the uniform hash-priority model. Percentages use the original input denominator. Split and discordant counts describe alignment patterns.</p></section>
 <section id="run-integrity"><h3>Run and sampling information</h3><table><tbody>{{RUN_FIELDS}}</tbody></table></section>
-<details class="raw-evidence"><summary>Full reference group evidence</summary><section id="observed-target-signals">{{AUDIT_SIGNALS}}</section></details>
-<section><h3>Methods and limitations</h3><p>All input fragments undergo a target 21-mer Bloom prescreen during one validated FASTQ pass. Retained candidates are sampled using deterministic BLAKE3 Bernoulli selection and undergo competitive HOST+TARGET minimap2 alignment. Candidate-population interval endpoints are divided by the original input count to obtain library abundance. References outside the index remain unmodeled. Cross-group ambiguity, host conflict, and unevaluable fragments are retained in the full evidence.</p></section>
+<details class="raw-evidence"><summary>Details for displayed reference groups</summary><section id="observed-target-signals">{{AUDIT_SIGNALS}}</section></details>
 </div>
 </details>
 </main>
-<footer><span>Viroflash</span><p>CSV and the research data on this page share one analysis result. The CSV download is embedded in this file.</p><a href="#top">Back to top</a></footer>
+<footer><span>Viroflash</span><p>The complete CSV is embedded in this report.</p><a href="#top">Back to top</a></footer>
 </div>
 </body>
 </html>

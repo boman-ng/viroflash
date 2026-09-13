@@ -8,10 +8,10 @@ use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StageTimes {
     pub index_load_ms: u64,
-    pub full_prescreen_ms: u64,
-    pub candidate_sample_align_ms: u64,
-    pub candidate_spool_bytes: u64,
+    pub scan_sample_ms: u64,
+    pub selected_analysis_ms: u64,
     pub report_write: u64,
+    pub sampling_peak_buffered_fragments: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,10 +26,10 @@ pub struct PerformanceReport {
     pub read_bytes: u64,
     pub written_bytes: u64,
     pub index_load_ms: u64,
-    pub full_prescreen_ms: u64,
-    pub candidate_sample_align_ms: u64,
-    pub candidate_spool_bytes: u64,
+    pub scan_sample_ms: u64,
+    pub selected_analysis_ms: u64,
     pub report_write: u64,
+    pub sampling_peak_buffered_fragments: u64,
     pub input_fragments: u64,
     pub selected_fragments: u64,
     pub prescreen_passed_fragments: u64,
@@ -94,10 +94,10 @@ impl PerformanceMonitor {
             read_bytes: read.saturating_sub(self.read_started),
             written_bytes: write.saturating_sub(self.write_started),
             index_load_ms: stages.index_load_ms,
-            full_prescreen_ms: stages.full_prescreen_ms,
-            candidate_sample_align_ms: stages.candidate_sample_align_ms,
-            candidate_spool_bytes: stages.candidate_spool_bytes,
+            scan_sample_ms: stages.scan_sample_ms,
+            selected_analysis_ms: stages.selected_analysis_ms,
             report_write: stages.report_write,
+            sampling_peak_buffered_fragments: stages.sampling_peak_buffered_fragments,
             input_fragments: counts.0,
             selected_fragments: counts.1,
             prescreen_passed_fragments: counts.2,

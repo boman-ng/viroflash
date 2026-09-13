@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -128,7 +128,8 @@ fn assert_csv_and_visible_html_share_all_fields(csv: &str, html: &str) {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert_eq!(html_rows, rows);
+    let visible_rows: Vec<_> = rows.iter().take(20).cloned().collect();
+    assert_eq!(html_rows, visible_rows);
     let schema = Selector::parse("meta[name=viroflash-report-schema]").unwrap();
     assert_eq!(
         document
@@ -266,8 +267,9 @@ fn cli_index_and_se_run_produce_three_source_consistent_files() {
     assert_eq!(value("sample_id"), "sample");
     assert_eq!(value("support_fragments"), value("selected_fragments"));
     assert!((1..=20).contains(&value("selected_fragments").parse::<u64>().unwrap()));
-    assert_eq!(value("support_ppm"), "1000000");
+    assert_eq!(value("support_pct"), "100");
     assert_eq!(value("target_support_share_pct"), "100");
+    assert!(value("sampling_target_score").parse::<f64>().unwrap() > 0.99);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -304,14 +306,17 @@ fn report_is_invariant_across_threads_reloads_and_gzip_segmentation() {
     write_gzip_members(&multiple, &[&fastq[..split], &fastq[split..]]);
 
     // Vary workers on identical input, then encoding at a fixed worker count.
-    let mut expected = None;
-    for (case, input, threads) in [
-        ("plain-1", &plain, 1),
-        ("plain-2", &plain, 2),
-        ("plain-4", &plain, 4),
-        ("plain-8", &plain, 8),
-        ("gzip", &single, 4),
-        ("multimember", &multiple, 4),
+    let mut expected = BTreeMap::new();
+    for (case, input, threads, mode) in [
+        ("plain-1", &plain, 1, "full"),
+        ("plain-2", &plain, 2, "full"),
+        ("plain-4", &plain, 4, "full"),
+        ("plain-8", &plain, 8, "full"),
+        ("gzip", &single, 4, "full"),
+        ("multimember", &multiple, 4, "full"),
+        ("screen-1", &plain, 1, "screen"),
+        ("screen-8", &plain, 8, "screen"),
+        ("screen-multimember", &multiple, 4, "screen"),
     ] {
         let output_dir = root.join(case);
         let output = command(&[
@@ -324,6 +329,8 @@ fn report_is_invariant_across_threads_reloads_and_gzip_segmentation() {
             output_dir.to_str().unwrap(),
             "--threads",
             &threads.to_string(),
+            "--mode",
+            mode,
         ]);
         assert!(
             output.status.success(),
@@ -334,10 +341,10 @@ fn report_is_invariant_across_threads_reloads_and_gzip_segmentation() {
             std::fs::read(output_dir.join("report.csv")).unwrap(),
             std::fs::read(output_dir.join("report.html")).unwrap(),
         );
-        if let Some(expected) = &expected {
+        if let Some(expected) = expected.get(mode) {
             assert_eq!(&report, expected, "{case}");
         } else {
-            expected = Some(report);
+            expected.insert(mode, report);
         }
     }
     let _ = std::fs::remove_dir_all(root);
@@ -458,17 +465,17 @@ fn research_report_ranks_groups_and_preserves_indexed_descriptions() {
     assert_eq!(value(0, "support_rank"), "1");
     assert_eq!(value(1, "support_rank"), "2");
     assert_eq!(value(0, "input_fragments"), "11");
-    assert_eq!(value(0, "selected_fragments"), "9");
+    assert_eq!(value(0, "selected_fragments"), "11");
     assert_eq!(value(0, "total_target_support_fragments"), "9");
     assert_eq!(value(0, "supported_reference_groups"), "2");
     assert_eq!(value(0, "target_support_share_pct"), "66.666667");
     assert_eq!(value(1, "target_support_share_pct"), "33.333333");
-    assert_eq!(value(0, "support_ppm"), "545454.545455");
-    // Every candidate was selected: six supports among eleven original fragments.
-    let lower: f64 = value(0, "support_ci_lower_ppm").parse().unwrap();
-    let upper: f64 = value(0, "support_ci_upper_ppm").parse().unwrap();
-    assert!(lower <= 6.0 / 11.0 * 1_000_000.0 && upper >= 6.0 / 11.0 * 1_000_000.0);
-    assert!(upper - lower < 0.00001);
+    assert_eq!(value(0, "support_pct"), "54.5454545455");
+    // Every input fragment was selected: six supports among eleven fragments.
+    let lower: f64 = value(0, "support_ci_lower_pct").parse().unwrap();
+    let upper: f64 = value(0, "support_ci_upper_pct").parse().unwrap();
+    assert!(lower <= 6.0 / 11.0 * 100.0 && upper >= 6.0 / 11.0 * 100.0);
+    assert!(upper - lower < 0.000000001);
     assert!(html.contains("sample_{{RUN_FIELDS}}"));
     assert!(html.contains("{{AUDIT_SIGNALS}}"));
     assert!(!html.contains("<script>window.injected"));
@@ -538,6 +545,58 @@ fn invalid_index_metadata_is_rejected_without_success_reports() {
 }
 
 #[test]
+fn both_modes_keep_the_original_library_denominator() {
+    let (root, target) = build_fixture("library-denominator");
+    // Short target reads remain in the original library denominator.
+    let bytes = [
+        fastq_bytes(&target[..120], 20),
+        fastq_bytes(&target[..21], 400),
+    ]
+    .concat();
+    std::fs::write(root.join("sample.fastq"), bytes).unwrap();
+    for mode in ["full", "screen"] {
+        let output = command(&[
+            "run",
+            "--r1",
+            root.join("sample.fastq").to_str().unwrap(),
+            "--index",
+            root.join("index").to_str().unwrap(),
+            "--out",
+            root.join(mode).to_str().unwrap(),
+            "--mode",
+            mode,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let csv = std::fs::read_to_string(root.join(mode).join("report.csv")).unwrap();
+        let html = std::fs::read_to_string(root.join(mode).join("report.html")).unwrap();
+        assert_csv_and_visible_html_share_all_fields(&csv, &html);
+        let (header, rows) = csv_rows(&csv);
+        let value = |field: &str| rows[0][header.iter().position(|s| s == field).unwrap()].as_str();
+        assert_eq!(rows.len(), 1);
+        let fraction = 20.0 / 420.0;
+        let expected_score = (fraction - 1e-5) / (fraction + 1e-5);
+        assert!(
+            (value("sampling_target_score").parse::<f64>().unwrap() - expected_score).abs() < 1e-12
+        );
+        assert!(value("support_fragments").parse::<u64>().unwrap() > 0);
+        assert_eq!(value("input_fragments"), "420");
+        let expected = 100.0 * 20.0 / 420.0;
+        assert!((value("support_pct").parse::<f64>().unwrap() - expected).abs() < 1e-9);
+        if mode == "screen" {
+            assert_eq!(value("selected_fragments"), "420");
+            assert_eq!(value("support_fragments"), "20");
+            assert!(value("support_ci_lower_pct").parse::<f64>().unwrap() <= expected);
+            assert!(value("support_ci_upper_pct").parse::<f64>().unwrap() >= expected);
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn failed_run_leaves_only_error_perf_json() {
     let (root, _) = build_fixture("failure");
     std::fs::write(root.join("broken.fastq"), b"@broken\nACGT\n+\n").unwrap();
@@ -562,7 +621,7 @@ fn failed_run_leaves_only_error_perf_json() {
 }
 
 #[test]
-fn zero_candidates_report_full_input_prescreen_limitation() {
+fn zero_candidates_keep_sample_counts_and_prescreen_status() {
     let (root, target) = build_fixture("short-reads");
     std::fs::write(root.join("short.fastq"), fastq_bytes(&target[..20], 100)).unwrap();
     let output = command(&[
@@ -597,7 +656,7 @@ fn zero_candidates_report_full_input_prescreen_limitation() {
     assert_eq!(value("total_target_support_fragments"), "0");
     assert_eq!(value("supported_reference_groups"), "0");
     let selected = value("selected_fragments").parse::<u64>().unwrap();
-    assert_eq!(selected, 0);
+    assert_eq!(selected, 100);
     assert!(html.contains("CONFORMANT_WITH_LIMITATIONS"));
     assert!(html.contains("TARGET_KMER_NOT_EVALUABLE_INPUT_FRAGMENTS=100"));
     let _ = std::fs::remove_dir_all(root);

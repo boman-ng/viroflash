@@ -7,7 +7,7 @@ use crate::evidence::{
 };
 use crate::fastq::InputCensus;
 use crate::profile::AnalysisProfile;
-use crate::sampling::SamplingDesign;
+use crate::sampling::{RunMode, SamplingDesign};
 
 pub const REPORT_SCHEMA: &str = "viroflash.evidence-report.v1";
 
@@ -47,6 +47,10 @@ pub struct RunEvidence {
     pub index_digest: String,
     pub input_digest: String,
     pub read_ends_per_fragment: u8,
+    pub mode: &'static str,
+    pub sampling_population_fragments: u64,
+    pub sample_capacity: u64,
+    pub sampling_expected_support: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +79,7 @@ pub struct TargetSignal {
     pub split_events: u64,
     pub discordant_fragments: u64,
     pub limitation_codes: Vec<String>,
+    pub sampling_target_score: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,7 +87,7 @@ pub struct EvidenceReport {
     pub schema_id: &'static str,
     pub run: RunEvidence,
     pub target_signals: Vec<TargetSignal>,
-    pub research_rows: Vec<[String; 23]>,
+    pub research_rows: Vec<[String; 24]>,
 }
 
 pub struct ReportInputs<'a> {
@@ -94,6 +99,7 @@ pub struct ReportInputs<'a> {
     pub profile: AnalysisProfile,
     pub index_digest: String,
     pub unevaluable_fragments: u64,
+    pub mode: RunMode,
 }
 
 pub fn build_evidence_report(
@@ -109,14 +115,14 @@ pub fn build_evidence_report(
         .filter(|evidence| evidence.observed_or_indeterminate())
     {
         let interval = finite_population_interval(
-            inputs.design.candidate_fragments,
+            inputs.design.population_fragments,
             inputs.selected_fragments,
             evidence.supporting_selected_fragments,
             per_group_alpha,
         )?;
         let fraction = evidence.supporting_selected_fragments as f64
             / inputs.selected_fragments as f64
-            * inputs.design.candidate_fragments as f64
+            * inputs.design.population_fragments as f64
             / inputs.census.fragments as f64;
         let covered_bases = evidence.covered_bases();
         target_signals.push(TargetSignal {
@@ -144,6 +150,10 @@ pub fn build_evidence_report(
             split_events: evidence.split_events,
             discordant_fragments: evidence.discordant_fragments,
             limitation_codes: Vec::new(),
+            sampling_target_score: sampling_target_score(
+                fraction,
+                inputs.design.precision.minimum_fraction(),
+            ),
         });
     }
     let reason_codes = (inputs.unevaluable_fragments > 0)
@@ -167,7 +177,7 @@ pub fn build_evidence_report(
         input_fragments: inputs.census.fragments,
         selected_fragments: inputs.selected_fragments,
         precision: inputs.design.precision.as_str(),
-        sampling_population: "bloom_candidates",
+        sampling_population: inputs.mode.population(),
         selection_probability: inputs.design.selection_probability,
         minimum_relevant_fraction: inputs.design.precision.minimum_fraction(),
         familywise_miss_probability: inputs.profile.familywise_miss_probability,
@@ -180,6 +190,17 @@ pub fn build_evidence_report(
         index_digest: inputs.index_digest,
         input_digest: inputs.census.input_digest.clone(),
         read_ends_per_fragment: inputs.census.read_ends_per_fragment,
+        mode: inputs.mode.as_str(),
+        sampling_population_fragments: inputs.design.population_fragments,
+        sample_capacity: inputs.design.sample_capacity,
+        sampling_expected_support: (inputs.selected_fragments > 0
+            && inputs.design.population_fragments > 0)
+            .then(|| {
+                inputs.selected_fragments as f64
+                    * inputs.design.precision.minimum_fraction()
+                    * inputs.census.fragments as f64
+                    / inputs.design.population_fragments as f64
+            }),
     };
     let research_rows =
         build_research_rows(&run, &target_signals, inputs.profile.occupied_window_bins);
@@ -191,21 +212,21 @@ pub fn build_evidence_report(
     })
 }
 
-pub const RESEARCH_HEADER: [&str; 23] = [
+pub const RESEARCH_HEADER: [&str; 24] = [
     "sample_id",
     "reference_description",
     "reference_id",
     "support_rank",
     "support_fragments",
-    "support_ppm",
+    "support_pct",
     "target_support_share_pct",
     "coverage_pct",
     "covered_bp",
     "reference_length_bp",
     "occupied_windows",
     "window_count",
-    "support_ci_lower_ppm",
-    "support_ci_upper_ppm",
+    "support_ci_lower_pct",
+    "support_ci_upper_pct",
     "split_support_fragments",
     "discordant_fragments",
     "reference_member_count",
@@ -215,23 +236,24 @@ pub const RESEARCH_HEADER: [&str; 23] = [
     "selected_fragments",
     "total_target_support_fragments",
     "supported_reference_groups",
+    "sampling_target_score",
 ];
 
-const RESEARCH_LABELS: [&str; 23] = [
+const RESEARCH_LABELS: [&str; 24] = [
     "Sample ID",
     "Reference description",
     "Reference accession",
     "Support rank",
     "Supporting fragments",
-    "Library abundance · ppm",
+    "Library abundance · %",
     "Target share · %",
     "Coverage breadth · %",
     "Covered bases · bp",
     "Reference length · bp",
     "Occupied windows",
     "Total windows",
-    "Interval lower bound · ppm",
-    "Interval upper bound · ppm",
+    "Interval lower bound · %",
+    "Interval upper bound · %",
     "Split-support fragments",
     "Discordant fragments",
     "Equivalent reference count",
@@ -241,13 +263,14 @@ const RESEARCH_LABELS: [&str; 23] = [
     "Selected fragments",
     "Total target-support fragments",
     "Supported reference groups",
+    "Target score",
 ];
 
 fn build_research_rows(
     run: &RunEvidence,
     signals: &[TargetSignal],
     windows: usize,
-) -> Vec<[String; 23]> {
+) -> Vec<[String; 24]> {
     let mut supported = signals
         .iter()
         .filter(|signal| signal.supporting_selected_fragments > 0)
@@ -284,7 +307,7 @@ fn build_research_rows(
             row[2] = signal.representative_id.clone();
             row[3] = (rank + 1).to_string();
             row[4] = signal.supporting_selected_fragments.to_string();
-            row[5] = research_decimal(signal.attributed_fragment_fraction * 1_000_000.0);
+            row[5] = research_decimal_precise(signal.attributed_fragment_fraction * 100.0);
             row[6] = research_decimal(
                 signal.supporting_selected_fragments as f64 / total as f64 * 100.0,
             );
@@ -293,12 +316,13 @@ fn build_research_rows(
             row[9] = signal.representative_length.to_string();
             row[10] = signal.occupied_windows.to_string();
             row[11] = windows.to_string();
-            row[12] = interval_ppm(signal.interval_lower, false);
-            row[13] = interval_ppm(signal.interval_upper, true);
+            row[12] = interval_pct(signal.interval_lower, false);
+            row[13] = interval_pct(signal.interval_upper, true);
             row[14] = signal.split_events.to_string();
             row[15] = signal.discordant_fragments.to_string();
             row[16] = signal.member_ids.len().to_string();
             row[17] = signal.member_ids.join(";");
+            row[23] = signal.sampling_target_score.to_string();
             row
         })
         .collect()
@@ -311,8 +335,15 @@ fn research_decimal(value: f64) -> String {
         .to_string()
 }
 
-fn interval_ppm(fraction: f64, upper: bool) -> String {
-    // One displayed unit is 1e-6 ppm. Include floating-point multiplication error
+fn research_decimal_precise(value: f64) -> String {
+    format!("{value:.10}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn interval_pct(fraction: f64, upper: bool) -> String {
+    // One displayed unit is 1e-10 percent. Include multiplication error
     // before rounding outward so formatting cannot narrow the original interval.
     let scaled = fraction * 1_000_000_000_000.0;
     let units = if upper {
@@ -320,7 +351,7 @@ fn interval_ppm(fraction: f64, upper: bool) -> String {
     } else {
         scaled.next_down().floor()
     };
-    research_decimal(units.clamp(0.0, 1_000_000_000_000.0) / 1_000_000.0)
+    research_decimal_precise(units.clamp(0.0, 1_000_000_000_000.0) / 10_000_000_000.0)
 }
 
 fn csv_text(report: &EvidenceReport) -> String {
@@ -352,28 +383,40 @@ fn csv_data_uri(report: &EvidenceReport) -> String {
 
 pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), String> {
     let rows = &report.research_rows;
-    let count = rows.iter().filter(|row| !row[2].is_empty()).count();
+    let visible = |row: &&[String; 24]| !row[2].is_empty();
+    let count = rows.iter().filter(visible).take(20).count();
+    let all_count = rows.iter().filter(|row| !row[2].is_empty()).count();
     let total: u64 = report
         .target_signals
         .iter()
         .map(|s| s.supporting_selected_fragments)
         .sum();
     let mut result_list = String::new();
-    for row in rows.iter().filter(|row| !row[2].is_empty()) {
+    for row in rows.iter().filter(visible).take(20) {
         result_list.push_str(&research_html(row));
     }
     if count == 0 {
-        let explanation = if report.run.prescreen_passed_fragments == 0 {
-            "No input fragments passed the target prescreen."
-        } else if report.run.selected_fragments == 0 {
-            "No candidate fragments were selected by this sampling design."
+        let explanation = if report.run.selected_fragments == 0 {
+            "No target candidates were retained."
+        } else if report.run.prescreen_passed_fragments == 0 {
+            "No screened fragments passed the target Bloom filter."
         } else {
-            "No sampled candidate fragments were attributed to a target reference group."
+            "No selected fragments were attributed to a target reference group."
         };
-        result_list = format!("<div class=\"empty-state\"><h3>No attributed reference signals</h3><p>{explanation}</p>{}</div>", research_field_list(&rows[0]));
+        let sample_fields = if all_count == 0 {
+            research_field_list(&rows[0])
+        } else {
+            String::new()
+        };
+        result_list = format!("<div class=\"empty-state\"><h3>No attributed target signals</h3><p>{explanation}</p>{sample_fields}</div>");
     }
     let mut audit = String::new();
-    for signal in &report.target_signals {
+    for signal in report.target_signals.iter().filter(|s| {
+        rows.iter()
+            .filter(|row| !row[2].is_empty())
+            .take(20)
+            .any(|row| row[2] == s.representative_id)
+    }) {
         audit.push_str(&format!(
             "<section class=\"target-signal\" data-group=\"{}\"><h4>{}</h4><table><tbody>{}</tbody></table></section>",
             html(&signal.target_group_id), html(&signal.representative_id),
@@ -390,6 +433,13 @@ pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), Str
         ("SELECTED_COUNT", report.run.selected_fragments.to_string()),
         ("TOTAL_SUPPORT", total.to_string()),
         ("GROUP_COUNT", count.to_string()),
+        ("ALL_GROUP_COUNT", all_count.to_string()),
+        ("SAMPLED_LABEL", if report.run.mode == "full" { "Sampled candidates" } else { "Sampled input fragments" }.into()),
+        ("METHOD", if report.run.mode == "full" {
+            "All input fragments undergo a target 21-mer Bloom prescreen. Candidate fragments are selected by deterministic bottom-k sampling before HOST+TARGET competitive alignment."
+        } else {
+            "Input fragments are selected by deterministic bottom-k sampling before the target 21-mer Bloom prescreen and HOST+TARGET competitive alignment."
+        }.into()),
         ("RESULT_LIST", result_list),
         ("RUN_FIELDS", visible_field_rows(&run_fields(report))),
         ("AUDIT_SIGNALS", audit),
@@ -411,7 +461,7 @@ pub fn write_report_html(path: &Path, report: &EvidenceReport) -> Result<(), Str
     atomic_write(path, document.as_bytes())
 }
 
-fn research_field_list(row: &[String; 23]) -> String {
+fn research_field_list(row: &[String; 24]) -> String {
     let mut fields = String::from("<dl class=\"research-fields\" data-research-row>");
     for ((key, label), value) in RESEARCH_HEADER.iter().zip(RESEARCH_LABELS).zip(row) {
         fields.push_str(&format!(
@@ -423,29 +473,33 @@ fn research_field_list(row: &[String; 23]) -> String {
     fields
 }
 
-fn research_html(row: &[String; 23]) -> String {
+fn research_html(row: &[String; 24]) -> String {
     let title = if row[1].is_empty() { &row[2] } else { &row[1] };
     format!(
         r#"<details class="signal">
 <summary><span class="rank"><span class="sr-only">Rank </span>{rank}</span>
 <span class="reference"><span class="reference-name">{title}</span><span class="accession">{reference}</span></span>
 <span class="metric"><span class="mobile-label">Fragments</span><strong>{support}</strong></span>
-<span class="metric"><span class="mobile-label">Library interval · ppm</span><strong class="abundance-interval">{lower} – {upper}</strong><span class="point-estimate">Estimate {ppm}</span></span>
+<span class="metric"><span class="mobile-label">Library interval · %</span><strong class="abundance-interval">[{lower}%, {upper}%]</strong><span class="point-estimate">Estimate {pct}%</span></span>
 <span class="metric coverage"><span class="mobile-label">Coverage</span><strong>{coverage}%</strong><span class="coverage-track" aria-hidden="true"><span style="width:{coverage}%"></span></span></span>
-<span class="metric"><span class="mobile-label">Target share</span><strong>{share}%</strong></span>
+<span class="metric target-score"><span class="mobile-label">Target score</span><strong>{score:+.6}</strong></span>
 <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></summary>
 <div class="signal-detail"><h3>Research data <span>{reference}</span></h3>{fields}</div></details>"#,
         rank = html(&row[3]),
         title = html(title),
         reference = html(&row[2]),
         support = html(&row[4]),
-        ppm = html(&row[5]),
+        pct = html(&row[5]),
         lower = html(&row[12]),
         upper = html(&row[13]),
         coverage = html(&row[7]),
-        share = html(&row[6]),
+        score = row[23].parse::<f64>().unwrap(),
         fields = research_field_list(row)
     )
+}
+
+fn sampling_target_score(fraction: f64, target: f64) -> f64 {
+    (fraction - target) / (fraction + target)
 }
 
 fn run_fields(report: &EvidenceReport) -> Vec<(&'static str, String)> {
@@ -460,6 +514,18 @@ fn run_fields(report: &EvidenceReport) -> Vec<(&'static str, String)> {
         ("input_fragments", run.input_fragments.to_string()),
         ("selected_fragments", run.selected_fragments.to_string()),
         ("precision", run.precision.into()),
+        ("mode", run.mode.into()),
+        ("sample_capacity", run.sample_capacity.to_string()),
+        (
+            "sampling_population_fragments",
+            run.sampling_population_fragments.to_string(),
+        ),
+        (
+            "sampling_expected_support",
+            run.sampling_expected_support
+                .map(format_float)
+                .unwrap_or_default(),
+        ),
         ("sampling_population", run.sampling_population.into()),
         (
             "selection_probability",
@@ -548,6 +614,10 @@ fn target_fields(signal: &TargetSignal) -> Vec<(&'static str, String)> {
             signal.discordant_fragments.to_string(),
         ),
         ("limitation_codes", signal.limitation_codes.join(";")),
+        (
+            "sampling_target_score",
+            signal.sampling_target_score.to_string(),
+        ),
     ]
 }
 
@@ -622,15 +692,16 @@ mod tests {
                     census: &census,
                     design: SamplingDesign {
                         precision: Precision::Standard,
-                        candidate_fragments: 1_000,
+                        population_fragments: 1_000,
                         selection_probability: 0.1,
-                        minimum_relevant_fragments: 1,
+                        sample_capacity: selected,
                     },
                     selected_fragments: selected,
                     prescreen_passed_fragments: 1_000,
                     profile: AnalysisProfile::FROZEN,
                     index_digest: "index".into(),
                     unevaluable_fragments: 0,
+                    mode: RunMode::Full,
                 },
                 accumulator,
             )
@@ -649,11 +720,109 @@ mod tests {
             signal.interval_upper,
             interval.upper_count as f64 / 10_000.0
         );
-        assert_eq!(report.research_rows[0][5], "10000");
+        assert_eq!(report.research_rows[0][5], "1");
         let empty = build(0, 0);
         assert!(empty.target_signals.is_empty());
         assert_eq!(empty.research_rows.len(), 1);
         assert!(empty.research_rows[0][12].is_empty());
+    }
+
+    #[test]
+    fn target_score_tracks_library_target_in_both_populations() {
+        let delta = 1e-5;
+        assert_eq!(sampling_target_score(0.0, delta), -1.0);
+        assert_eq!(sampling_target_score(delta, delta), 0.0);
+        for ratio in [0.5, 2.0, 10.0] {
+            let actual = sampling_target_score(delta * ratio, delta);
+            assert!((actual - (ratio - 1.0) / (ratio + 1.0)).abs() < 1e-15);
+        }
+        let mut previous = -1.0;
+        for x in 1..100 {
+            let score = sampling_target_score(x as f64 / 1_000_000.0, delta);
+            assert!(score > previous && score < 1.0);
+            previous = score;
+        }
+        let screen = sampling_target_score(20.0 / 1_000_000.0, delta);
+        let full = sampling_target_score(
+            (1_000_000.0 / 100_000_000.0) * (2000.0 / 1_000_000.0),
+            delta,
+        );
+        assert!((screen - full).abs() < 1e-15);
+    }
+
+    #[test]
+    fn top_twenty_includes_negative_scores_and_embeds_every_csv_row() {
+        use crate::index::reference::{build_reference_groups, FastaRecord};
+        use crate::sampling::Precision;
+        use scraper::{Html, Selector};
+        let groups = build_reference_groups(
+            &(0..25)
+                .map(|i| FastaRecord {
+                    id: format!("virus-{i}"),
+                    description: format!("Reference {i}"),
+                    sequence: b"ACGT".repeat(100 + i),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let census = InputCensus {
+            input_mode: "SE",
+            fragments: 100_000_000,
+            input_digest: "input".into(),
+            read_ends_per_fragment: 1,
+        };
+        let mut accumulator = EvidenceAccumulator::new(&groups);
+        for (i, group) in accumulator.groups.iter_mut().enumerate() {
+            group.supporting_selected_fragments = (i + 1) as u64;
+        }
+        let report = build_evidence_report(
+            ReportInputs {
+                sample_id: "top20".into(),
+                census: &census,
+                design: SamplingDesign {
+                    precision: Precision::Standard,
+                    population_fragments: census.fragments,
+                    selection_probability: 0.01,
+                    sample_capacity: 1_000_000,
+                },
+                selected_fragments: 1_000_000,
+                prescreen_passed_fragments: 325,
+                profile: AnalysisProfile::FROZEN,
+                index_digest: "index".into(),
+                unevaluable_fragments: 0,
+                mode: RunMode::Screen,
+            },
+            accumulator,
+        )
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("viroflash-top20-{}.html", std::process::id()));
+        write_report_html(&path, &report).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let html = Html::parse_document(&text);
+        assert_eq!(report.research_rows.len(), 25);
+        let rows = html
+            .select(&Selector::parse("dl[data-research-row]").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 20);
+        for (actual, expected) in rows.iter().zip(report.research_rows.iter()) {
+            let values = actual
+                .select(&Selector::parse("dd[data-field]").unwrap())
+                .map(|v| v.text().collect::<String>())
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected.as_slice());
+        }
+        assert!(report.research_rows[..20]
+            .iter()
+            .any(|r| r[23].parse::<f64>().unwrap() < 0.0));
+        let href = html
+            .select(&Selector::parse("a[download]").unwrap())
+            .next()
+            .unwrap()
+            .value()
+            .attr("href")
+            .unwrap();
+        assert_eq!(href, csv_data_uri(&report));
     }
 
     #[test]
@@ -669,8 +838,8 @@ mod tests {
             1.0,
         ] {
             for fraction in [value.next_down().max(0.0), value, value.next_up().min(1.0)] {
-                let lower = interval_ppm(fraction, false).parse::<f64>().unwrap() / 1_000_000.0;
-                let upper = interval_ppm(fraction, true).parse::<f64>().unwrap() / 1_000_000.0;
+                let lower = interval_pct(fraction, false).parse::<f64>().unwrap() / 100.0;
+                let upper = interval_pct(fraction, true).parse::<f64>().unwrap() / 100.0;
                 assert!(
                     lower <= fraction && fraction <= upper,
                     "{lower} <= {fraction} <= {upper}"
