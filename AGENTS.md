@@ -14,6 +14,7 @@ Viroflash is a Rust CLI for panel-based viral screening. Users install a prebuil
 
 - One SE read or PE pair is one fragment. Selection and attribution agree across thread counts and FASTQ compression formats.
 - Screen is the default: sample input, Bloom, align. Full: Bloom all input, sample candidates, align. Both use the same precision-derived capacity and one global reservoir, without candidate files.
+- Both modes release Bloom before loading the shared competitive mapping index. Selected batches transfer ownership without copying sequences.
 - Precision fast/standard/sensitive sets 100/10/1 ppm. Full's analyzed fragment set contains screen's for matching input, index and precision.
 - Each fragment supports at most one exact reference group. HOST is the sole background competitor. Coordinates are 0-based and half-open.
 - Library abundance and intervals use original input fragments; target share uses all attributed target fragments. Keep exact sampling intervals and outward rounding.

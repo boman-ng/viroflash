@@ -118,3 +118,85 @@ fn host_target_alternatives_without_supplementary_geometry_are_not_split() {
             .is_empty()
     );
 }
+
+mod chain_gate {
+    use super::*;
+    use crate::gate::{GateEvaluation, GateScratch};
+    use crate::index::{build_index, IndexOptions};
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn pseudo_random_sequence(length: usize, mut state: u64) -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state as usize) & 3]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn emitted_target_mappings_satisfy_the_short_read_chain_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "viroflash-chain-gate-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let host = pseudo_random_sequence(8_192, 11);
+        let target = pseudo_random_sequence(8_192, 29);
+        for (name, sequence) in [("host", &host), ("target", &target)] {
+            let mut file = File::create(root.join(format!("{name}.fa"))).unwrap();
+            writeln!(file, ">{name}\n{}", String::from_utf8_lossy(sequence)).unwrap();
+        }
+        let index = build_index(&IndexOptions {
+            host_fa: root.join("host.fa"),
+            target_fa: root.join("target.fa"),
+            out_dir: root.join("index"),
+            threads: 1,
+        })
+        .unwrap();
+        let aligner = CompetitiveAligner::open(&index.mmi_path).unwrap();
+        let (minimum_hits, minimum_covered_bases) =
+            CompetitiveAligner::short_read_chain_requirements(21).unwrap();
+        assert_eq!((minimum_hits, minimum_covered_bases), (2, 25));
+
+        let mut mapped_reads = 0;
+        let mut gate_scratch = GateScratch::default();
+        for (number, start) in (0..target.len() - 150).step_by(257).enumerate() {
+            let read = target[start..start + 150].to_vec();
+            let mappings = aligner
+                .aligner
+                .map(
+                    &read,
+                    false,
+                    false,
+                    None,
+                    None,
+                    Some(format!("target-read-{number}").as_bytes()),
+                )
+                .unwrap();
+            if hits_of(&mappings, &index.contigs)
+                .iter()
+                .any(|hit| hit.role == ReferenceRole::Target)
+            {
+                mapped_reads += 1;
+                assert_eq!(
+                    index.bloom.evaluate_fragment(
+                        &read,
+                        None,
+                        minimum_hits,
+                        minimum_covered_bases,
+                        &mut gate_scratch,
+                    ),
+                    GateEvaluation::Pass
+                );
+            }
+        }
+        assert!(mapped_reads > 20);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

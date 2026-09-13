@@ -75,11 +75,13 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
             },
         )?;
         drop(reader);
+        drop(index.bloom);
         stages.scan_sample_ms = started.elapsed().as_millis() as u64;
         stages.sampling_peak_buffered_fragments = sampled.selected_fragments;
         let census = sampled.input;
         counts.0 = census.fragments;
         counts.1 = sampled.selected_fragments;
+        counts.2 = sampled.passed_fragments;
         unevaluable_fragments = sampled.unevaluable;
         let design = SamplingDesign {
             precision: options.precision,
@@ -93,31 +95,15 @@ pub fn run_pipeline(options: &RunOptions) -> Result<RunSummary, String> {
         };
         let mut accumulator = EvidenceAccumulator::new(&index.target_groups);
         let started = Instant::now();
-        let bloom = if options.mode == RunMode::Screen {
-            Some(index.bloom)
-        } else {
-            drop(index.bloom);
-            None
-        };
-        let analyzed = align_fragments_bounded(
+        align_fragments_bounded(
             AnalysisWorkerConfig {
                 index_path: &index.mmi_path,
                 contigs: &index.contigs,
                 threads: options.threads,
-                bloom: bloom.as_ref(),
-                minimum_hits,
-                minimum_covered_bases,
             },
-            || Ok(sampled.selected.next_batch()),
+            || Ok(sampled.selected.pop_front()),
             |evidence| accumulator.accumulate_group_evidence(evidence),
         )?;
-        drop(bloom);
-        unevaluable_fragments += analyzed.unevaluable_fragments;
-        counts.2 = if options.mode == RunMode::Full {
-            sampled.population_fragments
-        } else {
-            analyzed.passed_fragments
-        };
         counts.3 = accumulator.aligned_fragments;
         stages.selected_analysis_ms = started.elapsed().as_millis() as u64;
         let started = Instant::now();

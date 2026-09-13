@@ -1,6 +1,6 @@
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 
-use crate::fastq::{Fragment, FragmentBatch, FASTQ_BATCH_RECORDS};
+use crate::fastq::{Fragment, FASTQ_BATCH_RECORDS};
 use crate::profile::AnalysisProfile;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -213,28 +213,35 @@ impl BottomKSampler {
     pub fn len(&self) -> usize {
         self.heap.len()
     }
-    pub fn finish(self) -> SelectedFragments {
+    pub fn finish(self) -> VecDeque<SelectedBatch> {
         drop(self.heap);
         let mut retained = self.fragments;
         retained.sort_unstable_by_key(|f| f.ordinal);
-        SelectedFragments {
-            fragments: retained.into_iter(),
-            paired: self.paired,
-        }
+        let mut fragments = retained.into_iter();
+        std::iter::from_fn(|| {
+            let batch = SelectedBatch {
+                fragments: fragments.by_ref().take(FASTQ_BATCH_RECORDS).collect(),
+                paired: self.paired,
+            };
+            (!batch.fragments.is_empty()).then_some(batch)
+        })
+        .collect()
     }
 }
 
-pub(crate) struct SelectedFragments {
-    fragments: std::vec::IntoIter<StoredFragment>,
+pub(crate) struct SelectedBatch {
+    fragments: Vec<StoredFragment>,
     paired: bool,
 }
-impl SelectedFragments {
-    pub fn next_batch(&mut self) -> Option<FragmentBatch> {
-        let mut batch = FragmentBatch::new(self.paired);
-        for f in self.fragments.by_ref().take(FASTQ_BATCH_RECORDS) {
-            batch.push(f.fragment(self.paired));
-        }
-        (batch.len() > 0).then_some(batch)
+impl SelectedBatch {
+    pub fn len(&self) -> usize {
+        self.fragments.len()
+    }
+    pub fn fragments(&self) -> impl Iterator<Item = Fragment<'_>> {
+        self.fragments.iter().map(|f| f.fragment(self.paired))
+    }
+    pub fn retain(&mut self, mut keep: impl FnMut(Fragment<'_>) -> bool) {
+        self.fragments.retain(|f| keep(f.fragment(self.paired)));
     }
 }
 
@@ -287,9 +294,8 @@ mod tests {
         }
         let mut result = BTreeSet::new();
         let mut sample = sampler.finish();
-        while let Some(batch) = sample.next_batch() {
+        while let Some(batch) = sample.pop_front() {
             for f in batch.fragments() {
-                let f = f.unwrap();
                 assert_eq!(f.id, format!("pair-{}", f.ordinal % 7));
                 assert_eq!(f.r1, &b"ACGTN"[..f.ordinal as usize % 6]);
                 assert_eq!(f.r2, Some(&b"TGCA"[..f.ordinal as usize % 5]));

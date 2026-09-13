@@ -1,7 +1,9 @@
 //! One-pass input census and an in-memory bottom-k sample.
-use crate::fastq::{FragmentBatch, FragmentReader, InputCensus};
+use std::collections::VecDeque;
+
+use crate::fastq::{Fragment, FragmentBatch, FragmentReader, InputCensus};
 use crate::gate::{GateEvaluation, GateScratch, TargetKmerBloom};
-use crate::sampling::{BottomKSampler, FragmentKeys, RunMode, SelectedFragments};
+use crate::sampling::{BottomKSampler, FragmentKeys, RunMode, SelectedBatch};
 use crate::workers::process_batches_bounded;
 
 pub(crate) struct SamplingConfig<'a> {
@@ -17,7 +19,8 @@ pub(crate) struct SamplingConfig<'a> {
 
 pub(crate) struct SampledInput {
     pub input: InputCensus,
-    pub selected: SelectedFragments,
+    pub selected: VecDeque<SelectedBatch>,
+    pub passed_fragments: u64,
     pub population_fragments: u64,
     pub selected_fragments: u64,
     pub unevaluable: u64,
@@ -49,20 +52,7 @@ pub(crate) fn sample_input(
                 for fragment in batch.fragments() {
                     let f = fragment?;
                     let retained = if config.mode == RunMode::Full {
-                        match config.bloom.evaluate_fragment(
-                            f.r1,
-                            f.r2,
-                            config.minimum_hits,
-                            config.minimum_covered_bases,
-                            &mut scratch,
-                        ) {
-                            GateEvaluation::Pass => true,
-                            GateEvaluation::Negative => false,
-                            GateEvaluation::NotEvaluable => {
-                                unevaluable += 1;
-                                false
-                            }
-                        }
+                        config.passes(f, &mut scratch, &mut unevaluable)
                     } else {
                         true
                     };
@@ -87,13 +77,41 @@ pub(crate) fn sample_input(
             }
             Ok(())
         },
-        #[cfg(test)]
-        |_| {},
     )?;
     if input == 0 {
         return Err("FASTQ contains no fragments".into());
     }
     let selected_fragments = sampler.len() as u64;
+    let mut selected = sampler.finish();
+    let passed_fragments = if config.mode == RunMode::Screen {
+        let mut passing = VecDeque::new();
+        let mut passed = 0;
+        process_batches_bounded(
+            config.threads,
+            &mut || Ok(selected.pop_front()),
+            || {
+                let config = &config;
+                let mut scratch = GateScratch::default();
+                move |mut batch: SelectedBatch| {
+                    let mut unevaluable = 0;
+                    batch.retain(|f| config.passes(f, &mut scratch, &mut unevaluable));
+                    Ok((batch, unevaluable))
+                }
+            },
+            &mut |(batch, count): (SelectedBatch, u64)| {
+                unevaluable += count;
+                passed += batch.len() as u64;
+                if batch.len() > 0 {
+                    passing.push_back(batch);
+                }
+                Ok(())
+            },
+        )?;
+        selected = passing;
+        passed
+    } else {
+        population
+    };
     Ok(SampledInput {
         input: InputCensus {
             input_mode: if config.paired { "PE" } else { "SE" },
@@ -101,11 +119,31 @@ pub(crate) fn sample_input(
             input_digest: reader.input_digest()?,
             read_ends_per_fragment: if config.paired { 2 } else { 1 },
         },
-        selected: sampler.finish(),
+        selected,
+        passed_fragments,
         population_fragments: population,
         selected_fragments,
         unevaluable,
     })
+}
+
+impl SamplingConfig<'_> {
+    fn passes(&self, f: Fragment<'_>, scratch: &mut GateScratch, unevaluable: &mut u64) -> bool {
+        match self.bloom.evaluate_fragment(
+            f.r1,
+            f.r2,
+            self.minimum_hits,
+            self.minimum_covered_bases,
+            scratch,
+        ) {
+            GateEvaluation::Pass => true,
+            GateEvaluation::Negative => false,
+            GateEvaluation::NotEvaluable => {
+                *unevaluable += 1;
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,9 +224,8 @@ mod tests {
                 let mut selected = Vec::new();
                 let mut passing = BTreeSet::new();
                 let mut scratch = GateScratch::default();
-                while let Some(batch) = result.selected.next_batch() {
+                while let Some(batch) = result.selected.pop_front() {
                     for f in batch.fragments() {
-                        let f = f.unwrap();
                         let sequence = if f.ordinal % 7 == 0 {
                             &target[..120]
                         } else {
@@ -209,6 +246,16 @@ mod tests {
                         }
                     }
                 }
+                assert_eq!(selected.len(), passing.len());
+                assert_eq!(
+                    result.passed_fragments,
+                    if mode == RunMode::Full {
+                        429
+                    } else {
+                        passing.len() as u64
+                    }
+                );
+                selected.sort_unstable();
                 if let Some((previous_selected, previous_passing)) = &expected {
                     assert_eq!(&selected, previous_selected);
                     assert_eq!(&passing, previous_passing);

@@ -56,22 +56,6 @@ pub(crate) struct FragmentBatch {
 }
 
 impl FragmentBatch {
-    pub fn new(paired: bool) -> Self {
-        Self {
-            ordinals: Vec::new(),
-            r1: FastqBatch::default(),
-            r2: paired.then(FastqBatch::default),
-        }
-    }
-
-    pub fn push(&mut self, fragment: Fragment<'_>) {
-        self.ordinals.push(fragment.ordinal);
-        self.r1.push(fragment.id, fragment.r1);
-        if let Some(right) = &mut self.r2 {
-            right.push(fragment.id, fragment.r2.expect("paired candidate"));
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.r1.records.len()
     }
@@ -98,45 +82,6 @@ impl FragmentBatch {
                 r2: right.map(|(_, sequence)| sequence),
             })
         })
-    }
-
-    #[cfg(test)]
-    pub fn sequence_bytes(&self) -> usize {
-        self.r1.sequences.len() + self.r2.as_ref().map_or(0, |batch| batch.sequences.len())
-    }
-
-    #[cfg(test)]
-    pub fn maximum_fragment_bytes(&self) -> usize {
-        self.r1
-            .records
-            .iter()
-            .enumerate()
-            .map(|(offset, record)| {
-                record.sequence.len()
-                    + self
-                        .r2
-                        .as_ref()
-                        .map_or(0, |batch| batch.records[offset].sequence.len())
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    pub fn from_fragments(fragments: &[Fragment<'_>]) -> Self {
-        let mut r1 = FastqBatch::default();
-        let mut r2 = fragments[0].r2.map(|_| FastqBatch::default());
-        for fragment in fragments {
-            r1.push(fragment.id, fragment.r1);
-            if let Some(batch) = &mut r2 {
-                batch.push(fragment.id, fragment.r2.unwrap());
-            }
-        }
-        Self {
-            ordinals: fragments.iter().map(|fragment| fragment.ordinal).collect(),
-            r1,
-            r2,
-        }
     }
 }
 

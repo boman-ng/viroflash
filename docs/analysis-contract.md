@@ -24,7 +24,7 @@ The implementation rounds conservatively and verifies the miss-probability bound
 
 BLAKE3 priorities use profile/index identity, normalized fragment ID and original ordinal. The ordinal also breaks hash ties. Selection is independent of worker completion order and FASTQ compression. Under the ideal uniform-priority model conditioned on distinct keys, bottom-k is a simple random sample without replacement. The zero-hit bound and a union bound over the reference family control sampling loss for sufficiently abundant detectable signals. The design protects relative abundance, not a fixed absolute copy count.
 
-Readers prefetch bounded batches. Workers calculate keys and, in full mode, evaluate Bloom. A single global reservoir retains selected sequences without quality strings. Analysis starts after selection is final. No candidate files are written.
+Readers prefetch bounded batches. Workers calculate keys and, in full mode, evaluate Bloom. A single global reservoir retains selected sequences without quality strings. Screen applies Bloom to its finalized sample. Both modes release Bloom before loading the shared mapping index and transfer selected batches without copying sequences. No candidate files are written.
 
 ## Abundance and target score
 
@@ -49,6 +49,6 @@ The score is negative below the target, zero at the target and positive above it
 
 Successful runs write `report.csv`, `report.html` and `perf.json` atomically. CSV has 24 ordered fields with BOM and CRLF, sorted by support count then reference ID. HTML displays the top 20 supported groups and embeds the complete CSV. Percentages use original input fragments; target share uses all attributed target fragments.
 
-Run information records the mode, precision, sample capacity, population size, actual selection fraction and expected support at the target. Performance records index loading, scan/sample, selected-analysis and report-writing times, CPU time, peak memory, storage I/O and peak reservoir size.
+Run information records the mode, precision, sample capacity, population size, actual selection fraction and expected support at the target. Performance records index loading, scan/sample, selected-analysis and report-writing times, CPU time, peak memory, storage I/O and peak reservoir size. Scan/sample includes input, sampling and Bloom in both modes; selected-analysis includes mapper loading and competitive alignment.
 
 The embedded base profile bytes define index identity. Runtime mode, precision and sample population are recorded separately. Production and tests use Rust and the existing dependencies.

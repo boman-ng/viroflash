@@ -1,70 +1,21 @@
-use crate::fastq::FragmentBatch;
-#[cfg(test)]
-use crate::fastq::FASTQ_BATCH_RECORDS;
 use std::sync::mpsc::sync_channel;
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AlignmentRetention {
-    pub pending_fragments: usize,
-    pub pending_sequence_bytes: usize,
-    pub maximum_pending_fragments: usize,
-    pub maximum_pending_sequence_bytes: usize,
-    pub maximum_fragment_bytes: usize,
-    pub total_sequence_bytes: usize,
-}
-
-#[cfg(test)]
-impl AlignmentRetention {
-    fn claim(
-        &mut self,
-        fragment_count: usize,
-        sequence_bytes: usize,
-        maximum_fragment_bytes: usize,
-        threads: usize,
-    ) {
-        self.pending_fragments += fragment_count;
-        self.pending_sequence_bytes += sequence_bytes;
-        self.maximum_pending_fragments = self.maximum_pending_fragments.max(self.pending_fragments);
-        self.maximum_pending_sequence_bytes = self
-            .maximum_pending_sequence_bytes
-            .max(self.pending_sequence_bytes);
-        self.maximum_fragment_bytes = self.maximum_fragment_bytes.max(maximum_fragment_bytes);
-        self.total_sequence_bytes += sequence_bytes;
-        let maximum_pending_fragments = (threads + 1).saturating_mul(FASTQ_BATCH_RECORDS);
-        assert!(self.pending_fragments <= maximum_pending_fragments);
-        assert!(
-            self.pending_sequence_bytes
-                <= maximum_pending_fragments.saturating_mul(self.maximum_fragment_bytes)
-        );
-    }
-
-    fn release(&mut self, fragment_count: usize, sequence_bytes: usize) {
-        self.pending_fragments -= fragment_count;
-        self.pending_sequence_bytes -= sequence_bytes;
-    }
-}
 
 struct CompletedBatch<R> {
     worker_index: usize,
-    #[cfg(test)]
-    fragment_count: usize,
-    #[cfg(test)]
-    sequence_bytes: usize,
     result: Result<R, String>,
 }
 
-pub(crate) fn process_batches_bounded<N, F, W, S, R>(
+pub(crate) fn process_batches_bounded<B, N, F, W, S, R>(
     threads: usize,
     next_batch: &mut N,
     make_worker: F,
     sink: &mut S,
-    #[cfg(test)] mut observe_retention: impl FnMut(AlignmentRetention),
 ) -> Result<(), String>
 where
-    N: FnMut() -> Result<Option<FragmentBatch>, String>,
+    B: Send,
+    N: FnMut() -> Result<Option<B>, String>,
     F: Fn() -> W,
-    W: FnMut(FragmentBatch) -> Result<R, String> + Send,
+    W: FnMut(B) -> Result<R, String> + Send,
     S: FnMut(R) -> Result<(), String>,
     R: Send,
 {
@@ -74,17 +25,13 @@ where
         let mut handles = Vec::new();
         let mut task_senders = Vec::with_capacity(threads);
         for worker_index in 0..threads {
-            let (task_sender, task_receiver) = sync_channel::<FragmentBatch>(1);
+            let (task_sender, task_receiver) = sync_channel::<B>(1);
             task_senders.push(task_sender);
             let mut process = make_worker();
             let result_sender = result_sender.clone();
             handles.push(scope.spawn(move || loop {
                 let task = task_receiver.recv();
                 let Ok(batch) = task else { break };
-                #[cfg(test)]
-                let fragment_count = batch.len();
-                #[cfg(test)]
-                let sequence_bytes = batch.sequence_bytes();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(batch)));
                 let panicked = result.is_err();
@@ -92,10 +39,6 @@ where
                 if result_sender
                     .send(CompletedBatch {
                         worker_index,
-                        #[cfg(test)]
-                        fragment_count,
-                        #[cfg(test)]
-                        sequence_bytes,
                         result,
                     })
                     .is_err()
@@ -109,21 +52,11 @@ where
         }
         drop(result_sender);
         let processing = (|| -> Result<(), String> {
-            #[cfg(test)]
-            let mut retention = AlignmentRetention::default();
-
             let mut active = 0;
             for sender in &task_senders {
                 let Some(batch) = next_batch()? else {
                     break;
                 };
-                #[cfg(test)]
-                {
-                    let sequence_bytes = batch.sequence_bytes();
-                    let maximum_fragment_bytes = batch.maximum_fragment_bytes();
-                    retention.claim(batch.len(), sequence_bytes, maximum_fragment_bytes, threads);
-                    observe_retention(retention);
-                }
                 sender
                     .send(batch)
                     .map_err(|_| "Batch worker queue closed".to_string())?;
@@ -136,34 +69,12 @@ where
                 active -= 1;
                 let analysis = completed.result?;
                 if let Some(batch) = next_batch()? {
-                    #[cfg(test)]
-                    {
-                        let sequence_bytes = batch.sequence_bytes();
-                        let maximum_fragment_bytes = batch.maximum_fragment_bytes();
-                        retention.claim(
-                            batch.len(),
-                            sequence_bytes,
-                            maximum_fragment_bytes,
-                            threads,
-                        );
-                        observe_retention(retention);
-                    }
                     task_senders[completed.worker_index]
                         .send(batch)
                         .map_err(|_| "Batch worker queue closed".to_string())?;
                     active += 1;
                 }
                 sink(analysis)?;
-                #[cfg(test)]
-                {
-                    retention.release(completed.fragment_count, completed.sequence_bytes);
-                    observe_retention(retention);
-                }
-            }
-            #[cfg(test)]
-            {
-                assert_eq!(retention.pending_fragments, 0);
-                assert_eq!(retention.pending_sequence_bytes, 0);
             }
             Ok(())
         })();
@@ -181,7 +92,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fastq::Fragment;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    #[test]
+    fn parallel_work_keeps_live_batches_bounded() {
+        struct Batch<'a>(&'a AtomicUsize);
+        impl Drop for Batch<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let threads = 4;
+        let barrier = Barrier::new(threads);
+        let live = AtomicUsize::new(0);
+        let mut emitted = 0;
+        let mut completed = 0;
+        process_batches_bounded(
+            threads,
+            &mut || {
+                if emitted == 100 {
+                    return Ok(None);
+                }
+                emitted += 1;
+                assert!(live.fetch_add(1, Ordering::SeqCst) < threads + 1);
+                Ok(Some(Batch(&live)))
+            },
+            || {
+                let barrier = &barrier;
+                let mut first = true;
+                move |batch| {
+                    if first {
+                        barrier.wait();
+                        first = false;
+                    }
+                    Ok(batch)
+                }
+            },
+            &mut |_| {
+                completed += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(completed, 100);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn sink_failure_stops_after_at_most_one_refill() {
@@ -190,19 +146,32 @@ mod tests {
             4,
             &mut || {
                 emitted += 1;
-                Ok(Some(FragmentBatch::from_fragments(&[Fragment {
-                    ordinal: emitted,
-                    id: "read",
-                    r1: b"ACGT",
-                    r2: None,
-                }])))
+                Ok(Some(()))
             },
-            || |_: FragmentBatch| Ok(()),
+            || |_| Ok(()),
             &mut |_| Err("aggregation failed".into()),
-            |_| {},
         )
         .unwrap_err();
         assert_eq!(error, "aggregation failed");
         assert_eq!(emitted, 5);
+    }
+
+    #[test]
+    fn worker_errors_and_panics_propagate() {
+        for panics in [false, true] {
+            let error = process_batches_bounded(
+                4,
+                &mut || Ok(Some(())),
+                || {
+                    move |_| {
+                        assert!(!panics, "worker panic");
+                        Err::<(), _>("worker failure".into())
+                    }
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(error.contains(if panics { "panicked" } else { "worker failure" }));
+        }
     }
 }

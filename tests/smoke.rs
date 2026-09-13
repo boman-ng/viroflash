@@ -600,23 +600,52 @@ fn both_modes_keep_the_original_library_denominator() {
 fn failed_run_leaves_only_error_perf_json() {
     let (root, _) = build_fixture("failure");
     std::fs::write(root.join("broken.fastq"), b"@broken\nACGT\n+\n").unwrap();
-    let output = command(&[
-        "run",
-        "--r1",
-        root.join("broken.fastq").to_str().unwrap(),
-        "--index",
-        root.join("index").to_str().unwrap(),
-        "--out",
-        root.join("out").to_str().unwrap(),
-    ]);
-    assert!(!output.status.success());
-    assert_eq!(
-        output_names(&root.join("out")),
-        BTreeSet::from(["perf.json".into()])
-    );
-    let perf: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("out/perf.json")).unwrap()).unwrap();
-    assert_eq!(perf["status"], "ERROR");
+    let prefix = "@pair\nACGT\n+\nIIII\n".repeat(2048);
+    std::fs::write(
+        root.join("r1.fastq"),
+        format!("{prefix}@left\nACGT\n+\nIIII\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("r2.fastq"),
+        format!("{prefix}@right\nACGT\n+\nIIII\n"),
+    )
+    .unwrap();
+    for mode in ["screen", "full"] {
+        for paired in [false, true] {
+            let out = root.join(format!("{mode}-{paired}"));
+            let r1 = root.join(if paired { "r1.fastq" } else { "broken.fastq" });
+            let r2 = root.join("r2.fastq");
+            let index = root.join("index");
+            let mut args = vec![
+                "run",
+                "--r1",
+                r1.to_str().unwrap(),
+                "--index",
+                index.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--mode",
+                mode,
+                "--threads",
+                "4",
+            ];
+            if paired {
+                args.extend(["--r2", r2.to_str().unwrap()]);
+            }
+            let output = command(&args);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains(if paired {
+                "Paired IDs do not match"
+            } else {
+                "missing quality"
+            }));
+            assert_eq!(output_names(&out), BTreeSet::from(["perf.json".into()]));
+            let perf: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(out.join("perf.json")).unwrap()).unwrap();
+            assert_eq!(perf["status"], "ERROR");
+        }
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
