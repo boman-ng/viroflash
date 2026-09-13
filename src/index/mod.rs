@@ -128,6 +128,7 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
             target_group_ordinal: None,
         });
     }
+    drop(host_records);
     for group in &groups {
         let record = by_id
             .get(group.representative_id.as_str())
@@ -148,7 +149,6 @@ fn build_into(directory: &Path, options: &IndexOptions) -> Result<(), String> {
     let bloom_summary = bloom.summary();
     drop(bloom);
     drop(by_id);
-    drop(host_records);
     drop(target_records);
 
     let mmi = directory.join(MMI);
