@@ -1,45 +1,54 @@
 # Analysis methods
 
-Viroflash measures profile-attributed fragment fraction for a fixed family of reference groups. The production profile is embedded from `src/analysis-profile.json`; its exact bytes define the SHA-256 profile identity. It fixes δ = 1e-5, β = 0.05, α = 0.05, target k = 21, minimap2 `sr` with all-chain enumeration, and ten diagnostic windows. The frozen bytes remain the base profile and index identity. Run sampling uses the explicit precision preset and Bloom candidate population.
+## References and attribution
 
-## Index and sampling
+HOST is the background competitor. TARGET sequences share a reference group when their complete normalized IUPAC sequences are identical or reverse complements. The smallest member ID represents each group; FASTA descriptions are retained. Indexes contain the composite reference, minimap2 index, target Bloom filter and reference metadata.
 
-The index combines HOST and TARGET references; HOST is the sole background competitor. Target records share a group only if their complete normalized IUPAC sequences are identical or reverse complements. The representative is the lexicographically smallest member ID. Group membership is fixed before analysis; names and taxonomy do not merge sequences. Representative descriptions are stored in the index, so analysis does not need the original FASTA files.
+The target-only 21-mer Bloom filter selects work. Passing fragments have an unmasked target hit and satisfy minimap2 short-read chaining hit-count and union-coverage requirements. Low-complexity masking uses symmetric DUST. Both ends compete against HOST and TARGET with minimap2 `sr`.
 
-A single original-input pass validates FASTQ records and paired identifiers, counts all fragments N, hashes decoded content, and applies the Bloom prescreen to every fragment. Readers reject file replacement, size or modification-time changes observed during reading. Passing candidates are written to a run-local binary spool containing original ordinal, normalized ID and read sequences; quality strings are validated but not stored. After EOF fixes the candidate count C and input identity, deterministic BLAKE3 Bernoulli selection operates on that spool. A paired-end fragment shares one selection key and contributes at most one target assignment.
+Alignment scores are compared as score/query length using integer cross multiplication. Host ties or advantages give no target support. Paired target sets are intersected; an unmapped end is neutral. Unresolved cross-group ties remain unassigned. One SE read or PE pair is one fragment and supports at most one reference group.
 
-For C candidate fragments and m target groups in the complete index:
+Coverage is the union of 0-based half-open reference intervals. Ten equal reference windows summarize spatial occupancy. Split and discordant counts describe alignment patterns.
+
+## Sampling
+
+Both modes make one validated pass over plain or gzip FASTQ and retain a bounded sample in memory. Screen samples the original input before Bloom. Full applies Bloom to every fragment and samples the resulting candidates. Final selected fragments are analyzed in bounded parallel batches.
+
+Let N be the original fragment count, C the candidate count, m the number of reference groups and β=0.05. Precision sets δ to 1e-4 (fast), 1e-5 (standard) or 1e-6 (sensitive). The common capacity is obtained by inverting the binomial zero-hit probability:
 
 ```text
-M_min = ceil(δC)
-π = min(1, 1 - (β/m)^(1/M_min))
+n0 = ceil(log(β/m) / log(1-δ))
 ```
 
-The presets `fast`, `standard` (default), and `sensitive` set δ to 1e-4, 1e-5, and 1e-6, respectively; β and α remain 0.05. The guarantee concerns retaining at least one candidate supporting a group with M_min or more such fragments, under the ideal-hash sampling model. It does not guarantee a fixed confidence-interval width. The same hash keys give nested selections across presets. The implementation rounds inclusion thresholds outward to preserve the familywise miss budget. Readers and analysis workers exchange bounded batches rather than retaining the input library.
+The implementation rounds conservatively and verifies the miss-probability bound. A bottom-k reservoir selects min(N,n0) input fragments in screen or min(C,n0) candidates in full. Full uses δ as a conservative lower bound on the candidate fraction corresponding to a whole-library target δ. It retains at least the Bloom-passing screen sample under matching input, index and precision.
 
-## Prescreen and attribution
+BLAKE3 priorities use profile/index identity, normalized fragment ID and original ordinal. The ordinal also breaks hash ties. Selection is independent of worker completion order and FASTQ compression. Under the ideal uniform-priority model conditioned on distinct keys, bottom-k is a simple random sample without replacement. The zero-hit bound and a union bound over the reference family control sampling loss for sufficiently abundant detectable signals. The design protects relative abundance, not a fixed absolute copy count.
 
-A target-only 21-mer Bloom gate selects alignment work. A passing fragment needs a non-SDUST-masked target hit on either end, plus a read end with sufficient hit count and union query coverage for the active minimap2 short-read chaining requirements. Both ends of passing fragments undergo competitive HOST+TARGET alignment. The gate is a workload filter, not a positive call.
+Readers prefetch bounded batches. Workers calculate keys and, in full mode, evaluate Bloom. A single global reservoir retains selected sequences without quality strings. Analysis starts after selection is final. No candidate files are written.
 
-Alignment scores are compared as `alignment_score / query_length` using exact integer cross multiplication. Viroflash adds no MAPQ, score-margin, or coverage cutoff.
+## Abundance and target score
 
-- Host ties or advantages on a target-evidenced fragment are confounded and contribute no target support.
-- Paired target sets are intersected; an unmapped end is neutral. Disjoint sets remain unresolved.
-- A single surviving group receives one supporting fragment. Exact-equivalent members remain indistinguishable within that group.
-- Cross-group ties remain unresolved; no fractional assignment is made.
+Let P be N for screen or C for full, n the actual selected count and x a group's attributed support. The estimated original-library fraction is:
 
-Input fragments without an evaluable target k-mer are counted and reported as a limitation; they do not enter the candidate pool. HOST–TARGET split evidence requires disjoint same-end chains with supplementary geometry; split and discordant counts are diagnostic fragment counts, not confirmed integration events.
+```text
+p = (P/N) * (x/n)
+support_pct = 100 * p
+```
 
-## Estimates and reports
+Screen's n includes selected Bloom negatives. Exact equal-tailed hypergeometric inversion uses P,n,x with per-group error 0.05/m. Integer population-count endpoints are divided by N, converted to percentages and rounded outward to 1e-10 percentage units. Intervals have simultaneous 95% sampling coverage under the sampling model; they do not include prescreen or classification error.
 
-For n sampled candidates and x uniquely attributed supporting fragments, estimated support in the original library is C*x/n, and abundance is (C/N)*(x/n). Simultaneous intervals use the existing equal-tailed exact hypergeometric inversion on population C, sample n and count x, conditional on the realized sample size, with Bonferroni α/m across the complete target family. Integer candidate-total endpoints L and U become [L/N, U/N], with outward ppm rounding. Sampling all candidates collapses the interval to x/N. The estimand is signal detectable under the current prescreen and attribution rules; intervals cover sampling uncertainty, not gate losses, classification accuracy or biological variation. With no candidates or no selected candidates, the report contains only the sample overview and no fabricated per-virus interval.
+At the whole-library target δ, expected selected support is μ=n*δ*N/P. The reported score is:
 
-Coverage is the union of supporting reference intervals in 0-based half-open coordinates. It measures breadth, not depth; overlapping chains and paired ends do not double-count bases. Occupied windows summarize distribution over the representative sequence.
+```text
+sampling_target_score = (x-μ)/(x+μ) = (p-δ)/(p+δ)
+```
 
-`report.csv` contains the 23 research fields in `tests/fixtures/output-fields.tsv`, sorted by support descending then reference ID ascending. A sample without attributed targets has one sample-only row. `support_ppm` and its interval estimate detectable support per million original fragments; `support_fragments` remains the observed sampled support, and `selected_fragments` is the sampled candidate count; `target_support_share_pct` uses total target support. HTML embeds its own CSV download and presents the same values plus full evidence and limitations; telemetry is confined to `perf.json`.
+The score is negative below the target, zero at the target and positive above it. Its range is [-1,1); it measures relative abundance, not confidence. The baseline uses the actual selected count. Sample-only rows have an empty score and interval.
 
-The report identity remains `viroflash.evidence-report.v1`. The 23-column layout replaced the former mixed RUN/TARGET_SIGNAL CSV in place, so consumers must validate the actual header. Older indexes without `target_descriptions` require rebuilding.
+## Outputs
 
-## Implementation references
+Successful runs write `report.csv`, `report.html` and `perf.json` atomically. CSV has 24 ordered fields with BOM and CRLF, sorted by support count then reference ID. HTML displays the top 20 supported groups and embeds the complete CSV. Percentages use original input fragments; target share uses all attributed target fragments.
 
-The reference Bloom screening approach follows [BioBloom Tools (Chu et al., 2014)](https://doi.org/10.1093/bioinformatics/btu558); its matches remain candidates requiring competitive attribution. Sampling and exact finite-population intervals reuse Viroflash's existing implementations. Input decoding retains [flate2 with the zlib-rs backend](https://github.com/rust-lang/flate2-rs). No digital normalization, adaptive stopping, or additional classifier is introduced.
+Run information records the mode, precision, sample capacity, population size, actual selection fraction and expected support at the target. Performance records index loading, scan/sample, selected-analysis and report-writing times, CPU time, peak memory, storage I/O and peak reservoir size.
+
+The embedded base profile bytes define index identity. Runtime mode, precision and sample population are recorded separately. Production and tests use Rust and the existing dependencies.

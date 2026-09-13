@@ -35,5 +35,3 @@ Docker uses the unpacked package as its build context. Apptainer reads the musl 
 A release tag must be `vMAJOR.MINOR.PATCH` (optionally with a SemVer prerelease suffix), matching `Cargo.toml`. Package/schema version changes and publishing require explicit authorization. Never replace an existing versioned asset or image tag.
 
 The release workflow uses one job and one Rust release build. It validates the tag, installs and tests the archive, builds SIF and OCI images from that binary, and compares their CSV/HTML against the installed executable. After those checks, it publishes the OCI tags and creates the GitHub release with archive/SIF checksums. Stable releases also update the minor-version and `latest` image tags. No intermediate artifact uploads or downloads are needed.
-
-Local packages built from uncommitted work are unpublished artifacts. Do not present them as an existing GitHub release or point users to an older release as if it contained the current implementation.
