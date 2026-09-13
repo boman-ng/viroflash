@@ -24,7 +24,7 @@ The implementation rounds conservatively and verifies the miss-probability bound
 
 BLAKE3 priorities use profile/index identity, normalized fragment ID and original ordinal. The ordinal also breaks hash ties. Selection is independent of worker completion order and FASTQ compression. Under the ideal uniform-priority model conditioned on distinct keys, bottom-k is a simple random sample without replacement. The zero-hit bound and a union bound over the reference family control sampling loss for sufficiently abundant detectable signals. The design protects relative abundance, not a fixed absolute copy count.
 
-Readers prefetch bounded batches. Workers calculate keys and, in full mode, evaluate Bloom. A single global reservoir retains selected sequences without quality strings. Screen applies Bloom to its finalized sample. Both modes release Bloom before loading the shared mapping index and transfer selected batches without copying sequences. No candidate files are written.
+For each input end, decoding and digesting overlap FASTQ parsing through bounded byte chunks. Readers prefetch bounded record batches. Workers calculate keys and, in full mode, evaluate Bloom. A single global reservoir retains selected sequences without quality strings. Screen applies Bloom to its finalized sample. Both modes release Bloom before loading the shared mapping index and transfer selected batches without copying sequences. No candidate files are written.
 
 ## Abundance and target score
 

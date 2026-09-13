@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -204,12 +204,42 @@ struct PrefetchedFastqReader {
 
 impl PrefetchedFastqReader {
     fn open(path: &Path) -> Result<Self, String> {
-        let reader = FastqReader::open(path)?;
-        let identity = reader.identity.clone();
+        let file =
+            File::open(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
+        let identity = FileIdentity::from_metadata(
+            &file
+                .metadata()
+                .map_err(|e| format!("Cannot inspect FASTQ: {e}"))?,
+        )?;
+        let input = if path.extension().is_some_and(|extension| extension == "gz") {
+            EncodedInput::Gzip(Box::new(MultiGzDecoder::new(file)))
+        } else {
+            EncodedInput::Plain(file)
+        };
+        let reader_path = path.to_path_buf();
         let (sender, receiver) = sync_channel(FASTQ_PREFETCH_BATCHES);
         let worker = std::thread::Builder::new()
             .name("viroflash-fastq-reader".into())
-            .spawn(move || prefetch_fastq(reader, sender))
+            .spawn(move || {
+                std::thread::scope(|scope| {
+                    let (decoded_sender, decoded_receiver) = sync_channel(FASTQ_PREFETCH_BATCHES);
+                    scope.spawn(move || decode_fastq(input, decoded_sender));
+                    let reader = FastqReader {
+                        reader: DecodedReader {
+                            receiver: decoded_receiver,
+                            data: Vec::new(),
+                            position: 0,
+                            digest: None,
+                        },
+                        path: reader_path,
+                        name: Vec::new(),
+                        sequence: Vec::new(),
+                        plus: Vec::new(),
+                        quality: Vec::new(),
+                    };
+                    prefetch_fastq(reader, sender);
+                });
+            })
             .map_err(|error| {
                 format!("Cannot start FASTQ reader for {}: {error}", path.display())
             })?;
@@ -315,28 +345,75 @@ fn prefetch_fastq(mut reader: FastqReader, sender: SyncSender<FastqBatchMessage>
     }
 }
 
-struct DigestingReader<R> {
-    inner: R,
-    hasher: Sha256,
+enum DecodedChunk {
+    Data(Vec<u8>),
+    Complete([u8; 32]),
 }
 
-impl<R> DigestingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
+fn decode_fastq(mut input: EncodedInput, sender: SyncSender<io::Result<DecodedChunk>>) {
+    let mut hasher = Sha256::new();
+    loop {
+        let mut data = Vec::with_capacity(FASTQ_READER_BUFFER_BYTES);
+        match input
+            .by_ref()
+            .take(FASTQ_READER_BUFFER_BYTES as u64)
+            .read_to_end(&mut data)
+        {
+            Ok(0) => {
+                let _ = sender.send(Ok(DecodedChunk::Complete(hasher.finalize().into())));
+                return;
+            }
+            Ok(_) => {
+                hasher.update(&data);
+                if sender.send(Ok(DecodedChunk::Data(data))).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
         }
     }
+}
 
-    fn digest(&self) -> [u8; 32] {
-        self.hasher.clone().finalize().into()
+struct DecodedReader {
+    receiver: Receiver<io::Result<DecodedChunk>>,
+    data: Vec<u8>,
+    position: usize,
+    digest: Option<[u8; 32]>,
+}
+
+impl BufRead for DecodedReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.position == self.data.len() && self.digest.is_none() {
+            match self.receiver.recv().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "FASTQ decoder closed before end-of-file",
+                )
+            })?? {
+                DecodedChunk::Data(data) => {
+                    self.data = data;
+                    self.position = 0;
+                }
+                DecodedChunk::Complete(digest) => self.digest = Some(digest),
+            }
+        }
+        Ok(&self.data[self.position..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.position += amount;
     }
 }
 
-impl<R: Read> Read for DigestingReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.inner.read(buffer)?;
-        self.hasher.update(&buffer[..count]);
+impl Read for DecodedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let count = available.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
         Ok(count)
     }
 }
@@ -356,45 +433,19 @@ impl Read for EncodedInput {
 }
 
 struct FastqReader {
-    reader: BufReader<DigestingReader<EncodedInput>>,
+    reader: DecodedReader,
     path: PathBuf,
     name: Vec<u8>,
     sequence: Vec<u8>,
     plus: Vec<u8>,
     quality: Vec<u8>,
-    identity: FileIdentity,
 }
 
 impl FastqReader {
-    fn open(path: &Path) -> Result<Self, String> {
-        let file =
-            File::open(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
-        let identity = FileIdentity::from_metadata(
-            &file
-                .metadata()
-                .map_err(|e| format!("Cannot inspect FASTQ: {e}"))?,
-        )?;
-        let input = if path.extension().is_some_and(|extension| extension == "gz") {
-            EncodedInput::Gzip(Box::new(MultiGzDecoder::new(file)))
-        } else {
-            EncodedInput::Plain(file)
-        };
-        Ok(Self {
-            reader: BufReader::with_capacity(
-                FASTQ_READER_BUFFER_BYTES,
-                DigestingReader::new(input),
-            ),
-            path: path.to_path_buf(),
-            name: Vec::new(),
-            sequence: Vec::new(),
-            plus: Vec::new(),
-            quality: Vec::new(),
-            identity,
-        })
-    }
-
     fn decoded_digest(&self) -> [u8; 32] {
-        self.reader.get_ref().digest()
+        self.reader
+            .digest
+            .expect("decoded input reached end-of-file")
     }
 
     fn append_record(&mut self, batch: &mut FastqBatch) -> Result<bool, String> {
@@ -513,9 +564,15 @@ mod tests {
         for mate in [1, 2] {
             let mut bytes = Vec::new();
             for ordinal in 0..count {
+                let sequence = if ordinal == FASTQ_BATCH_RECORDS {
+                    "A".repeat(FASTQ_READER_BUFFER_BYTES + 17)
+                } else {
+                    "ACGTN".into()
+                };
                 write!(
                     bytes,
-                    "@read-{ordinal}/{mate} comment\r\nACGTN\r\n+\r\nIIIII\r\n"
+                    "@read-{ordinal}/{mate} comment\r\n{sequence}\r\n+\r\n{}\r\n",
+                    "I".repeat(sequence.len())
                 )
                 .unwrap();
             }
@@ -531,8 +588,13 @@ mod tests {
                 let fragment = fragment.unwrap();
                 assert_eq!(fragment.ordinal, observed as u64);
                 assert_eq!(fragment.id, format!("read-{observed}"));
-                assert_eq!(fragment.r1, b"ACGTN");
-                assert_eq!(fragment.r2, Some(b"ACGTN".as_slice()));
+                if observed == FASTQ_BATCH_RECORDS {
+                    assert_eq!(fragment.r1.len(), FASTQ_READER_BUFFER_BYTES + 17);
+                    assert!(fragment.r1.iter().all(|&base| base == b'A'));
+                } else {
+                    assert_eq!(fragment.r1, b"ACGTN");
+                }
+                assert_eq!(fragment.r2, Some(fragment.r1));
                 observed += 1;
             }
         }
@@ -579,6 +641,20 @@ mod tests {
         assert!(census_fastq(&r1, Some(&r2))
             .unwrap_err()
             .contains("Paired IDs do not match"));
+        // A parser error must also release a decoder blocked on prefetched data.
+        let mut malformed = b"@bad\nACGT\n+\nIII\n".to_vec();
+        malformed.resize(FASTQ_READER_BUFFER_BYTES * 5, b'A');
+        std::fs::write(&r1, malformed).unwrap();
+        assert!(census_fastq(&r1, None)
+            .unwrap_err()
+            .contains("lengths differ"));
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(prefix.as_bytes()).unwrap();
+        let mut compressed = gzip.finish().unwrap();
+        compressed.truncate(compressed.len() - 4);
+        let path = root.join("truncated.fq.gz");
+        std::fs::write(&path, compressed).unwrap();
+        assert!(census_fastq(&path, None).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
