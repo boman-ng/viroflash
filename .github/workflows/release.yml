@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+            target/x86_64-unknown-linux-musl
+          key: cargo-musl-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Install build tools
+        run: bash ci/install-release-tools.sh
+
+      - name: Build, package and test release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          bash ci/build-release.sh
+          echo "VERSION=${RELEASE_TAG#v}" >> "${GITHUB_ENV}"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish OCI tags
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME,,}"
+          if docker manifest inspect "${image}:${VERSION}" >/dev/null 2>&1; then
+            echo "Versioned OCI tag ${VERSION} already exists and is immutable" >&2
+            exit 1
+          fi
+          tags=("${VERSION}")
+          if [[ "${VERSION}" != *-* ]]; then tags+=("${VERSION%.*}" latest); fi
+          for tag in "${tags[@]}"; do
+            docker tag viroflash:release-test "${image}:${tag}"
+            docker push "${image}:${tag}"
+          done
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          gh release create "${RELEASE_TAG}" ./*.tar.gz ./*.sif ./*.sha256 ./*.tsv ./build.json ./SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes --title "Viroflash ${RELEASE_TAG}"

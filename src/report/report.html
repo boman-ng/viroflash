@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viroflash-report-schema" content="{{SCHEMA}}">
+<title>Viroflash · {{SAMPLE}}</title>
+<style>{{STYLE}}</style>
+</head>
+<body>
+<a class="skip-link" href="#results">Skip to reference signals</a>
+<div class="page">
+<header class="report-header">
+<div class="masthead"><a class="wordmark" href="#top" aria-label="Viroflash report overview">Viroflash<span class="brand-dot" aria-hidden="true"></span></a><div class="actions"><a class="button primary" href="{{CSV_DOWNLOAD}}" download="{{SAMPLE}}.csv">Download CSV</a></div></div>
+<div id="top" class="heading"><h1>Viral reference signals</h1><p class="sample-name">{{SAMPLE}}</p><p class="intro">Whole-library abundance, reference coverage, and support relative to the selected ppm target.</p></div>
+<dl class="sample-stats" aria-label="Sample overview">
+<div><dt>Input fragments <span>{{INPUT_MODE}}</span></dt><dd>{{INPUT_COUNT}}</dd></div>
+<div><dt>{{SAMPLED_LABEL}}</dt><dd>{{SELECTED_COUNT}}</dd></div>
+<div><dt>Attributed target fragments</dt><dd>{{TOTAL_SUPPORT}}</dd></div>
+<div><dt>Displayed reference groups</dt><dd>{{GROUP_COUNT}}</dd></div>
+</dl>
+</header>
+<main>
+<section id="results" aria-labelledby="results-title">
+<div class="section-heading"><div><h2 id="results-title">Reference signals</h2><p>Showing the top {{GROUP_COUNT}} of {{ALL_GROUP_COUNT}} attributed groups by supporting fragments. Download CSV for all groups. Expand a row for its 24 research fields.</p></div><span class="result-count">{{GROUP_COUNT}} reference groups</span></div>
+<div class="column-head" aria-hidden="true"><span>Rank</span><span>Reference / accession</span><span>Fragments</span><span>Library interval · %</span><span>Coverage</span><span>Target score</span><span></span></div>
+<div id="signal-list">{{RESULT_LIST}}</div>
+<div class="reading-notes"><p><strong>Library abundance</strong> estimates detectable support as a percentage of all original input fragments, with a simultaneous 95% sampling interval. <strong>Target score</strong> is (estimated fraction − target fraction) / (estimated fraction + target fraction): negative below the selected ppm target, zero at the target, positive above it. It describes relative abundance, not confidence.</p><p>Coverage is the fraction of reference bases covered. One fragment is one SE read or one PE pair. Each group contains identical or reverse-complement reference sequences.</p></div>
+</section>
+<details class="methods" id="analysis-details">
+<summary>Methods and reference details<span>Sampling and analysis data</span></summary>
+<div class="methods-content">
+<section><h3>Analysis method</h3><p>{{METHOD}} Both modes read FASTQ once and keep the sample in memory. The same precision-derived capacity applies to the input population in screen mode and the candidate population in full mode.</p><p>Abundance intervals use exact hypergeometric inversion and cover sampling uncertainty under the uniform hash-priority model. Percentages use the original input denominator. Split and discordant counts describe alignment patterns.</p></section>
+<section id="run-integrity"><h3>Run and sampling information</h3><table><tbody>{{RUN_FIELDS}}</tbody></table></section>
+<details class="raw-evidence"><summary>Details for displayed reference groups</summary><section id="observed-target-signals">{{AUDIT_SIGNALS}}</section></details>
+</div>
+</details>
+</main>
+<footer><span>Viroflash</span><p>The complete CSV is embedded in this report.</p><a href="#top">Back to top</a></footer>
+</div>
+</body>
+</html>

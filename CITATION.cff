@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use Viroflash, please cite this software. Citation is appreciated, not a license condition."
+type: software
+title: Viroflash
+authors:
+  - name: boman-ng
+    email: boman.ngs@gmail.com
+repository-code: https://github.com/boman-ng/viroflash
+license: BSD-3-Clause

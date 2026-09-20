@@ -1,0 +1,52 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH'
+
+stages: [test, release]
+
+variables:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+rust:
+  stage: test
+  image: rust:1.94.1-bookworm
+  before_script:
+    - apt-get update && apt-get install --yes --no-install-recommends python3
+  interruptible: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - when: on_success
+  cache:
+    key:
+      prefix: cargo-ci-linux
+      files: [Cargo.lock, rust-toolchain.toml]
+    paths: [.cargo/registry/, .cargo/git/, target/debug/]
+  script:
+    - bash ci/check.sh
+
+release:
+  stage: release
+  # Ubuntu 22.04 x86_64 shell runner; see docs/releasing.md.
+  tags: [viroflash-release]
+  interruptible: false
+  resource_group: release
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  cache:
+    key:
+      prefix: cargo-musl-linux
+      files: [Cargo.lock, rust-toolchain.toml]
+    paths: [.cargo/registry/, .cargo/git/, target/release/, target/x86_64-unknown-linux-musl/]
+  script:
+    - export RELEASE_TAG="$CI_COMMIT_TAG"
+    - export RUNNER_TEMP="$(mktemp -d)"
+    - export DOCKER_CONFIG="$RUNNER_TEMP/docker"
+    - bash ci/install-release-tools.sh
+    - bash ci/build-release.sh
+    - bash ci/publish-gitlab.sh

@@ -1,0 +1,15 @@
+# Rust build output and local container images
+/target/
+/dist/
+*.sif
+
+# Local data, indexes, reports, and experiment artifacts
+/.local/
+/.tmp/
+/evaluation/
+*.work/
+.impeccable/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]

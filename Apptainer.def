@@ -1,0 +1,45 @@
+Bootstrap: docker
+From: ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986
+# Ubuntu 22.04, linux/amd64. Apptainer requires digest references without a tag.
+
+%arguments
+    VERSION=dev
+    REVISION=unknown
+    PACKAGE=viroflash-dev-linux-x86_64
+    SOURCE_URL=https://github.com/boman-ng/viroflash
+
+%files
+    {{ PACKAGE }}/viroflash /usr/local/bin/viroflash
+    {{ PACKAGE }}/LICENSE /usr/share/viroflash/LICENSE
+    {{ PACKAGE }}/THIRD_PARTY_NOTICES.md /usr/share/viroflash/THIRD_PARTY_NOTICES.md
+    {{ PACKAGE }}/licenses /usr/share/viroflash/licenses
+    {{ PACKAGE }}/examples /usr/share/viroflash/examples
+
+%post
+    # The upstream image's bootstrap log contains build-environment endpoints.
+    # Remove it only inside this new image, not from host or audit records.
+    rm -f /var/log/bootstrap.log
+    chmod 0755 /usr/local/bin/viroflash
+    mkdir -p /work
+
+%environment
+    export LC_ALL=C.UTF-8
+
+%runscript
+    exec /usr/local/bin/viroflash "$@"
+
+%test
+    /usr/local/bin/viroflash --help
+
+%labels
+    org.opencontainers.image.title viroflash
+    org.opencontainers.image.description Reference-group fragment evidence command-line tool
+    org.opencontainers.image.source {{ SOURCE_URL }}
+    org.opencontainers.image.licenses BSD-3-Clause
+    org.label-schema.build-host reproducible-builder
+    org.opencontainers.image.version {{ VERSION }}
+    org.opencontainers.image.revision {{ REVISION }}
+
+%help
+    Viroflash measures profile-attributed fragment fractions from FASTQ or FASTQ.gz data.
+    Run `apptainer run viroflash.sif --help` for command-line usage.
